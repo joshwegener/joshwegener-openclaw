@@ -17,9 +17,9 @@ Use it when you need to locate policies/runbooks/profiles without loading lots o
 - (planned) `memory/runbooks/email.md`
 
 ## Projects / business context
-- (planned) `memory/projects/`
-  - `ocep.md`
+- Directory: `memory/projects/`
   - `recalldeck.md`
+  - (planned) `ocep.md`
 
 ## System / operational notes
 - Local memory search store: `~/.clawdbot/memory/main.sqlite` (auto-generated)
