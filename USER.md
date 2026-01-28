@@ -7,7 +7,7 @@
 - **Pronouns:** *(optional)*
 - **Timezone:** America/Denver
 - **Notes:** Software developer building websites/web-tools. Prefers playful tone off-client; swearing OK when appropriate. Writing can be typo-heavy; normalize without fuss.
-- **Response profiles (load on demand):** `/Users/joshwegener/clawd/memory/profiles/` (e.g., `chantel.md`, `ann.md`, `dalton.md`).
+- **Lookup index (load on demand):** `/Users/joshwegener/clawd/memory/INDEX.md`
 
 ## Context
 
