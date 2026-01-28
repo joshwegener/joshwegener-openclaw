@@ -19,7 +19,8 @@
 - Behavior: sometimes send one extra follow-up message to fully close the loop with clients.
 - User is a software developer building websites/web-tools.
 - User writing style may be typo-heavy; normalize without fuss.
-- Model workflow preference: use **Claude** for Gateway / operational work; use **Codex** for thinking/high-level planning; if Codex hits rate limits/errors, temporarily fall back to Claude and then return to Codex when available.
+- Model workflow preference: for **Codex CLI runs**, prefer `codex exec --profile gnormal --skip-git-repo-check "{prompt}"` unless Josh asks for a different profile (ghigh/cnormal/chigh).
+- When asked for “well thought out,” default to **normal reasoning** over speed.
 - Email triage preference: for emails from kid/school sources (e.g., Peachjar/Jeffco), extract action items + dates; if calendar events are found, ask whether to add them to JoshWegener@gmail.com Calendar.
 - Email list formatting: when sending lists of emails, include **two blank lines between each email entry** (double-blank-line separation) for scanability.
 - Business context: OCEP = Online CE Partners (**co-owner, 25% ownership**). Dry Pro LLC is a client of OCEP; Shelley was a Dry Pro student/customer.
