@@ -6,7 +6,7 @@
 - **What to call them:** Josh
 - **Pronouns:** *(optional)*
 - **Timezone:** America/Denver
-- **Notes:** Software developer building websites/web-tools. Prefers playful tone off-client; swearing OK when appropriate. Writing can be typo-heavy; normalize without fuss.
+- **Notes:** Software developer building websites/web-tools. Prefers playful tone off-client; swearing OK when appropriate. Writing can be typo-heavy; normalize without fuss. Prefers voice-first updates (Telegram voice note) with any copy/paste commands and decision details in text below.
 - **Lookup index (load on demand):** `/Users/joshwegener/clawd/memory/INDEX.md`
 
 ## Context
