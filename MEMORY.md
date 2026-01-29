@@ -19,7 +19,9 @@
 - Behavior: sometimes send one extra follow-up message to fully close the loop with clients.
 - User is a software developer building websites/web-tools.
 - User writing style may be typo-heavy; normalize without fuss.
-- Model workflow preference: for **Codex CLI runs**, prefer `codex exec --profile gnormal --skip-git-repo-check "{prompt}"` unless Josh asks for a different profile (ghigh/cnormal/chigh).
+- Model workflow preference: for **Codex CLI runs**: default to `--profile chigh` for implementation/coding, and `--profile ghigh` for planning/analysis. Use `--skip-git-repo-check` unless Josh asks otherwise.
+- RecallDeck execution preference: be autonomous and keep momentum. Use GPT (high) for planning, Codex for implementation, and Claude for edge-case review. OK to use multiple git worktrees to parallelize. Provide at least hourly updates (and also whenever a major change lands).
+- Terminology: when Josh says "Claude CLI" in this project context, he often means the Codex CLI (he does use Claude CLI sometimes on servers, but default assumption should be Codex unless clarified).
 - When asked for “well thought out,” default to **normal reasoning** over speed.
 - Email triage preference: for emails from kid/school sources (e.g., Peachjar/Jeffco), extract action items + dates; if calendar events are found, ask whether to add them to JoshWegener@gmail.com Calendar.
 - Email list formatting: when sending lists of emails, include **two blank lines between each email entry** (double-blank-line separation) for scanability.
