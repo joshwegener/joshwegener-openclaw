@@ -42,9 +42,11 @@ The orchestrator only auto-starts tasks (Ready → WIP) when it can map the task
 Provide a mapping via one of:
 - Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
 - Description line: `Repo: <key-or-path>`
-- Title prefix: `<key>:` (e.g. `server: ...`, `web: ...`)
+- Title prefix: `<key>:` (e.g. `server: ...`, `web: ...`) **legacy fallback**
 
 If a task truly has no repo (planning/research), add tag `no-repo` so it can still be started.
+
+Note: Prefer tags + explicit `Repo:` hints; title-prefix mapping is legacy and can be disabled via `BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT=0`.
 
 ## Auto-block + auto-heal (self-healing)
 When a task can’t be started for a deterministic reason, the orchestrator may move it to `Blocked` and tag it:
@@ -71,11 +73,13 @@ MVP behavior:
 ## Worker tracking (v1 approach)
 
 Do not rely on OS PIDs.
-- Track a worker handle and liveness in state:
-  - `taskId -> { handle, startedAtMs, lastSeenAtMs }`
-- Liveness is **TTL-based**:
-  - Alive if `now - lastSeenAtMs < 60 minutes`
-  - If stale/missing: treat as “unknown” and escalate (MVP: Block + message Josh), rather than guessing completion.
+- Track a worker handle in state:
+  - `taskId -> { execSessionId, logPath, startedAtMs, repoKey, repoPath }`
+- Missing handles are reconciled deterministically:
+  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=spawn` will attempt to spawn via `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD`.
+  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=pause` will move the task to `Paused`.
+- If a task is moved to WIP but no worker handle can be recorded, it is auto-paused to avoid silent WIP.
+- If a worker log shows a completed output (patch marker / kanboard comment file), auto-move WIP → Review.
 
 ## Safety valves
 
@@ -88,6 +92,8 @@ Do not rely on OS PIDs.
 
 1) Read board state.
 2) If WIP > 2: do not pull new work; focus only on notifying about stale/unknown WIP.
+   - Reconcile WIP tasks with completed worker output (auto-advance to Review).
+   - Reconcile WIP tasks missing worker handles (auto-spawn or auto-pause).
 3) If WIP < 2:
    - Ensure Ready has work:
      - If Ready empty: promote top Backlog task by position (skip `hold`).
