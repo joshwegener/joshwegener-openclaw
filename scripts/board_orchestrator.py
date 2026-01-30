@@ -20,14 +20,15 @@ import base64
 import json
 import os
 import re
-import sys
 import time
 import urllib.request
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-STATE_PATH = "/Users/joshwegener/clawd/memory/board-orchestrator-state.json"
-LOCK_PATH = "/tmp/board-orchestrator.lock"
+STATE_PATH = os.environ.get(
+    "BOARD_ORCHESTRATOR_STATE",
+    "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
+)
+LOCK_PATH = os.environ.get("BOARD_ORCHESTRATOR_LOCK", "/tmp/board-orchestrator.lock")
 
 PROJECT_NAME = os.environ.get("RECALLDECK_PROJECT", "RecallDeck")
 KANBOARD_BASE = os.environ.get("KANBOARD_BASE", "http://localhost:8401/jsonrpc.php")
@@ -63,6 +64,73 @@ COL_DONE = "Done"
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def critical_column_priority(column_id: int, col_wip_id: int, col_review_id: int, col_ready_id: int) -> int:
+    if column_id == col_wip_id:
+        return 0
+    if column_id == col_review_id:
+        return 1
+    if column_id == col_ready_id:
+        return 2
+    return 3
+
+
+def critical_sort_key(
+    column_id: int,
+    col_wip_id: int,
+    col_review_id: int,
+    col_ready_id: int,
+    base_sort: Tuple[int, int],
+) -> Tuple[int, int, int]:
+    return (critical_column_priority(column_id, col_wip_id, col_review_id, col_ready_id),) + tuple(base_sort)
+
+
+def plan_pause_wip(
+    wip_task_ids: List[int],
+    critical_task_ids: set[int],
+    paused_by_critical: Dict[str, Any],
+) -> List[int]:
+    pause_ids: List[int] = []
+    for tid in wip_task_ids:
+        if tid in critical_task_ids:
+            continue
+        if str(tid) in paused_by_critical:
+            continue
+        pause_ids.append(tid)
+    return pause_ids
+
+
+def sorted_paused_ids(paused_by_critical: Dict[str, Any]) -> List[int]:
+    paused_ids = [int(k) for k in paused_by_critical.keys()]
+    return sorted(
+        paused_ids,
+        key=lambda tid: (
+            int(paused_by_critical.get(str(tid), {}).get("pausedAtMs", 0) or 0),
+            tid,
+        ),
+    )
+
+
+def plan_resume_from_state(
+    paused_by_critical: Dict[str, Any],
+    paused_task_ids: set[int],
+    wip_count: int,
+    wip_limit: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    resume_to_wip: List[int] = []
+    resume_to_ready: List[int] = []
+    drop_ids: List[int] = []
+    for tid in sorted_paused_ids(paused_by_critical):
+        if tid not in paused_task_ids:
+            drop_ids.append(tid)
+            continue
+        if wip_count < wip_limit:
+            resume_to_wip.append(tid)
+            wip_count += 1
+        else:
+            resume_to_ready.append(tid)
+    return resume_to_wip, resume_to_ready, drop_ids
 
 
 def load_state() -> Dict[str, Any]:
@@ -393,8 +461,9 @@ def main() -> int:
         blocked_tasks = tasks_for_column(int(col_blocked["id"]))
 
         # Sort helper
-        def sort_key(item: Tuple[Dict[str, Any], int]) -> Tuple[int, int]:
-            t, sl_id = item
+        def sort_key(item: Tuple[Any, ...]) -> Tuple[int, int]:
+            t = item[0]
+            sl_id = item[1]
             # swimlane priority index
             sl_name = None
             for sl in swimlanes:
@@ -522,76 +591,94 @@ def main() -> int:
         # emit an error instead.
 
         # Collect all non-Done tasks so we can find critical candidates anywhere.
-        all_open: List[Tuple[Dict[str, Any], int]] = []
+        all_open: List[Tuple[Dict[str, Any], int, int]] = []
         for sl in swimlanes:
             for c in (sl.get("columns") or []):
-                if int(c.get("id") or 0) == int(col_done["id"]):
+                col_id = int(c.get("id") or 0)
+                if col_id == int(col_done["id"]):
                     continue
                 for t in (c.get("tasks") or []):
-                    all_open.append((t, int(sl.get("id") or 0)))
+                    all_open.append((t, int(sl.get("id") or 0), col_id))
 
-        def col_id_of(task_id: int) -> int:
-            try:
-                return int(get_task(task_id).get("column_id") or 0)
-            except Exception:
-                return 0
-
-        critical_candidates: List[Tuple[Dict[str, Any], int]] = []
-        for t, sl_id in all_open:
+        critical_candidates: List[Tuple[Dict[str, Any], int, int]] = []
+        critical_task_ids: set[int] = set()
+        for t, sl_id, col_id in all_open:
             tid = int(t.get("id"))
             try:
                 tags = get_task_tags(tid)
             except Exception:
                 tags = []
             if is_critical(tags) and not is_held(tags):
-                critical_candidates.append((t, sl_id))
+                critical_candidates.append((t, sl_id, col_id))
+                critical_task_ids.add(tid)
 
-        # Deterministic active critical selection: use existing swimlane+position ordering.
-        active_critical: Optional[Tuple[Dict[str, Any], int]] = None
+        # Prefer critical already in WIP/Review, then Ready, then other columns.
+        active_critical: Optional[Tuple[Dict[str, Any], int, int]] = None
         if critical_candidates:
-            active_critical = sorted(critical_candidates, key=sort_key)[0]
+            active_critical = sorted(
+                critical_candidates,
+                key=lambda item: critical_sort_key(
+                    item[2],
+                    int(col_wip["id"]),
+                    int(col_review["id"]),
+                    int(col_ready["id"]),
+                    sort_key(item),
+                ),
+            )[0]
 
         # Resume paused tasks only when NO critical tasks remain.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
 
-        if active_critical is None and paused_by_critical and not dry_run:
-            # Restore previously paused tasks.
-            # Strategy: restore into WIP up to WIP_LIMIT, then Ready.
-            restore_ids = [int(k) for k in paused_by_critical.keys()]
-            # keep deterministic order: by stored pausedAtMs then task id
-            restore_ids.sort(key=lambda tid: (int(paused_by_critical.get(str(tid), {}).get("pausedAtMs", 0) or 0), tid))
-
-            # recompute WIP count now
+        if active_critical is None and paused_by_critical:
+            budget = max(budget, ACTION_BUDGET_CRITICAL)
+            paused_tasks = tasks_for_column(int(col_paused["id"]))
+            paused_task_ids = {int(t.get("id")) for t, _ in paused_tasks}
+            paused_by_id = {int(t.get("id")): (t, sl_id) for t, sl_id in paused_tasks}
             wip_now = len(tasks_for_column(int(col_wip["id"])))
-            for tid in restore_ids:
+
+            resume_to_wip, resume_to_ready, drop_ids = plan_resume_from_state(
+                paused_by_critical, paused_task_ids, wip_now, WIP_LIMIT
+            )
+
+            def resume_task(tid: int, dest_col: int) -> None:
+                nonlocal budget
                 if budget <= 0:
-                    break
+                    return
                 info = paused_by_critical.get(str(tid), {})
                 sl_id = int(info.get("swimlaneId") or 0)
-                # only restore if still in Paused and still tagged paused
-                try:
-                    t = get_task(tid)
-                    if int(t.get("column_id") or 0) != int(col_paused["id"]):
-                        continue
-                except Exception:
-                    continue
-
-                dest_col = int(col_ready["id"])
-                if wip_now < WIP_LIMIT:
-                    dest_col = int(col_wip["id"])
-
-                move_task(pid, tid, dest_col, 1, sl_id)
-                record_action(tid)
-                remove_tag(tid, TAG_PAUSED)
-                actions.append(f"Resumed paused #{tid} -> {'WIP' if dest_col==int(col_wip['id']) else 'Ready'}")
-                paused_by_critical.pop(str(tid), None)
+                if not sl_id:
+                    sl_id = int(paused_by_id.get(tid, ({}, 0))[1])
+                if dry_run:
+                    actions.append(
+                        f"Would resume paused #{tid} -> {'WIP' if dest_col==int(col_wip['id']) else 'Ready'}"
+                    )
+                else:
+                    move_task(pid, tid, dest_col, 1, sl_id)
+                    record_action(tid)
+                    remove_tag(tid, TAG_PAUSED)
+                    actions.append(
+                        f"Resumed paused #{tid} -> {'WIP' if dest_col==int(col_wip['id']) else 'Ready'}"
+                    )
+                    paused_by_critical.pop(str(tid), None)
                 budget -= 1
-                if dest_col == int(col_wip["id"]):
-                    wip_now += 1
 
-            state["pausedByCritical"] = paused_by_critical
-            state["lastActionsByTaskId"] = last_actions
-            save_state(state)
+            for tid in resume_to_wip:
+                resume_task(tid, int(col_wip["id"]))
+
+            for tid in resume_to_ready:
+                resume_task(tid, int(col_ready["id"]))
+
+            for tid in drop_ids:
+                if dry_run:
+                    actions.append(f"Would clear paused state for #{tid} (no longer in Paused)")
+                else:
+                    paused_by_critical.pop(str(tid), None)
+                    actions.append(f"Cleared paused state for #{tid} (no longer in Paused)")
+
+            if not dry_run:
+                state["pausedByCritical"] = paused_by_critical
+                state["lastActionsByTaskId"] = last_actions
+                save_state(state)
 
             emit_json(
                 mode=mode,
@@ -604,30 +691,29 @@ def main() -> int:
             return 0
 
         if active_critical is not None:
-            ct, csl_id = active_critical
+            ct, csl_id, c_col_id = active_critical
             cid = int(ct.get("id"))
             ctitle = task_title(ct)
 
             # Critical stays active through Review; nothing else should run until it reaches Done.
-            c_col_id = col_id_of(cid)
             critical_in_progress = c_col_id in (int(col_wip["id"]), int(col_review["id"]))
 
             def pause_noncritical_wip() -> None:
                 nonlocal budget
-                # Pause non-critical WIP tasks into Paused.
                 budget = max(budget, ACTION_BUDGET_CRITICAL)
-                current_wip = tasks_for_column(int(col_wip["id"]))
-                paused_by_critical = state.get("pausedByCritical") or {}
+                current_wip = sorted(tasks_for_column(int(col_wip["id"])), key=sort_key)
+                paused_state = state.get("pausedByCritical") or {}
+                wip_by_id = {int(t.get("id")): (t, sl_id) for t, sl_id in current_wip}
+                pause_ids = plan_pause_wip(
+                    [int(t.get("id")) for t, _ in current_wip],
+                    critical_task_ids,
+                    paused_state,
+                )
 
-                for wt, wsl_id in current_wip:
-                    wid = int(wt.get("id"))
-                    wtags = get_task_tags(wid)
-                    if is_critical(wtags):
-                        continue
+                for wid in pause_ids:
                     if budget <= 0:
                         break
-                    if str(wid) in paused_by_critical:
-                        continue
+                    wt, wsl_id = wip_by_id[wid]
 
                     if dry_run:
                         actions.append(f"Would pause non-critical WIP #{wid} -> Paused (for critical #{cid})")
@@ -637,7 +723,7 @@ def main() -> int:
                     move_task(pid, wid, int(col_paused["id"]), 1, int(wsl_id))
                     record_action(wid)
                     add_tag(wid, TAG_PAUSED)
-                    paused_by_critical[str(wid)] = {
+                    paused_state[str(wid)] = {
                         "criticalTaskId": cid,
                         "pausedAtMs": now_ms(),
                         "swimlaneId": int(wsl_id),
@@ -645,44 +731,47 @@ def main() -> int:
                     actions.append(f"Paused WIP #{wid} -> Paused (for critical #{cid})")
                     budget -= 1
 
-                state["pausedByCritical"] = paused_by_critical
+                state["pausedByCritical"] = paused_state
 
             if critical_in_progress:
-                # Critical is already active (WIP or Review) -> pause everything else.
                 pause_noncritical_wip()
 
             else:
-                # Critical exists but is not yet active; only preempt if it can actually start.
                 full = get_task(cid)
                 desc = (full.get("description") or "")
                 deps = parse_depends_on(desc)
                 unmet = [d for d in deps if not is_done(d)]
 
-                # exclusives currently in WIP (non-critical included)
-                wip_exclusive_keys: set[str] = set()
-                for wt, _wsl in wip_tasks:
-                    wid = int(wt.get("id"))
-                    wtags = get_task_tags(wid)
-                    wdesc = (get_task(wid).get("description") or "")
-                    for k in parse_exclusive_keys(wtags, wdesc):
-                        wip_exclusive_keys.add(k)
-                ctags = get_task_tags(cid)
-                ex_keys = parse_exclusive_keys(ctags, desc)
-                ex_conflicts = [k for k in ex_keys if k in wip_exclusive_keys]
-
-                if unmet or ex_conflicts:
-                    # Can't start critical: do NOT pause everything; just surface loudly.
-                    reason_parts = []
-                    if unmet:
-                        reason_parts.append("Depends on " + ", ".join("#" + str(x) for x in unmet))
-                    if ex_conflicts:
-                        reason_parts.append("Exclusive conflict: " + ", ".join("exclusive:" + k for k in ex_conflicts))
-                    errors.append(f"critical #{cid} ({ctitle}) cannot start: {'; '.join(reason_parts)}")
+                if unmet:
+                    reason = "Depends on " + ", ".join("#" + str(x) for x in unmet)
+                    errors.append(f"critical #{cid} ({ctitle}) cannot start: {reason}")
                 else:
                     pause_noncritical_wip()
 
-                    # Move critical directly into WIP (skip Ready).
-                    if budget > 0:
+                    critical_wip_exclusive_keys: set[str] = set()
+                    for wt, _wsl in wip_tasks:
+                        wid = int(wt.get("id"))
+                        if wid == cid or wid not in critical_task_ids:
+                            continue
+                        wtags = get_task_tags(wid)
+                        wdesc = (get_task(wid).get("description") or "")
+                        for k in parse_exclusive_keys(wtags, wdesc):
+                            critical_wip_exclusive_keys.add(k)
+
+                    ctags = get_task_tags(cid)
+                    ex_keys = parse_exclusive_keys(ctags, desc)
+                    ex_conflicts = [k for k in ex_keys if k in critical_wip_exclusive_keys]
+
+                    if ex_conflicts:
+                        errors.append(
+                            "critical #"
+                            + str(cid)
+                            + " ("
+                            + ctitle
+                            + ") cannot start: Exclusive conflict: "
+                            + ", ".join("exclusive:" + k for k in ex_conflicts)
+                        )
+                    elif budget > 0:
                         if dry_run:
                             actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                         else:
