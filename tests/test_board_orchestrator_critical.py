@@ -100,6 +100,23 @@ class TestRepoMappingHelpers(unittest.TestCase):
         title = "docs: something"
         self.assertEqual(bo.parse_repo_hint(tags, desc, title), "server")
 
+    def test_parse_repo_hint_with_source(self) -> None:
+        hint, source = bo.parse_repo_hint_with_source(["repo:server"], "Repo: web", "docs: something")
+        self.assertEqual(hint, "server")
+        self.assertEqual(source, "tag")
+
+        hint, source = bo.parse_repo_hint_with_source([], "Repo: web", "docs: something")
+        self.assertEqual(hint, "web")
+        self.assertEqual(source, "description")
+
+        hint, source = bo.parse_repo_hint_with_source([], "", "server: something", allow_title_prefix=True)
+        self.assertEqual(hint, "server")
+        self.assertEqual(source, "title")
+
+        hint, source = bo.parse_repo_hint_with_source([], "", "server: something", allow_title_prefix=False)
+        self.assertIsNone(hint)
+        self.assertIsNone(source)
+
     def test_resolve_repo_path_direct_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -20,6 +20,8 @@ import base64
 import json
 import os
 import re
+import shlex
+import subprocess
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,9 +61,23 @@ TAG_NO_REPO = "no-repo"
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 EXCLUSIVE_RE = re.compile(r"^exclusive\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 REPO_RE = re.compile(r"^repo\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+PATCH_MARKER_RE = re.compile(
+    r"(?:patch file|patch to apply|generated patch)\s*:\s*`?([^\s`]+)`?",
+    re.IGNORECASE,
+)
 
 REPO_ROOT = os.environ.get("RECALLDECK_REPO_ROOT", "/Users/joshwegener/Projects/RecallDeck")
 REPO_MAP_PATH = os.environ.get("BOARD_ORCHESTRATOR_REPO_MAP", "")
+WORKER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_DIR", "/Users/joshwegener/clawd/memory/worker-logs")
+WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_BYTES", "20000"))
+WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
+WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "60"))
+MISSING_WORKER_POLICY = os.environ.get("BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY", "pause").strip().lower()
+ALLOW_TITLE_REPO_HINT = os.environ.get("BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
 
 COL_BACKLOG = "Backlog"
 COL_READY = "Ready"
@@ -363,21 +379,34 @@ def merge_repo_maps(*maps: Dict[str, str]) -> Dict[str, str]:
     return pruned
 
 
-def parse_repo_hint(tags: List[str], description: str, title: str) -> Optional[str]:
+def parse_repo_hint_with_source(
+    tags: List[str],
+    description: str,
+    title: str,
+    *,
+    allow_title_prefix: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
     for t in tags:
         if ":" in t:
             a, b = t.split(":", 1)
             if a.strip().lower() == "repo" and b.strip():
-                return b.strip()
+                return b.strip(), "tag"
     if description:
         m = REPO_RE.search(description)
         if m:
-            return m.group(1).strip()
-    if title:
+            return m.group(1).strip(), "description"
+    if allow_title_prefix and title:
         m = re.match(r"^\s*([A-Za-z0-9_-]+)\s*:\s*", title)
         if m:
-            return m.group(1).strip()
-    return None
+            return m.group(1).strip(), "title"
+    return None, None
+
+
+def parse_repo_hint(tags: List[str], description: str, title: str) -> Optional[str]:
+    hint, _source = parse_repo_hint_with_source(
+        tags, description, title, allow_title_prefix=ALLOW_TITLE_REPO_HINT
+    )
+    return hint
 
 
 def resolve_repo_path(repo_hint: Optional[str], repo_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
@@ -397,6 +426,113 @@ def resolve_repo_path(repo_hint: Optional[str], repo_map: Dict[str, str]) -> Tup
     if path and os.path.isdir(path):
         return key, path
     return key, None
+
+
+def worker_entry_for(task_id: int, workers_by_task: Dict[str, Any]) -> Any:
+    if not workers_by_task:
+        return None
+    return workers_by_task.get(str(task_id)) or workers_by_task.get(task_id)
+
+
+def worker_handle(entry: Any) -> Optional[str]:
+    if entry is None:
+        return None
+    if isinstance(entry, str):
+        return entry.strip() or None
+    if not isinstance(entry, dict):
+        return None
+    for key in ("execSessionId", "handle", "sessionId", "session_id"):
+        val = entry.get(key)
+        if val:
+            return str(val)
+    return None
+
+
+def default_worker_log_path(task_id: int) -> str:
+    return os.path.join(WORKER_LOG_DIR, f"task-{task_id}.log")
+
+
+def read_tail(path: str, max_bytes: int) -> str:
+    try:
+        with open(path, "rb") as f:
+            if max_bytes > 0:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(size - max_bytes, 0), os.SEEK_SET)
+            raw = f.read()
+        return raw.decode(errors="ignore")
+    except Exception:
+        return ""
+
+
+def detect_worker_completion(task_id: int, log_path: str) -> Optional[Dict[str, str]]:
+    if not log_path or not os.path.isfile(log_path):
+        return None
+    tail = read_tail(log_path, WORKER_LOG_TAIL_BYTES)
+    if not tail:
+        return None
+    patch_match = PATCH_MARKER_RE.search(tail)
+    comment_marker = f"kanboard-task-{task_id}-comment.md"
+    if patch_match or comment_marker in tail:
+        payload: Dict[str, str] = {"logPath": log_path}
+        if patch_match:
+            payload["patchPath"] = patch_match.group(1)
+        return payload
+    return None
+
+
+def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not WORKER_SPAWN_CMD:
+        return None
+    safe_repo_key = repo_key or ""
+    safe_repo_path = repo_path or ""
+    try:
+        cmd = WORKER_SPAWN_CMD.format(
+            task_id=task_id,
+            repo_key=shlex.quote(safe_repo_key),
+            repo_path=shlex.quote(safe_repo_path),
+        )
+    except Exception:
+        cmd = WORKER_SPAWN_CMD
+    try:
+        out = subprocess.run(
+            cmd,
+            shell=True,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=WORKER_SPAWN_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    raw = (out.stdout or "").strip()
+    if not raw:
+        return None
+    handle: Optional[str] = None
+    log_path: Optional[str] = None
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                handle = payload.get("execSessionId") or payload.get("handle") or payload.get("sessionId")
+                log_path = payload.get("logPath")
+        except Exception:
+            handle = None
+    if not handle:
+        handle = raw.splitlines()[-1].strip()
+    if not log_path:
+        log_path = default_worker_log_path(task_id)
+    return {
+        "kind": "codex",
+        "execSessionId": handle,
+        "logPath": log_path,
+        "startedAtMs": now_ms(),
+        "repoKey": safe_repo_key,
+        "repoPath": safe_repo_path,
+    }
 
 
 def set_task_tags(pid: int, task_id: int, tags: List[str]) -> None:
@@ -639,12 +775,15 @@ def main() -> int:
         created_tasks: List[int] = []
         errors: List[str] = []
 
+        missing_worker_tasks: List[Tuple[Dict[str, Any], int]] = []
+
         # Drift: WIP tasks missing worker handle and/or repo mapping
-        for t, _sl_id in wip_tasks:
+        for t, sl_id in wip_tasks:
             tid = int(t.get("id"))
             title = task_title(t)
-            if str(tid) not in workers_by_task:
-                errors.append(f"drift: WIP #{tid} ({title}) has no worker handle recorded")
+            entry = worker_entry_for(tid, workers_by_task)
+            if not worker_handle(entry):
+                missing_worker_tasks.append((t, sl_id))
             try:
                 if str(tid) in repo_by_task and os.path.isdir(str(repo_by_task.get(str(tid), {}).get("path") or "")):
                     continue
@@ -713,20 +852,66 @@ def main() -> int:
             except Exception:
                 pass
 
-        def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> None:
+        def ensure_worker_handle_for_task(
+            task_id: int,
+            repo_key: Optional[str],
+            repo_path: Optional[str],
+        ) -> bool:
+            entry = worker_entry_for(task_id, workers_by_task)
+            if worker_handle(entry):
+                return True
+            if WORKER_SPAWN_CMD and repo_path:
+                spawned = spawn_worker(task_id, repo_key, repo_path)
+                if spawned:
+                    workers_by_task[str(task_id)] = spawned
+                    return True
+            return False
+
+        def pause_missing_worker(task_id: int, sl_id: int, title: str, reason: str, *, force: bool = False) -> None:
+            nonlocal budget
+            if budget <= 0 and not force:
+                return
+            if dry_run:
+                actions.append(f"Would pause WIP #{task_id} ({title}) -> Paused ({reason})")
+            else:
+                move_task(pid, task_id, int(col_paused["id"]), 1, sl_id)
+                record_action(task_id)
+                add_tag(task_id, TAG_PAUSED)
+                actions.append(f"Paused WIP #{task_id} ({title}) -> Paused ({reason})")
+            if budget > 0:
+                budget -= 1
+
+        def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str], source: Optional[str]) -> None:
             if not repo_key or not repo_path:
                 return
-            repo_by_task[str(task_id)] = {"key": repo_key, "path": repo_path, "resolvedAtMs": now_ms()}
+            payload: Dict[str, Any] = {"key": repo_key, "path": repo_path, "resolvedAtMs": now_ms()}
+            if source:
+                payload["source"] = source
+            repo_by_task[str(task_id)] = payload
 
-        def has_repo_mapping(task_id: int, title: str, tags: List[str], description: str) -> bool:
+        def resolve_repo_for_task(
+            task_id: int,
+            title: str,
+            tags: List[str],
+            description: str,
+        ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
             if has_tag(tags, TAG_NO_REPO):
-                return True
-            hint = parse_repo_hint(tags, description, title)
+                return True, None, None, "tag"
+            hint, source = parse_repo_hint_with_source(
+                tags,
+                description,
+                title,
+                allow_title_prefix=ALLOW_TITLE_REPO_HINT,
+            )
             repo_key, repo_path = resolve_repo_path(hint, repo_map)
             if repo_path:
-                record_repo(task_id, repo_key, repo_path)
-                return True
-            return False
+                record_repo(task_id, repo_key, repo_path, source)
+                return True, repo_key, repo_path, source
+            return False, repo_key, None, source
+
+        def has_repo_mapping(task_id: int, title: str, tags: List[str], description: str) -> bool:
+            ok, _key, _path, _source = resolve_repo_for_task(task_id, title, tags, description)
+            return ok
 
         # Determine dry-run
         dry_runs_remaining = int(state.get("dryRunRunsRemaining") or 0)
@@ -786,6 +971,104 @@ def main() -> int:
                 actions.append(f"Created docs task #{new_id} for review #{rid} ({rtitle})")
 
         budget = ACTION_BUDGET
+
+        # Auto-advance WIP tasks when a worker log shows completed output.
+        completed_wip_ids: List[int] = []
+        if budget > 0 and wip_tasks:
+            for wt, wsl_id in sorted(wip_tasks, key=sort_key):
+                if budget <= 0:
+                    break
+                wid = int(wt.get("id"))
+                wtitle = task_title(wt)
+                entry = worker_entry_for(wid, workers_by_task)
+                if not entry:
+                    continue
+                log_path = None
+                if isinstance(entry, dict):
+                    log_path = entry.get("logPath")
+                if not log_path:
+                    log_path = default_worker_log_path(wid)
+                completion = detect_worker_completion(wid, log_path)
+                if not completion:
+                    continue
+                if dry_run:
+                    actions.append(f"Would move WIP #{wid} ({wtitle}) -> Review (worker output complete)")
+                else:
+                    move_task(pid, wid, int(col_review["id"]), 1, wsl_id)
+                    record_action(wid)
+                    if isinstance(entry, dict):
+                        entry["completedAtMs"] = now_ms()
+                    actions.append(f"Moved WIP #{wid} ({wtitle}) -> Review (worker output complete)")
+                completed_wip_ids.append(wid)
+                budget -= 1
+
+        if completed_wip_ids:
+            wip_tasks = [(t, sl_id) for t, sl_id in wip_tasks if int(t.get("id")) not in completed_wip_ids]
+            wip_count = len(wip_tasks)
+            missing_worker_tasks = [
+                (t, sl_id) for t, sl_id in missing_worker_tasks if int(t.get("id")) not in completed_wip_ids
+            ]
+
+        # Reconcile WIP tasks missing worker handles: spawn or pause deterministically.
+        paused_missing_worker_ids: List[int] = []
+        if budget > 0 and missing_worker_tasks:
+            for wt, wsl_id in sorted(missing_worker_tasks, key=sort_key):
+                if budget <= 0:
+                    break
+                wid = int(wt.get("id"))
+                wtitle = task_title(wt)
+                try:
+                    wtags = get_task_tags(wid)
+                    wfull = get_task(wid)
+                    wdesc = (wfull.get("description") or "")
+                except Exception:
+                    wtags = []
+                    wdesc = ""
+
+                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(wid, wtitle, wtags, wdesc)
+                spawn_allowed = MISSING_WORKER_POLICY == "spawn"
+                spawned = False
+                if spawn_allowed and repo_path:
+                    if dry_run:
+                        actions.append(f"Would spawn worker for WIP #{wid} ({wtitle})")
+                        if not WORKER_SPAWN_CMD:
+                            actions.append(f"Would pause WIP #{wid} ({wtitle}) -> Paused (missing worker handle)")
+                            paused_missing_worker_ids.append(wid)
+                        budget -= 1
+                        continue
+                    if ensure_worker_handle_for_task(wid, repo_key, repo_path):
+                        actions.append(f"Spawned worker for WIP #{wid} ({wtitle})")
+                        budget -= 1
+                        spawned = True
+
+                if spawned:
+                    continue
+
+                reason = "missing worker handle"
+                if not repo_ok and not repo_path:
+                    reason = "missing worker handle + repo mapping"
+                pause_missing_worker(wid, wsl_id, wtitle, reason)
+                paused_missing_worker_ids.append(wid)
+                if budget <= 0:
+                    break
+
+        if paused_missing_worker_ids:
+            wip_tasks = [(t, sl_id) for t, sl_id in wip_tasks if int(t.get("id")) not in paused_missing_worker_ids]
+            wip_count = len(wip_tasks)
+
+        if missing_worker_tasks and budget <= 0:
+            remaining = []
+            for t, _sl_id in missing_worker_tasks:
+                tid = int(t.get("id"))
+                if tid in paused_missing_worker_ids:
+                    continue
+                entry = worker_entry_for(tid, workers_by_task)
+                if worker_handle(entry):
+                    continue
+                remaining.append(tid)
+            if remaining:
+                tail_ids = ", ".join("#" + str(x) for x in sorted(remaining)[:5])
+                errors.append(f"drift: WIP tasks missing worker handle (action budget exhausted): {tail_ids}")
 
         # ---------------------------------------------------------------------
         # CRITICAL MODE (preemptive)
@@ -888,6 +1171,7 @@ def main() -> int:
                 state["pausedByCritical"] = paused_by_critical
                 state["lastActionsByTaskId"] = last_actions
                 state["repoByTaskId"] = repo_by_task
+                state["workersByTaskId"] = workers_by_task
                 state["autoBlockedByOrchestrator"] = auto_blocked
                 save_state(state)
 
@@ -958,7 +1242,8 @@ def main() -> int:
                     errors.append(f"critical #{cid} ({ctitle}) cannot start: {reason}")
                 else:
                     ctags = get_task_tags(cid)
-                    if not has_repo_mapping(cid, ctitle, ctags, desc):
+                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, ctags, desc)
+                    if not repo_ok:
                         if dry_run:
                             actions.append(
                                 f"Would move critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping"
@@ -1002,16 +1287,25 @@ def main() -> int:
                         elif budget > 0:
                             if dry_run:
                                 actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
+                                if not WORKER_SPAWN_CMD:
+                                    actions.append(
+                                        f"Would pause WIP #{cid} ({ctitle}) -> Paused (missing worker handle)"
+                                    )
                             else:
                                 move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
                                 record_action(cid)
                                 moved_to_wip.append(cid)
                                 actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                                if not ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                                    pause_missing_worker(cid, int(csl_id), ctitle, "missing worker handle", force=True)
+                                    if cid in moved_to_wip:
+                                        moved_to_wip.remove(cid)
                             budget -= 1
 
             # While critical exists anywhere not Done, freeze normal pulling.
             state["lastActionsByTaskId"] = last_actions
             state["repoByTaskId"] = repo_by_task
+            state["workersByTaskId"] = workers_by_task
             state["autoBlockedByOrchestrator"] = auto_blocked
             save_state(state)
 
@@ -1032,6 +1326,11 @@ def main() -> int:
         # If WIP > limit, don't pull new work (MVP)
         if wip_count > WIP_LIMIT:
             actions.append(f"WIP is {wip_count} (> {WIP_LIMIT}); not pulling new work")
+            state["lastActionsByTaskId"] = last_actions
+            state["repoByTaskId"] = repo_by_task
+            state["workersByTaskId"] = workers_by_task
+            state["autoBlockedByOrchestrator"] = auto_blocked
+            save_state(state)
             emit_json(
                 mode=mode,
                 actions=actions,
@@ -1325,7 +1624,8 @@ def main() -> int:
                     continue
 
                 ctitle = task_title(candidate)
-                if not has_repo_mapping(cid, ctitle, tags, desc):
+                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, tags, desc)
+                if not repo_ok:
                     if dry_run:
                         actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
                     else:
@@ -1343,18 +1643,28 @@ def main() -> int:
                     did_something = True
                     ready_tasks_sorted = ready_tasks_sorted[1:]
                     continue
+                paused_after_start = False
                 if dry_run:
                     actions.append(f"Would move Ready #{cid} ({ctitle}) -> WIP")
+                    if not WORKER_SPAWN_CMD:
+                        actions.append(f"Would pause WIP #{cid} ({ctitle}) -> Paused (missing worker handle)")
+                        paused_after_start = True
                 else:
                     move_task(pid, cid, int(col_wip["id"]), 1, sl_id)
                     record_action(cid)
                     moved_to_wip.append(cid)
                     actions.append(f"Moved Ready #{cid} ({ctitle}) -> WIP")
+                    if not ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                        pause_missing_worker(cid, sl_id, ctitle, "missing worker handle", force=True)
+                        if cid in moved_to_wip:
+                            moved_to_wip.remove(cid)
+                        paused_after_start = True
                 # simulate state
                 ready_tasks_sorted = ready_tasks_sorted[1:]
-                wip_count += 1
-                for k in ex_keys:
-                    wip_exclusive_keys.add(k)
+                if not paused_after_start:
+                    wip_count += 1
+                    for k in ex_keys:
+                        wip_exclusive_keys.add(k)
                 budget -= 1
                 did_something = True
 
@@ -1364,6 +1674,7 @@ def main() -> int:
         # Persist state updates
         state["lastActionsByTaskId"] = last_actions
         state["repoByTaskId"] = repo_by_task
+        state["workersByTaskId"] = workers_by_task
         state["autoBlockedByOrchestrator"] = auto_blocked
         if dry_run:
             if dry_runs_remaining > 0:

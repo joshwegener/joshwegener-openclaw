@@ -54,7 +54,10 @@ When the orchestrator is about to start a task (Ready → WIP), it must be able 
 Supported hints (first match wins):
 - Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
 - Description line: `Repo: <key-or-path>` (e.g. `Repo: server` or `Repo: /Users/joshwegener/Projects/RecallDeck/RecallDeck-Server`)
-- Title prefix: `<key>:` (e.g. `server: Add /v1/recall`, `web: Improve UI`)
+- Title prefix: `<key>:` (e.g. `server: Add /v1/recall`, `web: Improve UI`) **legacy fallback**
+
+Notes:
+- Prefer tags + explicit `Repo:` hints; title-prefix mapping is legacy and can be disabled via `BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT=0`.
 
 Defaults:
 - The orchestrator auto-discovers repos under `RECALLDECK_REPO_ROOT` (default: `/Users/joshwegener/Projects/RecallDeck`) and adds common aliases (e.g. `api` → `server`).
@@ -78,7 +81,14 @@ Schema (MVP):
   "lastActionsByTaskId": {"28": 1769730000000},
   "swimlanePriority": ["Default swimlane"],
   "workersByTaskId": {
-    "28": {"kind": "codex", "execSessionId": "<clawdbot-exec-sessionId>", "startedAtMs": 1769730000000}
+    "28": {
+      "kind": "codex",
+      "execSessionId": "<clawdbot-exec-sessionId>",
+      "logPath": "/Users/joshwegener/clawd/memory/worker-logs/task-28.log",
+      "repoKey": "server",
+      "repoPath": "/Users/joshwegener/Projects/RecallDeck/RecallDeck-Server",
+      "startedAtMs": 1769730000000
+    }
   }
 }
 ```
@@ -118,6 +128,10 @@ Runs every 15 minutes.
    - Move top Ready item into WIP.
 4) Worker start:
    - For every task moved into WIP, start a worker (Codex) and record the handle.
+   - If `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD` is configured, the orchestrator will attempt to spawn and record the handle immediately.
+   - WIP tasks missing a worker handle are deterministically reconciled: auto-spawn (policy `spawn`) or auto-pause to `Paused` (policy `pause`) via `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY`.
+   - If a task is moved to WIP but no worker handle can be recorded, it is auto-paused to avoid silent WIP.
+   - If a worker log (from `BOARD_ORCHESTRATOR_WORKER_LOG_DIR`) shows a completed output (patch marker / kanboard comment file), the orchestrator auto-moves WIP → Review.
    - If no safe repo mapping is available, do **not** start; instead comment and/or move to Blocked.
 5) Escalation:
    - Anything truly blocked on Josh must go to `Blocked` and message Josh immediately.
