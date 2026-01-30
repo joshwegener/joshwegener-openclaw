@@ -1,4 +1,7 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 from scripts import board_orchestrator as bo
 
@@ -58,6 +61,61 @@ class TestCriticalHelpers(unittest.TestCase):
             bo.critical_column_priority(col_review, col_wip, col_review, col_ready),
             bo.critical_column_priority(col_other, col_wip, col_review, col_ready),
         )
+
+
+class TestRepoMappingHelpers(unittest.TestCase):
+    def test_normalize_repo_key(self) -> None:
+        self.assertEqual(bo.normalize_repo_key("RecallDeck-Server"), "recalldeck-server")
+        self.assertEqual(bo.normalize_repo_key(" server "), "server")
+        self.assertEqual(bo.normalize_repo_key("Server/API"), "server-api")
+
+    def test_discover_repo_map_adds_recalldeck_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "RecallDeck-Server").mkdir()
+            (root / "RecallDeck-Web").mkdir()
+
+            m = bo.discover_repo_map(str(root))
+
+            self.assertIn("recalldeck-server", m)
+            self.assertIn("server", m)
+            self.assertIn("api", m)
+            self.assertIn("recalldeck-web", m)
+            self.assertIn("web", m)
+
+    def test_load_repo_map_from_file_normalizes_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "RecallDeck-Server"
+            server.mkdir()
+            p = root / "map.json"
+            p.write_text(json.dumps({"Server": str(server)}))
+
+            m = bo.load_repo_map_from_file(str(p))
+            self.assertEqual(m["server"], str(server))
+
+    def test_parse_repo_hint_precedence(self) -> None:
+        tags = ["repo:server"]
+        desc = "Repo: web"
+        title = "docs: something"
+        self.assertEqual(bo.parse_repo_hint(tags, desc, title), "server")
+
+    def test_resolve_repo_path_direct_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "MyRepo"
+            repo.mkdir()
+            key, path = bo.resolve_repo_path(str(repo), {})
+            self.assertEqual(key, "myrepo")
+            self.assertEqual(path, str(repo))
+
+    def test_merge_repo_maps_prunes_non_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "RecallDeck-Server"
+            server.mkdir()
+            merged = bo.merge_repo_maps({"server": "/does/not/exist"}, {"server": str(server)})
+            self.assertEqual(merged["server"], str(server))
 
 
 if __name__ == "__main__":
