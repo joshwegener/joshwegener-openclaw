@@ -1,0 +1,22 @@
+# Local secrets
+.env*
+
+# Local state / logs
+memory/
+tmp/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+
+# SQLite + WAL/SHM
+*.sqlite
+*.sqlite-*
+
+# Python
+__pycache__/
+*.pyc
+
+# Worker/review logs (if ever outside memory/)
+*.log
