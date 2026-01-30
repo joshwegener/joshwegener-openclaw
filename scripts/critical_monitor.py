@@ -88,6 +88,10 @@ def main() -> int:
             return [str(v) for v in tagmap.values()]
         return [str(x) for x in tagmap]
 
+    def is_held(tags: List[str]) -> bool:
+        lower = {x.lower() for x in tags}
+        return "hold" in lower or "no-auto" in lower
+
     critical: List[Tuple[Dict[str, Any], List[str], str]] = []
     for t in all_tasks:
         tid = int(t["id"])
@@ -95,7 +99,8 @@ def main() -> int:
         if col == "Done":
             continue
         tags = tags_for(tid)
-        if "critical" in [x.lower() for x in tags]:
+        # Treat "critical" tasks as active only when not held.
+        if "critical" in [x.lower() for x in tags] and not is_held(tags):
             critical.append((t, tags, col))
 
     if not critical:
