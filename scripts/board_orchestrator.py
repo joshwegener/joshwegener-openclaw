@@ -50,7 +50,8 @@ TAG_DOCS_REQUIRED = "docs-required"
 TAG_CRITICAL = "critical"
 TAG_PAUSED = "paused"
 
-DEPENDS_RE = re.compile(r"^depends on\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+# Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
+DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 EXCLUSIVE_RE = re.compile(r"^exclusive\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 COL_BACKLOG = "Backlog"
@@ -238,9 +239,12 @@ def parse_depends_on(description: str) -> List[int]:
     if not m:
         return []
     raw = m.group(1)
-    ids = []
-    for part in raw.split(','):
+    ids: List[int] = []
+    # allow comma- or whitespace-separated lists
+    for part in re.split(r"[\s,]+", raw.strip()):
         part = part.strip()
+        if not part:
+            continue
         if part.startswith('#'):
             part = part[1:]
         if part.isdigit():
