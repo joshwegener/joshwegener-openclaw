@@ -36,6 +36,23 @@ The orchestrator must not move/start a task until all dependencies are in **Done
 Epic linkage:
 - For each child task, add a note/comment: `Epic: #<epicId> <epicTitle>`
 
+## Repo mapping (required for auto-start)
+The orchestrator only auto-starts tasks (Ready → WIP) when it can map the task to a local repo.
+
+Provide a mapping via one of:
+- Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
+- Description line: `Repo: <key-or-path>`
+- Title prefix: `<key>:` (e.g. `server: ...`, `web: ...`)
+
+If a task truly has no repo (planning/research), add tag `no-repo` so it can still be started.
+
+## Auto-block + auto-heal (self-healing)
+When a task can’t be started for a deterministic reason, the orchestrator may move it to `Blocked` and tag it:
+- `auto-blocked`
+- plus one reason tag: `blocked:deps`, `blocked:exclusive`, or `blocked:repo`
+
+When the reason clears, the orchestrator auto-heals the task from `Blocked` back to `Ready` and removes those tags.
+
 ## Epic breakdown rule (idempotent)
 
 - Epic container cards are **not** coding tasks.

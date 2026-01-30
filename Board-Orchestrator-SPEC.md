@@ -48,6 +48,25 @@ Rules:
 Linking epic children:
 - Each child task should get a comment: `Epic: #<epicId> <epicTitle>`
 
+## Repo mapping (worker start)
+When the orchestrator is about to start a task (Ready → WIP), it must be able to map the task to a local repo.
+
+Supported hints (first match wins):
+- Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
+- Description line: `Repo: <key-or-path>` (e.g. `Repo: server` or `Repo: /Users/joshwegener/Projects/RecallDeck/RecallDeck-Server`)
+- Title prefix: `<key>:` (e.g. `server: Add /v1/recall`, `web: Improve UI`)
+
+Defaults:
+- The orchestrator auto-discovers repos under `RECALLDECK_REPO_ROOT` (default: `/Users/joshwegener/Projects/RecallDeck`) and adds common aliases (e.g. `api` → `server`).
+- If a task truly has no repo (planning/research), add tag `no-repo` to bypass mapping.
+
+## Auto-block + auto-heal (self-healing)
+If a task cannot be started due to a deterministic constraint, the orchestrator may move it to `Blocked` and tag it:
+- `auto-blocked`
+- plus one reason tag: `blocked:deps`, `blocked:exclusive`, or `blocked:repo`
+
+When the constraint clears (deps done, exclusive freed, repo mapping available), the orchestrator will auto-heal the task from `Blocked` back to `Ready` and remove those tags.
+
 ## State + safety
 State file: `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
 

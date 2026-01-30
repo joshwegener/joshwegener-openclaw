@@ -49,10 +49,19 @@ TAG_EPIC_CHILD = "epic-child"
 TAG_DOCS_REQUIRED = "docs-required"
 TAG_CRITICAL = "critical"
 TAG_PAUSED = "paused"
+TAG_AUTO_BLOCKED = "auto-blocked"
+TAG_BLOCKED_DEPS = "blocked:deps"
+TAG_BLOCKED_EXCLUSIVE = "blocked:exclusive"
+TAG_BLOCKED_REPO = "blocked:repo"
+TAG_NO_REPO = "no-repo"
 
 # Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 EXCLUSIVE_RE = re.compile(r"^exclusive\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+REPO_RE = re.compile(r"^repo\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+REPO_ROOT = os.environ.get("RECALLDECK_REPO_ROOT", "/Users/joshwegener/Projects/RecallDeck")
+REPO_MAP_PATH = os.environ.get("BOARD_ORCHESTRATOR_REPO_MAP", "")
 
 COL_BACKLOG = "Backlog"
 COL_READY = "Ready"
@@ -149,6 +158,10 @@ def load_state() -> Dict[str, Any]:
         # critical-mode bookkeeping (optional, self-healing)
         "critical": {},
         "pausedByCritical": {},
+        # repo mapping + auto-block bookkeeping (optional, self-healing)
+        "repoMap": {},
+        "repoByTaskId": {},
+        "autoBlockedByOrchestrator": {},
     }
 
 
@@ -277,6 +290,115 @@ def parse_exclusive_keys(tags: List[str], description: str) -> List[str]:
     return out
 
 
+def normalize_repo_key(key: str) -> str:
+    k = (key or "").strip().lower()
+    k = re.sub(r"[^a-z0-9]+", "-", k).strip("-")
+    return k
+
+
+def load_repo_map_from_file(path: str) -> Dict[str, str]:
+    if not path:
+        return {}
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            out: Dict[str, str] = {}
+            for k, v in raw.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    continue
+                out[normalize_repo_key(k)] = os.path.expanduser(v)
+            return out
+    except Exception:
+        return {}
+    return {}
+
+
+def discover_repo_map(repo_root: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not repo_root:
+        return out
+    root = os.path.expanduser(repo_root)
+    if not os.path.isdir(root):
+        return out
+    try:
+        entries = os.listdir(root)
+    except Exception:
+        return out
+
+    for name in entries:
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        full_key = normalize_repo_key(name)
+        if not full_key:
+            continue
+        out[full_key] = path
+        if full_key.startswith("recalldeck-"):
+            out[full_key[len("recalldeck-") :]] = path
+
+    # common aliases
+    if "server" in out:
+        out.setdefault("api", out["server"])
+        out.setdefault("backend", out["server"])
+    if "web" in out:
+        out.setdefault("frontend", out["web"])
+        out.setdefault("ui", out["web"])
+    return out
+
+
+def merge_repo_maps(*maps: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in maps:
+        for k, v in (m or {}).items():
+            kk = normalize_repo_key(k)
+            if not kk or not isinstance(v, str):
+                continue
+            out[kk] = os.path.expanduser(v)
+    # prune obvious non-dirs; keep if empty (caller can decide)
+    pruned: Dict[str, str] = {}
+    for k, p in out.items():
+        if os.path.isdir(p):
+            pruned[k] = p
+    return pruned
+
+
+def parse_repo_hint(tags: List[str], description: str, title: str) -> Optional[str]:
+    for t in tags:
+        if ":" in t:
+            a, b = t.split(":", 1)
+            if a.strip().lower() == "repo" and b.strip():
+                return b.strip()
+    if description:
+        m = REPO_RE.search(description)
+        if m:
+            return m.group(1).strip()
+    if title:
+        m = re.match(r"^\s*([A-Za-z0-9_-]+)\s*:\s*", title)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def resolve_repo_path(repo_hint: Optional[str], repo_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    if not repo_hint:
+        return None, None
+    hint = repo_hint.strip()
+
+    # Direct path hint (Repo: /path/to/repo)
+    if ("/" in hint or "\\" in hint) and os.path.isdir(os.path.expanduser(hint)):
+        p = os.path.expanduser(hint)
+        return normalize_repo_key(os.path.basename(p)), p
+
+    key = normalize_repo_key(hint)
+    if not key:
+        return None, None
+    path = (repo_map or {}).get(key)
+    if path and os.path.isdir(path):
+        return key, path
+    return key, None
+
+
 def set_task_tags(pid: int, task_id: int, tags: List[str]) -> None:
     rpc("setTaskTags", [pid, task_id, tags])
 
@@ -400,6 +522,21 @@ def main() -> int:
 
     try:
         state = load_state()
+
+        # Repo mapping (self-healing):
+        # - Merge any persisted mapping with optional JSON mapping file and
+        #   auto-discovered repos under REPO_ROOT.
+        existing_repo_map = state.get("repoMap") or {}
+        file_repo_map = load_repo_map_from_file(REPO_MAP_PATH)
+        discovered_repo_map = discover_repo_map(REPO_ROOT)
+        if file_repo_map or discovered_repo_map:
+            merged_repo_map = merge_repo_maps(existing_repo_map, file_repo_map, discovered_repo_map)
+            if merged_repo_map:
+                state["repoMap"] = merged_repo_map
+        repo_map: Dict[str, str] = (state.get("repoMap") or {})
+        repo_by_task: Dict[str, Any] = (state.get("repoByTaskId") or {})
+        auto_blocked: Dict[str, Any] = (state.get("autoBlockedByOrchestrator") or {})
+
         pid = get_project_id()
         board = get_board(pid)
         swimlanes = best_swimlanes(board, state.get("swimlanePriority") or ["Default swimlane"])
@@ -463,6 +600,23 @@ def main() -> int:
         review_tasks = tasks_for_column(int(col_review["id"]))
         paused_tasks = tasks_for_column(int(col_paused["id"]))
         blocked_tasks = tasks_for_column(int(col_blocked["id"]))
+        done_tasks = tasks_for_column(int(col_done["id"]))
+
+        # Self-heal state: drop stale bookkeeping for tasks no longer in those columns.
+        blocked_ids = {int(t.get("id")) for t, _sl in blocked_tasks}
+        done_ids = {int(t.get("id")) for t, _sl in done_tasks}
+        for k in list(auto_blocked.keys()):
+            try:
+                if int(k) not in blocked_ids:
+                    auto_blocked.pop(k, None)
+            except Exception:
+                auto_blocked.pop(k, None)
+        for k in list(repo_by_task.keys()):
+            try:
+                if int(k) in done_ids:
+                    repo_by_task.pop(k, None)
+            except Exception:
+                repo_by_task.pop(k, None)
 
         # Sort helper
         def sort_key(item: Tuple[Any, ...]) -> Tuple[int, int]:
@@ -485,12 +639,24 @@ def main() -> int:
         created_tasks: List[int] = []
         errors: List[str] = []
 
-        # Drift: WIP tasks missing worker handle
+        # Drift: WIP tasks missing worker handle and/or repo mapping
         for t, _sl_id in wip_tasks:
             tid = int(t.get("id"))
             title = task_title(t)
             if str(tid) not in workers_by_task:
                 errors.append(f"drift: WIP #{tid} ({title}) has no worker handle recorded")
+            try:
+                if str(tid) in repo_by_task and os.path.isdir(str(repo_by_task.get(str(tid), {}).get("path") or "")):
+                    continue
+                tags = get_task_tags(tid)
+                full = get_task(tid)
+                desc = (full.get("description") or "")
+                if not has_repo_mapping(tid, title, tags, desc):
+                    errors.append(
+                        f"drift: WIP #{tid} ({title}) has no repo mapping (add 'Repo:' in description or tag repo:<key>)"
+                    )
+            except Exception:
+                pass
 
         # Docs drift is handled after dry-run mode is computed.
 
@@ -522,6 +688,45 @@ def main() -> int:
                     set_task_tags(pid, task_id, new_tags)
             except Exception:
                 pass
+
+        def add_tags(task_id: int, tags_to_add: List[str]) -> None:
+            try:
+                existing = get_task_tags(task_id)
+                lower = {t.lower() for t in existing}
+                merged = existing[:]
+                for t in tags_to_add:
+                    if t and t.lower() not in lower:
+                        merged.append(t)
+                        lower.add(t.lower())
+                if merged != existing:
+                    set_task_tags(pid, task_id, merged)
+            except Exception:
+                pass
+
+        def remove_tags(task_id: int, tags_to_remove: List[str]) -> None:
+            try:
+                existing = get_task_tags(task_id)
+                remove_lower = {t.lower() for t in tags_to_remove if t}
+                new_tags = [t for t in existing if t.strip().lower() not in remove_lower]
+                if new_tags != existing:
+                    set_task_tags(pid, task_id, new_tags)
+            except Exception:
+                pass
+
+        def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> None:
+            if not repo_key or not repo_path:
+                return
+            repo_by_task[str(task_id)] = {"key": repo_key, "path": repo_path, "resolvedAtMs": now_ms()}
+
+        def has_repo_mapping(task_id: int, title: str, tags: List[str], description: str) -> bool:
+            if has_tag(tags, TAG_NO_REPO):
+                return True
+            hint = parse_repo_hint(tags, description, title)
+            repo_key, repo_path = resolve_repo_path(hint, repo_map)
+            if repo_path:
+                record_repo(task_id, repo_key, repo_path)
+                return True
+            return False
 
         # Determine dry-run
         dry_runs_remaining = int(state.get("dryRunRunsRemaining") or 0)
@@ -682,6 +887,8 @@ def main() -> int:
             if not dry_run:
                 state["pausedByCritical"] = paused_by_critical
                 state["lastActionsByTaskId"] = last_actions
+                state["repoByTaskId"] = repo_by_task
+                state["autoBlockedByOrchestrator"] = auto_blocked
                 save_state(state)
 
             emit_json(
@@ -750,43 +957,62 @@ def main() -> int:
                     reason = "Depends on " + ", ".join("#" + str(x) for x in unmet)
                     errors.append(f"critical #{cid} ({ctitle}) cannot start: {reason}")
                 else:
-                    pause_noncritical_wip()
-
-                    critical_wip_exclusive_keys: set[str] = set()
-                    for wt, _wsl in wip_tasks:
-                        wid = int(wt.get("id"))
-                        if wid == cid or wid not in critical_task_ids:
-                            continue
-                        wtags = get_task_tags(wid)
-                        wdesc = (get_task(wid).get("description") or "")
-                        for k in parse_exclusive_keys(wtags, wdesc):
-                            critical_wip_exclusive_keys.add(k)
-
                     ctags = get_task_tags(cid)
-                    ex_keys = parse_exclusive_keys(ctags, desc)
-                    ex_conflicts = [k for k in ex_keys if k in critical_wip_exclusive_keys]
-
-                    if ex_conflicts:
-                        errors.append(
-                            "critical #"
-                            + str(cid)
-                            + " ("
-                            + ctitle
-                            + ") cannot start: Exclusive conflict: "
-                            + ", ".join("exclusive:" + k for k in ex_conflicts)
-                        )
-                    elif budget > 0:
+                    if not has_repo_mapping(cid, ctitle, ctags, desc):
                         if dry_run:
-                            actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
+                            actions.append(
+                                f"Would move critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping"
+                            )
                         else:
-                            move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
+                            move_task(pid, cid, int(col_blocked["id"]), 1, int(csl_id))
                             record_action(cid)
-                            moved_to_wip.append(cid)
-                            actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                            add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_REPO])
+                            auto_blocked[str(cid)] = {
+                                "reason": "repo",
+                                "blockedAtMs": now_ms(),
+                                "from": "critical",
+                            }
+                            actions.append(f"Moved critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
                         budget -= 1
+                    else:
+                        pause_noncritical_wip()
+
+                        critical_wip_exclusive_keys: set[str] = set()
+                        for wt, _wsl in wip_tasks:
+                            wid = int(wt.get("id"))
+                            if wid == cid or wid not in critical_task_ids:
+                                continue
+                            wtags = get_task_tags(wid)
+                            wdesc = (get_task(wid).get("description") or "")
+                            for k in parse_exclusive_keys(wtags, wdesc):
+                                critical_wip_exclusive_keys.add(k)
+
+                        ex_keys = parse_exclusive_keys(ctags, desc)
+                        ex_conflicts = [k for k in ex_keys if k in critical_wip_exclusive_keys]
+
+                        if ex_conflicts:
+                            errors.append(
+                                "critical #"
+                                + str(cid)
+                                + " ("
+                                + ctitle
+                                + ") cannot start: Exclusive conflict: "
+                                + ", ".join("exclusive:" + k for k in ex_conflicts)
+                            )
+                        elif budget > 0:
+                            if dry_run:
+                                actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
+                            else:
+                                move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
+                                record_action(cid)
+                                moved_to_wip.append(cid)
+                                actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                            budget -= 1
 
             # While critical exists anywhere not Done, freeze normal pulling.
             state["lastActionsByTaskId"] = last_actions
+            state["repoByTaskId"] = repo_by_task
+            state["autoBlockedByOrchestrator"] = auto_blocked
             save_state(state)
 
             emit_json(
@@ -878,6 +1104,12 @@ def main() -> int:
                         blocked = (t, sl_id, f"Exclusive conflict: {', '.join('exclusive:'+k for k in ex_keys if k in wip_exclusive_keys)}")
                     continue
 
+                # repo mapping (required for auto-start)
+                if not has_repo_mapping(tid, title, tags, desc):
+                    if blocked is None:
+                        blocked = (t, sl_id, "No repo mapping (add 'Repo:' or tag repo:<key>)")
+                    continue
+
                 return (t, sl_id), epic, blocked
 
             return None, epic, blocked
@@ -898,23 +1130,94 @@ def main() -> int:
         while budget > 0:
             did_something = False
 
+            # 0) Auto-heal Blocked tasks that were auto-blocked and are now clear.
+            # Only do this when Ready is empty to avoid thrash.
+            if budget > 0 and not ready_tasks_sorted and blocked_tasks:
+                blocked_sorted = sorted(tasks_for_column(int(col_blocked["id"])), key=sort_key)
+                for bt, bsl_id in blocked_sorted:
+                    bid = int(bt.get("id"))
+                    btitle = task_title(bt)
+                    try:
+                        btags = get_task_tags(bid)
+                    except Exception:
+                        btags = []
+                    if is_held(btags):
+                        continue
+                    if not has_tag(btags, TAG_AUTO_BLOCKED):
+                        continue
+                    if not cooled(bid):
+                        continue
+                    try:
+                        full = get_task(bid)
+                        desc = (full.get("description") or "")
+                    except Exception:
+                        desc = ""
+
+                    deps = parse_depends_on(desc)
+                    unmet = [d for d in deps if not is_done(d)]
+                    if unmet:
+                        continue
+
+                    ex_keys = parse_exclusive_keys(btags, desc)
+                    if any(k in wip_exclusive_keys for k in ex_keys):
+                        continue
+
+                    if not has_repo_mapping(bid, btitle, btags, desc):
+                        continue
+
+                    if dry_run:
+                        actions.append(f"Would auto-heal Blocked #{bid} ({btitle}) -> Ready")
+                    else:
+                        move_task(pid, bid, int(col_ready["id"]), 1, bsl_id)
+                        record_action(bid)
+                        promoted_to_ready.append(bid)
+                        remove_tags(
+                            bid,
+                            [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS, TAG_BLOCKED_EXCLUSIVE, TAG_BLOCKED_REPO],
+                        )
+                        auto_blocked.pop(str(bid), None)
+                        actions.append(f"Auto-healed Blocked #{bid} ({btitle}) -> Ready")
+                    budget -= 1
+                    did_something = True
+                    # refresh lists
+                    ready_tasks_sorted = sorted(tasks_for_column(int(col_ready["id"])), key=sort_key)
+                    backlog_sorted = sorted(tasks_for_column(int(col_backlog["id"])), key=sort_key)
+                    break
+
             # 1) If Ready is empty and Backlog has work, promote one item to Ready.
             if not ready_tasks_sorted and backlog_sorted:
                 picked, epic_container, blocked_candidate = pick_next_backlog_action()
 
-                # If the next candidate is blocked by deps/exclusive, move it to Blocked with a clear reason.
-                if picked is None and blocked_candidate is not None and not dry_run:
+                # If the next candidate is blocked by deps/exclusive/repo, move it to Blocked with a clear reason.
+                if picked is None and blocked_candidate is not None:
                     bt, bsl_id, reason = blocked_candidate
-                    bid = int(bt.get('id'))
+                    bid = int(bt.get("id"))
                     btitle = task_title(bt)
-                    move_task(pid, bid, int(col_blocked["id"]), 1, bsl_id)
-                    record_action(bid)
-                    actions.append(f"Moved Backlog #{bid} ({btitle}) -> Blocked (auto): {reason}")
+                    reason_lower = (reason or "").lower()
+                    reason_tag = TAG_BLOCKED_REPO
+                    if reason_lower.startswith("depends on"):
+                        reason_tag = TAG_BLOCKED_DEPS
+                    elif reason_lower.startswith("exclusive conflict"):
+                        reason_tag = TAG_BLOCKED_EXCLUSIVE
+
+                    if dry_run:
+                        actions.append(f"Would move Backlog #{bid} ({btitle}) -> Blocked (auto): {reason}")
+                    else:
+                        move_task(pid, bid, int(col_blocked["id"]), 1, bsl_id)
+                        record_action(bid)
+                        add_tags(bid, [TAG_AUTO_BLOCKED, reason_tag])
+                        auto_blocked[str(bid)] = {
+                            "reason": reason_tag,
+                            "detail": reason,
+                            "blockedAtMs": now_ms(),
+                            "fromColumn": COL_BACKLOG,
+                        }
+                        actions.append(f"Moved Backlog #{bid} ({btitle}) -> Blocked (auto): {reason}")
                     budget -= 1
                     did_something = True
-                    # refresh sorted lists next loop
+                    # simulate state / refresh sorted lists next loop
+                    backlog_sorted = [(t, sid) for (t, sid) in backlog_sorted if int(t.get("id")) != bid]
                     ready_tasks_sorted = sorted(tasks_for_column(int(col_ready["id"])), key=sort_key)
-                    backlog_sorted = sorted(tasks_for_column(int(col_backlog["id"])), key=sort_key)
                     continue
 
                 if picked is not None:
@@ -986,17 +1289,26 @@ def main() -> int:
                 desc = (full.get('description') or '')
                 deps = parse_depends_on(desc)
                 unmet = [d for d in deps if not is_done(d)]
-                if unmet and not dry_run:
+                if unmet:
                     ctitle = task_title(candidate)
-                    move_task(pid, cid, int(col_blocked["id"]), 1, sl_id)
-                    record_action(cid)
-                    actions.append(
-                        f"Moved Ready #{cid} ({ctitle}) -> Blocked (auto): Depends on {', '.join('#'+str(x) for x in unmet)}"
-                    )
+                    reason = "Depends on " + ", ".join("#" + str(x) for x in unmet)
+                    if dry_run:
+                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): {reason}")
+                    else:
+                        move_task(pid, cid, int(col_blocked["id"]), 1, sl_id)
+                        record_action(cid)
+                        add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS])
+                        auto_blocked[str(cid)] = {
+                            "reason": TAG_BLOCKED_DEPS,
+                            "detail": reason,
+                            "blockedAtMs": now_ms(),
+                            "fromColumn": COL_READY,
+                        }
+                        actions.append(f"Moved Ready #{cid} ({ctitle}) -> Blocked (auto): {reason}")
                     budget -= 1
                     did_something = True
-                    # refresh lists
-                    ready_tasks_sorted = sorted(tasks_for_column(int(col_ready["id"])), key=sort_key)
+                    # simulate / refresh lists
+                    ready_tasks_sorted = ready_tasks_sorted[1:]
                     continue
 
                 ex_keys = parse_exclusive_keys(tags, desc)
@@ -1013,6 +1325,24 @@ def main() -> int:
                     continue
 
                 ctitle = task_title(candidate)
+                if not has_repo_mapping(cid, ctitle, tags, desc):
+                    if dry_run:
+                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
+                    else:
+                        move_task(pid, cid, int(col_blocked["id"]), 1, sl_id)
+                        record_action(cid)
+                        add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_REPO])
+                        auto_blocked[str(cid)] = {
+                            "reason": TAG_BLOCKED_REPO,
+                            "detail": "No repo mapping",
+                            "blockedAtMs": now_ms(),
+                            "fromColumn": COL_READY,
+                        }
+                        actions.append(f"Moved Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
+                    budget -= 1
+                    did_something = True
+                    ready_tasks_sorted = ready_tasks_sorted[1:]
+                    continue
                 if dry_run:
                     actions.append(f"Would move Ready #{cid} ({ctitle}) -> WIP")
                 else:
@@ -1033,6 +1363,8 @@ def main() -> int:
 
         # Persist state updates
         state["lastActionsByTaskId"] = last_actions
+        state["repoByTaskId"] = repo_by_task
+        state["autoBlockedByOrchestrator"] = auto_blocked
         if dry_run:
             if dry_runs_remaining > 0:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1
