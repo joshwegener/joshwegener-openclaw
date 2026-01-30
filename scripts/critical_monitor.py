@@ -128,20 +128,24 @@ def main() -> int:
     active_task, _active_tags, active_col = critical_sorted[0]
     active_id = int(active_task["id"])
 
-    wip = [t for t in all_tasks if col_by_id.get(int(t.get("column_id") or 0), "") == "Work in progress"]
-    noncrit_in_wip: List[Tuple[int, str]] = []
-    for t in wip:
-        tid = int(t["id"])
-        tags = tags_for(tid)
-        if "critical" not in [x.lower() for x in tags]:
-            noncrit_in_wip.append((tid, (t.get("title") or "").strip()))
+    # Only enforce the "WIP must be critical-only" invariant when the critical task is actually
+    # active (in WIP or Review). If a critical ticket is still sitting in Backlog/Ready/Blocked,
+    # the orchestrator hasn't had a chance to preempt yet; alerting here just creates noise.
+    if active_col in ("Work in progress", "Review"):
+        wip = [t for t in all_tasks if col_by_id.get(int(t.get("column_id") or 0), "") == "Work in progress"]
+        noncrit_in_wip: List[Tuple[int, str]] = []
+        for t in wip:
+            tid = int(t["id"])
+            tags = tags_for(tid)
+            if "critical" not in [x.lower() for x in tags]:
+                noncrit_in_wip.append((tid, (t.get("title") or "").strip()))
 
-    if noncrit_in_wip:
-        msg = "ALERT: Non-critical tasks still in WIP while critical is active:\n" + "\n".join(
-            [f"#{tid} {title}" for tid, title in noncrit_in_wip]
-        )
-        print(msg)
-        return 0
+        if noncrit_in_wip:
+            msg = "ALERT: Non-critical tasks still in WIP while critical is active:\n" + "\n".join(
+                [f"#{tid} {title}" for tid, title in noncrit_in_wip]
+            )
+            print(msg)
+            return 0
 
     if active_col == "Work in progress" and str(active_id) not in workers:
         print(f"ALERT: Active critical #{active_id} is in WIP but has no worker handle recorded in state")
