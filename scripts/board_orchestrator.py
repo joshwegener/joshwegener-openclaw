@@ -1356,18 +1356,20 @@ def main() -> int:
                     wdesc = ""
 
                 repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(wid, wtitle, wtags, wdesc)
-                spawn_allowed = MISSING_WORKER_POLICY == "spawn"
+                is_critical_wip = is_critical(wtags) and not is_held(wtags)
+                spawn_allowed = MISSING_WORKER_POLICY == "spawn" or is_critical_wip
+                label = "critical WIP" if is_critical_wip else "WIP"
                 spawned = False
                 if spawn_allowed and repo_path:
                     if dry_run:
-                        actions.append(f"Would spawn worker for WIP #{wid} ({wtitle})")
+                        actions.append(f"Would spawn worker for {label} #{wid} ({wtitle})")
                         if not WORKER_SPAWN_CMD:
-                            actions.append(f"Would pause WIP #{wid} ({wtitle}) -> Paused (missing worker handle)")
+                            actions.append(f"Would pause {label} #{wid} ({wtitle}) -> Paused (missing worker handle)")
                             paused_missing_worker_ids.append(wid)
                         budget -= 1
                         continue
                     if ensure_worker_handle_for_task(wid, repo_key, repo_path):
-                        actions.append(f"Spawned worker for WIP #{wid} ({wtitle})")
+                        actions.append(f"Spawned worker for {label} #{wid} ({wtitle})")
                         budget -= 1
                         spawned = True
 
@@ -1377,7 +1379,7 @@ def main() -> int:
                 reason = "missing worker handle"
                 if not repo_ok and not repo_path:
                     reason = "missing worker handle + repo mapping"
-                pause_missing_worker(wid, wsl_id, wtitle, reason)
+                pause_missing_worker(wid, wsl_id, wtitle, reason, label=label)
                 paused_missing_worker_ids.append(wid)
                 if budget <= 0:
                     break
@@ -1737,6 +1739,35 @@ def main() -> int:
                 state['pausedByCritical'] = paused_state
 
             if critical_in_progress:
+                budget = max(budget, ACTION_BUDGET_CRITICAL)
+                entry = worker_entry_for(cid, workers_by_task)
+                if not worker_handle(entry):
+                    try:
+                        ctags = get_task_tags(cid)
+                        cfull = get_task(cid)
+                        cdesc = (cfull.get("description") or "")
+                    except Exception:
+                        ctags = []
+                        cdesc = ""
+                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, ctags, cdesc)
+                    if repo_path and ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                        if worker_handle(worker_entry_for(cid, workers_by_task)):
+                            actions.append(f"Spawned worker for active critical #{cid} ({ctitle})")
+                        else:
+                            pause_missing_worker(
+                                cid,
+                                int(csl_id),
+                                ctitle,
+                                "worker spawn returned no handle",
+                                label="critical",
+                            )
+                    else:
+                        reason = "missing worker handle"
+                        if not repo_ok and not repo_path:
+                            reason = "missing worker handle + repo mapping"
+                        if not WORKER_SPAWN_CMD:
+                            reason = "missing worker handle (no worker spawn command configured)"
+                        pause_missing_worker(cid, int(csl_id), ctitle, reason, label="critical")
                 pause_noncritical_wip()
 
             else:
@@ -1806,10 +1837,21 @@ def main() -> int:
                                     actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                             else:
                                 if ensure_worker_handle_for_task(cid, repo_key, repo_path):
-                                    move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
-                                    record_action(cid)
-                                    moved_to_wip.append(cid)
-                                    actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                                    entry = worker_entry_for(cid, workers_by_task)
+                                    if worker_handle(entry):
+                                        move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
+                                        record_action(cid)
+                                        moved_to_wip.append(cid)
+                                        actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                                    else:
+                                        pause_missing_worker(
+                                            cid,
+                                            int(csl_id),
+                                            ctitle,
+                                            "worker spawn returned no handle",
+                                            force=True,
+                                            label="critical",
+                                        )
                                 else:
                                     pause_missing_worker(
                                         cid,
