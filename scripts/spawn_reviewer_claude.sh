@@ -55,7 +55,7 @@ printf "### REVIEW START %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_PATH"
 
 claude -p --model opus --dangerously-skip-permissions --output-format text "$PROMPT" > "$tmp"
 
-compact="$(python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin),separators=(',',':')))" < "$tmp")"
+compact="$(python3 /Users/joshwegener/clawd/scripts/compact_json.py "$tmp")"
 
 printf "%s\n" "$compact" >> "$LOG_PATH"
 printf "review_result: %s\n" "$compact" >> "$LOG_PATH"
