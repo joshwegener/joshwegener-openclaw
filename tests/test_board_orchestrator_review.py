@@ -84,6 +84,24 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertEqual(result.get("score"), 90)
         self.assertEqual(result.get("verdict"), "PASS")
 
+    def test_parse_review_result_json_on_next_line(self) -> None:
+        text = "REVIEW_RESULT:\n{\"score\": 88, \"verdict\": \"PASS\"}\n"
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 88)
+        self.assertEqual(result.get("verdict"), "PASS")
+
+    def test_parse_review_result_fenced_json(self) -> None:
+        text = (
+            "review_result: ```json\n"
+            "{\"score\": 89, \"verdict\": \"PASS\"}\n"
+            "```\n"
+        )
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 89)
+        self.assertEqual(result.get("verdict"), "PASS")
+
 
 class TestDetectReviewResult(unittest.TestCase):
     def test_detect_review_result_after_marker(self) -> None:
