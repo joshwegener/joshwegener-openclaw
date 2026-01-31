@@ -1,5 +1,6 @@
 import unittest
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 
@@ -25,6 +26,45 @@ class TestReviewResultParsing(unittest.TestCase):
     def test_parse_review_result_invalid(self) -> None:
         text = "REVIEW_RESULT: verdict=PASS"
         self.assertIsNone(bo.parse_review_result(text))
+
+    def test_parse_review_result_lowercase_and_space(self) -> None:
+        text = "review result: score=88 verdict=pass"
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 88)
+        self.assertEqual(result.get("verdict"), "PASS")
+
+    def test_parse_review_result_last_match_wins(self) -> None:
+        text = (
+            "review_result: score=91 verdict=PASS\n"
+            "noise\n"
+            "REVIEW_RESULT: score=70 verdict=REWORK\n"
+        )
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 70)
+        self.assertEqual(result.get("verdict"), "REWORK")
+
+
+class TestDetectReviewResult(unittest.TestCase):
+    def test_detect_review_result_after_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "review.log"
+            stale = json.dumps({"score": 60, "verdict": "REWORK"})
+            fresh = json.dumps({"score": 95, "verdict": "PASS"})
+            p.write_text(
+                "\n".join(
+                    [
+                        "review_result: " + stale,
+                        "### REVIEW START 2026-01-31T00:00:00Z",
+                        "review_result: " + fresh,
+                    ]
+                )
+            )
+            result = bo.detect_review_result(1, str(p))
+            self.assertIsNotNone(result)
+            self.assertEqual(result.get("score"), 95)
+            self.assertEqual(result.get("verdict"), "PASS")
 
 
 class TestReviewRevisionHelpers(unittest.TestCase):
