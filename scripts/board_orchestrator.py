@@ -333,8 +333,8 @@ def acquire_lock(run_id: str) -> Optional[Dict[str, Any]]:
     if strategy == "flock":
         # No implicit fallback: explicit config switch required.
         return acquire_lock_flock(run_id)
-    # Unknown strategy: fall back to legacy for safety.
-    return acquire_lock_legacy(run_id)
+    # Unknown strategy: refuse to run (avoid implicit stale-file behavior).
+    return None
 
 
 def release_lock(lock: Optional[Dict[str, Any]]) -> None:
