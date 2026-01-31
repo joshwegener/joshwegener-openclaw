@@ -60,7 +60,17 @@ TAG_BLOCKED_DEPS = "blocked:deps"
 TAG_BLOCKED_EXCLUSIVE = "blocked:exclusive"
 TAG_BLOCKED_REPO = "blocked:repo"
 TAG_NO_REPO = "no-repo"
-TAG_NEEDS_REWORK = "needs-rework"
+TAG_NEEDS_REWORK = "needs-rework"  # legacy
+
+TAG_REVIEW_AUTO = "review:auto"
+TAG_REVIEW_PENDING = "review:pending"
+TAG_REVIEW_INFLIGHT = "review:inflight"
+TAG_REVIEW_PASS = "review:pass"
+TAG_REVIEW_REWORK = "review:rework"
+TAG_REVIEW_BLOCKED_WIP = "review:blocked:wip"
+TAG_REVIEW_ERROR = "review:error"
+TAG_REVIEW_SKIP = "review:skip"
+TAG_REVIEW_RERUN = "review:rerun"
 
 # Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -70,7 +80,7 @@ PATCH_MARKER_RE = re.compile(
     r"(?:patch file|patch to apply|generated patch)\s*:\s*`?([^\s`]+)`?",
     re.IGNORECASE,
 )
-REVIEW_RESULT_RE = re.compile(r"review_result\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+REVIEW_RESULT_RE = re.compile(r"review[_ ]result\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 REPO_ROOT = os.environ.get("RECALLDECK_REPO_ROOT", "/Users/joshwegener/Projects/RecallDeck")
 REPO_MAP_PATH = os.environ.get("BOARD_ORCHESTRATOR_REPO_MAP", "")
@@ -78,11 +88,26 @@ WORKER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_DIR", "/Users/jos
 WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_BYTES", "20000"))
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
 WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "60"))
-REVIEWER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_DIR", WORKER_LOG_DIR)
+REVIEWER_LOG_DIR = os.environ.get(
+    "BOARD_ORCHESTRATOR_REVIEWER_LOG_DIR",
+    "/Users/joshwegener/clawd/memory/review-logs",
+)
 REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TAIL_BYTES", "20000"))
 REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
 REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "60"))
-REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "85"))
+REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "90"))
+REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# If any critical items are found by the reviewer, fail regardless of score.
+REVIEW_FAIL_ON_CRITICAL_ITEMS = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_FAIL_ON_CRITICAL_ITEMS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
 MISSING_WORKER_POLICY = os.environ.get("BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY", "pause").strip().lower()
 ALLOW_TITLE_REPO_HINT = os.environ.get("BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT", "1").strip().lower() not in (
     "0",
@@ -374,6 +399,11 @@ def discover_repo_map(repo_root: str) -> Dict[str, str]:
     if "web" in out:
         out.setdefault("frontend", out["web"])
         out.setdefault("ui", out["web"])
+
+    # local orchestrator repo convenience alias
+    if os.path.isdir("/Users/joshwegener/clawd"):
+        out.setdefault("clawd", "/Users/joshwegener/clawd")
+
     return out
 
 
@@ -515,6 +545,41 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
+    def extract_review_json_from_string(s: str) -> Optional[Dict[str, Any]]:
+        """Best-effort extraction of a {score, verdict, ...} object from a string.
+
+        This is primarily to recover when the reviewer wrote a JSON envelope where
+        the actual review JSON was embedded inside a text field.
+        """
+        if not s:
+            return None
+        # Unescape common sequences (Claude json output often embeds {\"score\":...}).
+        s2 = s.replace('\\"', '"')
+        idx = s2.find('{"score"')
+        if idx < 0:
+            idx = s2.find("{\"score\"")
+        if idx < 0:
+            return None
+        # Brace scan to extract one JSON object.
+        depth = 0
+        end = None
+        for i, ch in enumerate(s2[idx:], start=idx):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            return None
+        frag = s2[idx:end]
+        try:
+            out = json.loads(frag)
+            return out if isinstance(out, dict) else None
+        except Exception:
+            return None
+
     payload: Any = None
     if raw.startswith("{"):
         try:
@@ -522,13 +587,26 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         except Exception:
             payload = None
 
+    # If the reviewer wrote a Claude JSON envelope (e.g. {type:'result', result:'...{score...}'})
+    # attempt to recover the embedded review JSON.
+    if isinstance(payload, dict) and ("score" not in payload or "verdict" not in payload):
+        embedded = None
+        if isinstance(payload.get("result"), str):
+            embedded = extract_review_json_from_string(payload.get("result") or "")
+        if embedded and isinstance(embedded, dict):
+            payload = embedded
+
     score = None
     verdict = None
     notes = None
+    critical_items: list[str] = []
     if isinstance(payload, dict):
         score = payload.get("score") if score is None else score
         verdict = payload.get("verdict") if verdict is None else verdict
         notes = payload.get("notes") or payload.get("comment") or payload.get("summary")
+        ci = payload.get("critical_items") or payload.get("criticalIssues") or payload.get("critical")
+        if isinstance(ci, list):
+            critical_items = [str(x) for x in ci if str(x).strip()]
 
     if score is None:
         score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", raw, re.IGNORECASE)
@@ -553,6 +631,8 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
     result: Dict[str, Any] = {"score": score_int, "verdict": verdict_norm, "raw": raw}
     if notes:
         result["notes"] = str(notes)
+    if critical_items:
+        result["critical_items"] = critical_items
     return result
 
 
@@ -1224,6 +1304,18 @@ def main() -> int:
                 else:
                     move_task(pid, wid, int(col_review["id"]), 1, wsl_id)
                     record_action(wid)
+                    # Mark this review as auto-managed.
+                    remove_tags(
+                        wid,
+                        [
+                            TAG_REVIEW_PASS,
+                            TAG_REVIEW_REWORK,
+                            TAG_REVIEW_BLOCKED_WIP,
+                            TAG_REVIEW_ERROR,
+                            TAG_REVIEW_INFLIGHT,
+                        ],
+                    )
+                    add_tags(wid, [TAG_REVIEW_AUTO, TAG_REVIEW_PENDING])
                     if isinstance(entry, dict):
                         entry["completedAtMs"] = now_ms()
                         if completion.get("patchPath"):
@@ -1352,12 +1444,19 @@ def main() -> int:
         review_rework_queue: List[Tuple[Dict[str, Any], int]] = []
         for rt, rsl_id in sorted(review_tasks, key=sort_key):
             rid = int(rt.get("id"))
+            # While any critical exists, only run review automation for the active critical card.
+            if active_critical is not None:
+                active_id = int(active_critical[0].get("id") or 0)
+                if rid != active_id:
+                    continue
             rtitle = task_title(rt)
             try:
                 rtags = get_task_tags(rid)
             except Exception:
                 rtags = []
             if is_held(rtags):
+                continue
+            if has_tag(rtags, TAG_REVIEW_SKIP):
                 continue
 
             stored_result = review_results_by_task.get(str(rid))
@@ -1367,6 +1466,12 @@ def main() -> int:
                 if dry_run:
                     actions.append(f"Would spawn reviewer for Review #{rid} ({rtitle})")
                 else:
+                    # Mark this Review card as auto-reviewed by default.
+                    if not has_tag(rtags, TAG_REVIEW_AUTO):
+                        add_tag(rid, TAG_REVIEW_AUTO)
+                    add_tag(rid, TAG_REVIEW_PENDING)
+                    remove_tag(rid, TAG_REVIEW_ERROR)
+
                     try:
                         full = get_task(rid)
                         rdesc = (full.get("description") or "")
@@ -1374,6 +1479,7 @@ def main() -> int:
                         rdesc = ""
                     _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
                     if ensure_reviewer_handle_for_task(rid, repo_key, repo_path):
+                        add_tag(rid, TAG_REVIEW_INFLIGHT)
                         actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
 
             result_payload: Optional[Dict[str, Any]] = None
@@ -1395,12 +1501,21 @@ def main() -> int:
                 if dry_run:
                     actions.append(f"Would comment review results on Review #{rid} ({rtitle})")
                 else:
+                    critical_items = result_payload.get("critical_items") or []
+                    if not isinstance(critical_items, list):
+                        critical_items = []
+
                     comment_lines = [
                         "Automated review result:",
                         f"- Score: {score}",
                         f"- Verdict: {verdict}",
                         f"- Threshold: {REVIEW_THRESHOLD}",
+                        f"- Fail on critical items: {'yes' if REVIEW_FAIL_ON_CRITICAL_ITEMS else 'no'}",
                     ]
+                    if critical_items:
+                        comment_lines.append("- Critical items:")
+                        for item in critical_items[:10]:
+                            comment_lines.append(f"  - {item}")
                     if notes:
                         comment_lines.append(f"- Notes: {notes}")
                     add_comment(rid, "\n".join(comment_lines))
@@ -1415,29 +1530,65 @@ def main() -> int:
             if result_payload:
                 score = int(result_payload.get("score") or 0)
                 verdict = str(result_payload.get("verdict") or "").upper()
+                critical_items = result_payload.get("critical_items") or []
+                if not isinstance(critical_items, list):
+                    critical_items = []
+
                 needs_rework = score < REVIEW_THRESHOLD or verdict in ("REWORK", "BLOCKER")
+                if REVIEW_FAIL_ON_CRITICAL_ITEMS and critical_items:
+                    needs_rework = True
+
+                # Clear inflight/pending once we have a result.
+                if dry_run:
+                    actions.append(f"Would clear review:inflight/review:pending for Review #{rid} ({rtitle})")
+                else:
+                    remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+
                 if needs_rework:
-                    if not has_tag(rtags, TAG_NEEDS_REWORK):
-                        if dry_run:
-                            actions.append(
-                                f"Would tag Review #{rid} ({rtitle}) as needs-rework (score {score}, verdict {verdict})"
-                            )
-                        else:
-                            add_tag(rid, TAG_NEEDS_REWORK)
+                    if dry_run:
+                        actions.append(
+                            f"Would tag Review #{rid} ({rtitle}) as review:rework (score {score}, verdict {verdict})"
+                        )
+                    else:
+                        add_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK])
+                        remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_BLOCKED_WIP])
                     review_rework_queue.append((rt, rsl_id))
                 else:
-                    if has_tag(rtags, TAG_NEEDS_REWORK):
+                    if dry_run:
+                        actions.append(f"Would tag Review #{rid} ({rtitle}) as review:pass")
+                    else:
+                        add_tag(rid, TAG_REVIEW_PASS)
+                        remove_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP])
+
+                    # Auto-advance Review -> Done on pass (configurable).
+                    if REVIEW_AUTO_DONE and budget > 0:
                         if dry_run:
-                            actions.append(f"Would clear needs-rework tag for Review #{rid} ({rtitle})")
+                            actions.append(f"Would move Review #{rid} ({rtitle}) -> Done (review pass)")
                         else:
-                            remove_tag(rid, TAG_NEEDS_REWORK)
+                            move_task(pid, rid, int(col_done["id"]), 1, int(rsl_id))
+                            record_action(rid)
+                            actions.append(f"Moved Review #{rid} ({rtitle}) -> Done (review pass)")
+                        budget -= 1
 
         # Move rework items back to WIP before pulling new Ready work.
         if review_rework_queue and budget > 0:
             for rt, rsl_id in sorted(review_rework_queue, key=sort_key):
-                if budget <= 0 or wip_count >= WIP_LIMIT:
+                if budget <= 0:
                     break
                 rid = int(rt.get("id"))
+                if wip_count >= WIP_LIMIT:
+                    # Can't move yet; mark it so we keep prioritizing it.
+                    try:
+                        rtags = get_task_tags(rid)
+                    except Exception:
+                        rtags = []
+                    if not has_tag(rtags, TAG_REVIEW_BLOCKED_WIP):
+                        if dry_run:
+                            actions.append(f"Would tag Review #{rid} as review:blocked:wip (waiting for WIP capacity)")
+                        else:
+                            add_tag(rid, TAG_REVIEW_BLOCKED_WIP)
+                    continue
+
                 if active_critical is not None:
                     active_id = int(active_critical[0].get("id") or 0)
                     if rid != active_id:
@@ -1454,6 +1605,9 @@ def main() -> int:
                 else:
                     move_task(pid, rid, int(col_wip["id"]), 1, int(rsl_id))
                     record_action(rid)
+                    remove_tags(rid, [TAG_REVIEW_BLOCKED_WIP, TAG_REVIEW_PASS, TAG_REVIEW_PENDING, TAG_REVIEW_INFLIGHT])
+                    # Keep review:rework tag as a breadcrumb is optional; for now we clear it once it re-enters WIP.
+                    remove_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK])
                     actions.append(f"Moved Review #{rid} ({rtitle}) -> WIP (rework)")
                 wip_tasks.append((rt, rsl_id))
                 wip_count += 1
