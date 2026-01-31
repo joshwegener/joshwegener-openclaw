@@ -30,6 +30,68 @@ KANBOARD_USER = os.environ.get("KANBOARD_USER")
 KANBOARD_TOKEN = os.environ.get("KANBOARD_TOKEN")
 PROJECT = os.environ.get("RECALLDECK_PROJECT", "RecallDeck")
 STATE_PATH = os.environ.get("STATE_PATH", "/Users/joshwegener/clawd/memory/board-orchestrator-state.json")
+WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
+
+LEASE_SCHEMA_VERSION = 1
+
+
+def lease_json_path(task_id: int) -> str:
+    return os.path.join(WORKER_LEASE_ROOT, f"task-{task_id}", "lease", "lease.json")
+
+
+def load_lease(task_id: int) -> Dict[str, Any] | None:
+    path = lease_json_path(task_id)
+    if not os.path.isfile(path):
+        return None
+    try:
+        raw = json.loads(Path(path).read_text())
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        if int(raw.get("taskId") or 0) != int(task_id):
+            return None
+    except Exception:
+        return None
+    if raw.get("schemaVersion") != LEASE_SCHEMA_VERSION:
+        return None
+    if not raw.get("leaseId"):
+        return None
+    return raw
+
+
+def lease_worker_pid(lease: Dict[str, Any] | None) -> int | None:
+    if not lease:
+        return None
+    worker = lease.get("worker")
+    if not isinstance(worker, dict):
+        return None
+    try:
+        pid = int(worker.get("pid") or 0)
+    except Exception:
+        pid = 0
+    return pid if pid > 0 else None
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return False
+
+
+def lease_has_live_pid(task_id: int) -> bool:
+    lease = load_lease(task_id)
+    pid = lease_worker_pid(lease)
+    return pid_alive(pid)
 
 
 def rpc(method: str, params: Any = None) -> Any:
@@ -186,8 +248,12 @@ def main() -> int:
             print(msg)
             return 0
 
-    if active_col == "Work in progress" and (str(active_id) not in workers and active_id not in workers):
-        msg = f"ALERT: Active critical #{active_id} is in WIP but has no worker handle recorded in state"
+    has_worker = str(active_id) in workers or active_id in workers or lease_has_live_pid(active_id)
+    if active_col == "Work in progress" and not has_worker:
+        msg = (
+            f"ALERT: Active critical #{active_id} is in WIP but has no worker handle "
+            "recorded in state or live lease"
+        )
         if queue_summary:
             msg += "\n" + queue_summary
         print(msg)
