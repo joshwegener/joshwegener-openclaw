@@ -38,30 +38,14 @@ Policy:
 EOF
 
 # IMPORTANT:
-# - Use `--output-format text` so Claude prints ONLY the JSON object (as instructed).
-# - Write to a temp file then append, to avoid tee/tail races writing to the same file.
-# - Emit a single-line `review_result: {...}` marker for the orchestrator to parse.
+# Use a Python wrapper for Claude to avoid shell quoting issues and to enforce a timeout +
+# always write a parseable `review_result: {...}` line.
 
-export TASK_ID REPO_PATH LOG_PATH PROMPT
-
-nohup bash -lc '
-set -euo pipefail
-
-cd "$REPO_PATH"
-
-tmp="$(mktemp -t "review-${TASK_ID}.XXXXXX")"
-
-printf "### REVIEW START %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_PATH"
-
-claude -p --model opus --dangerously-skip-permissions --output-format text "$PROMPT" > "$tmp"
-
-compact="$(python3 /Users/joshwegener/clawd/scripts/compact_json.py "$tmp")"
-
-printf "%s\n" "$compact" >> "$LOG_PATH"
-printf "review_result: %s\n" "$compact" >> "$LOG_PATH"
-
-rm -f "$tmp"
-' >/dev/null 2>&1 &
+nohup python3 /Users/joshwegener/clawd/scripts/run_claude_review.py \
+  --repo-path "$REPO_PATH" \
+  --log-path "$LOG_PATH" \
+  --model "${CLAUDE_MODEL:-opus}" \
+  --prompt "$PROMPT" >/dev/null 2>&1 &
 
 PID=$!
 
