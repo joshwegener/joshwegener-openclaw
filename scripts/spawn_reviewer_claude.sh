@@ -42,17 +42,20 @@ EOF
 # Use a Python wrapper for Claude to avoid shell quoting issues and to enforce a timeout +
 # always write a parseable `review_result: {...}` line.
 
-REVISION_ARGS=()
 if [[ -n "$REVIEW_REVISION" ]]; then
-  REVISION_ARGS=(--revision "$REVIEW_REVISION")
+  nohup python3 /Users/joshwegener/clawd/scripts/run_claude_review.py \
+    --repo-path "$REPO_PATH" \
+    --log-path "$LOG_PATH" \
+    --model "${CLAUDE_MODEL:-opus}" \
+    --prompt "$PROMPT" \
+    --revision "$REVIEW_REVISION" >/dev/null 2>&1 &
+else
+  nohup python3 /Users/joshwegener/clawd/scripts/run_claude_review.py \
+    --repo-path "$REPO_PATH" \
+    --log-path "$LOG_PATH" \
+    --model "${CLAUDE_MODEL:-opus}" \
+    --prompt "$PROMPT" >/dev/null 2>&1 &
 fi
-
-nohup python3 /Users/joshwegener/clawd/scripts/run_claude_review.py \
-  --repo-path "$REPO_PATH" \
-  --log-path "$LOG_PATH" \
-  --model "${CLAUDE_MODEL:-opus}" \
-  --prompt "$PROMPT" \
-  "${REVISION_ARGS[@]}" >/dev/null 2>&1 &
 
 PID=$!
 
