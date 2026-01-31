@@ -17,21 +17,31 @@ Env:
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
+import shutil
 import subprocess
 import time
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - platform dependent
+    fcntl = None
 
 STATE_PATH = os.environ.get(
     "BOARD_ORCHESTRATOR_STATE",
     "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
 )
 LOCK_PATH = os.environ.get("BOARD_ORCHESTRATOR_LOCK", "/tmp/board-orchestrator.lock")
+LOCK_STRATEGY = os.environ.get("BOARD_ORCHESTRATOR_LOCK_STRATEGY", "flock").strip().lower()
+LOCK_WAIT_MS = int(os.environ.get("BOARD_ORCHESTRATOR_LOCK_WAIT_MS", "0"))
 
 PROJECT_NAME = os.environ.get("RECALLDECK_PROJECT", "RecallDeck")
 KANBOARD_BASE = os.environ.get("KANBOARD_BASE", "http://localhost:8401/jsonrpc.php")
@@ -90,6 +100,17 @@ WORKER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_DIR", "/Users/jos
 WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_BYTES", "20000"))
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
 WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "60"))
+WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
+WORKER_LEASE_ARCHIVE_TTL_HOURS = int(os.environ.get("RECALLDECK_WORKER_LEASE_ARCHIVE_TTL_HOURS", "72"))
+WORKER_LOG_STALE_MS = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_STALE_MS", "0"))
+THRASH_WINDOW_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_WINDOW_MIN", "30"))
+THRASH_MAX_RESPAWNS = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_MAX_RESPAWNS", "3"))
+THRASH_PAUSE_TAG = os.environ.get("BOARD_ORCHESTRATOR_THRASH_PAUSE_TAG", "paused:thrash")
 REVIEWER_LOG_DIR = os.environ.get(
     "BOARD_ORCHESTRATOR_REVIEWER_LOG_DIR",
     "/Users/joshwegener/clawd/memory/review-logs",
@@ -127,6 +148,11 @@ COL_DONE = "Done"
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def make_run_id() -> str:
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"{ts}-p{os.getpid()}"
 
 
 def critical_column_priority(column_id: int, col_wip_id: int, col_review_id: int, col_ready_id: int) -> int:
@@ -243,29 +269,93 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, indent=2, sort_keys=True)
 
 
-def acquire_lock() -> bool:
+def acquire_lock_legacy(run_id: str) -> Optional[Dict[str, Any]]:
     # stale after 10 minutes
     stale_ms = 10 * 60 * 1000
-    if os.path.exists(LOCK_PATH):
-        try:
-            with open(LOCK_PATH, "r") as f:
-                lock = json.load(f)
-            if now_ms() - int(lock.get("createdAtMs", 0)) < stale_ms:
-                return False
-        except Exception:
-            # if unreadable, treat as stale
-            pass
-    with open(LOCK_PATH, "w") as f:
-        json.dump({"pid": os.getpid(), "createdAtMs": now_ms()}, f)
-    return True
-
-
-def release_lock() -> None:
-    try:
+    deadline_ms = now_ms() + max(0, LOCK_WAIT_MS)
+    while True:
         if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+            try:
+                with open(LOCK_PATH, "r") as f:
+                    lock = json.load(f)
+                if now_ms() - int(lock.get("createdAtMs", 0)) < stale_ms:
+                    if LOCK_WAIT_MS <= 0 or now_ms() >= deadline_ms:
+                        return None
+                    time.sleep(0.05)
+                    continue
+            except Exception:
+                # if unreadable, treat as stale
+                pass
+        try:
+            fh = open(LOCK_PATH, "w")
+            json.dump({"pid": os.getpid(), "createdAtMs": now_ms(), "runId": run_id}, fh)
+            fh.flush()
+            return {"fh": fh, "strategy": "legacy-stale-file"}
+        except Exception:
+            return None
+
+
+def acquire_lock_flock(run_id: str) -> Optional[Dict[str, Any]]:
+    if fcntl is None:
+        return None
+    deadline_ms = now_ms() + max(0, LOCK_WAIT_MS)
+    while True:
+        try:
+            fh = open(LOCK_PATH, "a+")
+        except Exception:
+            return None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            if LOCK_WAIT_MS <= 0 or now_ms() >= deadline_ms:
+                return None
+            time.sleep(0.05)
+            continue
+        except Exception:
+            fh.close()
+            return None
+        # Write diagnostics for humans; not used for correctness.
+        try:
+            fh.seek(0)
+            fh.truncate()
+            json.dump({"pid": os.getpid(), "createdAtMs": now_ms(), "runId": run_id}, fh)
+            fh.flush()
+        except Exception:
+            pass
+        return {"fh": fh, "strategy": "flock"}
+
+
+def acquire_lock(run_id: str) -> Optional[Dict[str, Any]]:
+    strategy = LOCK_STRATEGY or "flock"
+    if strategy == "legacy-stale-file":
+        return acquire_lock_legacy(run_id)
+    if strategy == "flock":
+        lock = acquire_lock_flock(run_id)
+        if lock is not None:
+            return lock
+        # If flock unavailable, fall back to legacy.
+        return acquire_lock_legacy(run_id)
+    # Unknown strategy: fall back to legacy for safety.
+    return acquire_lock_legacy(run_id)
+
+
+def release_lock(lock: Optional[Dict[str, Any]]) -> None:
+    if not lock:
+        return
+    strategy = lock.get("strategy")
+    fh = lock.get("fh")
+    try:
+        if fh:
+            fh.close()
     except Exception:
         pass
+    if strategy == "legacy-stale-file":
+        try:
+            if os.path.exists(LOCK_PATH):
+                os.remove(LOCK_PATH)
+        except Exception:
+            pass
 
 
 def rpc(method: str, params: Any = None) -> Any:
@@ -552,9 +642,453 @@ def worker_is_alive(handle: Optional[str]) -> bool:
     return pid_alive(pid)
 
 
+# -----------------------------------------------------------------------------
+# Worker leases + thrash guard
+# -----------------------------------------------------------------------------
 
+LEASE_SCHEMA_VERSION = 1
+HISTORY_SCHEMA_VERSION = 1
+
+
+def lease_task_dir(task_id: int) -> str:
+    return os.path.join(WORKER_LEASE_ROOT, f"task-{task_id}")
+
+
+def lease_dir(task_id: int) -> str:
+    return os.path.join(lease_task_dir(task_id), "lease")
+
+
+def lease_json_path(task_id: int) -> str:
+    return os.path.join(lease_dir(task_id), "lease.json")
+
+
+def lease_archive_root(task_id: int) -> str:
+    return os.path.join(lease_task_dir(task_id), "archive")
+
+
+def lease_history_path(task_id: int) -> str:
+    return os.path.join(lease_task_dir(task_id), "history.json")
+
+
+def ensure_dir(path: str) -> None:
+    if not path:
+        return
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_read_json(path: str) -> Optional[Dict[str, Any]]:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        return None
+    return None
+
+
+def safe_write_json(path: str, payload: Dict[str, Any]) -> None:
+    if not path:
+        return
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def generate_lease_id() -> str:
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"{ts}-{secrets.token_hex(4)}"
+
+
+def default_history(task_id: int) -> Dict[str, Any]:
+    return {"schemaVersion": HISTORY_SCHEMA_VERSION, "taskId": task_id, "spawnAttempts": []}
+
+
+def load_history(task_id: int) -> Dict[str, Any]:
+    raw = safe_read_json(lease_history_path(task_id))
+    if not isinstance(raw, dict):
+        return default_history(task_id)
+    if raw.get("schemaVersion") != HISTORY_SCHEMA_VERSION:
+        return default_history(task_id)
+    if not isinstance(raw.get("spawnAttempts"), list):
+        raw["spawnAttempts"] = []
+    return raw
+
+
+def record_spawn_attempt(
+    task_id: int,
+    lease_id: Optional[str],
+    run_id: str,
+    result: str,
+    reason: Optional[str] = None,
+) -> None:
+    history = load_history(task_id)
+    entry: Dict[str, Any] = {
+        "atMs": now_ms(),
+        "leaseId": lease_id or "",
+        "orchestratorRunId": run_id,
+        "result": result,
+    }
+    if reason:
+        entry["reason"] = reason
+    history.setdefault("spawnAttempts", []).append(entry)
+    safe_write_json(lease_history_path(task_id), history)
+
+
+def thrash_guard_allows(task_id: int, nowm: int) -> bool:
+    if THRASH_MAX_RESPAWNS <= 0 or THRASH_WINDOW_MIN <= 0:
+        return True
+    history = load_history(task_id)
+    window_ms = THRASH_WINDOW_MIN * 60 * 1000
+    count = 0
+    for attempt in history.get("spawnAttempts", []):
+        try:
+            if attempt.get("result") != "spawned":
+                continue
+            at_ms = int(attempt.get("atMs") or 0)
+        except Exception:
+            continue
+        if (nowm - at_ms) <= window_ms:
+            count += 1
+    return count < THRASH_MAX_RESPAWNS
+
+
+def init_lease_payload(
+    task_id: int,
+    run_id: str,
+    repo_key: str,
+    repo_path: str,
+    log_path: str,
+    patch_path: str,
+    comment_path: str,
+    spawn_cmd: str,
+    spawn_timeout_sec: int,
+) -> Dict[str, Any]:
+    nowm = now_ms()
+    return {
+        "schemaVersion": LEASE_SCHEMA_VERSION,
+        "leaseId": generate_lease_id(),
+        "taskId": task_id,
+        "createdAtMs": nowm,
+        "updatedAtMs": nowm,
+        "orchestrator": {"runId": run_id, "pid": os.getpid()},
+        "worker": {
+            "kind": "codex",
+            "pid": None,
+            "startedAtMs": None,
+            "repoKey": repo_key,
+            "repoPath": repo_path,
+            "logPath": log_path,
+            "patchPath": patch_path,
+            "commentPath": comment_path,
+            "spawn": {"cmd": spawn_cmd, "timeoutSec": spawn_timeout_sec},
+        },
+        "liveness": {
+            "lastSeenAliveAtMs": None,
+            "lastCheckedAtMs": None,
+            "lastVerdict": "unknown",
+            "notes": "",
+        },
+    }
+
+
+def write_lease_files(task_id: int, lease: Dict[str, Any]) -> None:
+    lease["updatedAtMs"] = now_ms()
+    safe_write_json(lease_json_path(task_id), lease)
+    # Optional convenience PID files.
+    try:
+        worker_pid = lease.get("worker", {}).get("pid")
+        if worker_pid:
+            with open(os.path.join(lease_dir(task_id), "worker.pid"), "w") as f:
+                f.write(f"{int(worker_pid)}\n")
+        with open(os.path.join(lease_dir(task_id), "orchestrator.pid"), "w") as f:
+            f.write(f"{os.getpid()}\n")
+    except Exception:
+        pass
+
+
+def load_lease(task_id: int) -> Optional[Dict[str, Any]]:
+    return safe_read_json(lease_json_path(task_id))
+
+
+def lease_worker_pid(lease: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not lease:
+        return None
+    worker = lease.get("worker")
+    if not isinstance(worker, dict):
+        worker = {}
+    try:
+        pid = int(worker.get("pid") or 0)
+    except Exception:
+        pid = 0
+    return pid if pid > 0 else None
+
+
+def lease_log_path(lease: Optional[Dict[str, Any]], task_id: int) -> str:
+    if not lease:
+        return default_worker_log_path(task_id)
+    worker = lease.get("worker")
+    if not isinstance(worker, dict):
+        worker = {}
+    log_path = worker.get("logPath")
+    return str(log_path) if log_path else default_worker_log_path(task_id)
+
+
+def lease_worker_entry(task_id: int, lease: Dict[str, Any]) -> Dict[str, Any]:
+    worker = lease.get("worker")
+    if not isinstance(worker, dict):
+        worker = {}
+    handle = worker.get("execSessionId") or worker.get("handle")
+    pid = lease_worker_pid(lease)
+    if not handle and pid:
+        handle = f"pid:{pid}"
+    return {
+        "kind": worker.get("kind") or "codex",
+        "execSessionId": handle,
+        "logPath": worker.get("logPath") or default_worker_log_path(task_id),
+        "patchPath": worker.get("patchPath") or default_worker_patch_path(task_id),
+        "commentPath": worker.get("commentPath") or default_worker_comment_path(task_id),
+        "startedAtMs": worker.get("startedAtMs"),
+        "repoKey": worker.get("repoKey") or "",
+        "repoPath": worker.get("repoPath") or "",
+        "leaseId": lease.get("leaseId"),
+    }
+
+
+def evaluate_lease_liveness(task_id: int, lease: Optional[Dict[str, Any]]) -> Tuple[str, Optional[int], str]:
+    if not lease:
+        return "unknown", None, "missing lease metadata"
+    pid = lease_worker_pid(lease)
+    if not pid:
+        return "dead", None, "missing worker pid"
+    verdict = "alive" if pid_alive(pid) else "dead"
+    log_path = lease_log_path(lease, task_id)
+    if verdict == "alive" and WORKER_LOG_STALE_MS > 0:
+        try:
+            mtime_ms = int(os.path.getmtime(log_path) * 1000)
+            if now_ms() - mtime_ms > WORKER_LOG_STALE_MS:
+                return "unknown", pid, "worker log stale"
+        except Exception:
+            return "unknown", pid, "worker log mtime unavailable"
+    return verdict, pid, ""
+
+
+def update_lease_liveness(task_id: int, lease: Dict[str, Any], verdict: str, notes: str = "") -> None:
+    liveness = lease.get("liveness") or {}
+    nowm = now_ms()
+    liveness["lastCheckedAtMs"] = nowm
+    liveness["lastVerdict"] = verdict
+    if verdict == "alive":
+        liveness["lastSeenAliveAtMs"] = nowm
+    if notes:
+        liveness["notes"] = notes
+    lease["liveness"] = liveness
+    write_lease_files(task_id, lease)
+
+
+def archive_lease_dir(task_id: int, lease_id: Optional[str] = None) -> Optional[str]:
+    src = lease_dir(task_id)
+    if not os.path.isdir(src):
+        return None
+    ensure_dir(lease_archive_root(task_id))
+    if lease_id:
+        name = lease_id
+    else:
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        name = f"stale-{ts}"
+    dest = os.path.join(lease_archive_root(task_id), name)
+    # Avoid collisions.
+    if os.path.exists(dest):
+        dest = f"{dest}-{secrets.token_hex(2)}"
+    try:
+        shutil.move(src, dest)
+        return dest
+    except Exception:
+        return None
+
+
+def acquire_lease_dir(task_id: int) -> bool:
+    ensure_dir(lease_task_dir(task_id))
+    try:
+        os.mkdir(lease_dir(task_id))
+        return True
+    except FileExistsError:
+        return False
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            return False
+        return False
+
+
+def gc_worker_leases() -> None:
+    if not WORKER_LEASE_ROOT or not os.path.isdir(WORKER_LEASE_ROOT):
+        return
+    ttl_ms = WORKER_LEASE_ARCHIVE_TTL_HOURS * 60 * 60 * 1000
+    nowm = now_ms()
+    try:
+        entries = os.listdir(WORKER_LEASE_ROOT)
+    except Exception:
+        return
+    for name in entries:
+        if not name.startswith("task-"):
+            continue
+        tdir = os.path.join(WORKER_LEASE_ROOT, name)
+        if not os.path.isdir(tdir):
+            continue
+        lease_path = os.path.join(tdir, "lease")
+        archive_root = os.path.join(tdir, "archive")
+        if os.path.isdir(archive_root):
+            for aname in os.listdir(archive_root):
+                apath = os.path.join(archive_root, aname)
+                try:
+                    mtime_ms = int(os.path.getmtime(apath) * 1000)
+                except Exception:
+                    continue
+                if nowm - mtime_ms > ttl_ms:
+                    try:
+                        shutil.rmtree(apath)
+                    except Exception:
+                        pass
+        # Remove empty task dir if no active lease and no recent history.
+        if os.path.isdir(lease_path):
+            continue
+        try:
+            if os.path.isdir(archive_root) and os.listdir(archive_root):
+                continue
+        except Exception:
+            continue
+        history_path = os.path.join(tdir, "history.json")
+        if os.path.isfile(history_path):
+            try:
+                mtime_ms = int(os.path.getmtime(history_path) * 1000)
+                if nowm - mtime_ms <= ttl_ms:
+                    continue
+            except Exception:
+                continue
+        try:
+            if not os.listdir(tdir):
+                os.rmdir(tdir)
+        except Exception:
+            pass
+
+
+def scan_orphan_leases(wip_ids: set[int]) -> List[str]:
+    alerts: List[str] = []
+    if not WORKER_LEASE_ROOT or not os.path.isdir(WORKER_LEASE_ROOT):
+        return alerts
+    try:
+        entries = os.listdir(WORKER_LEASE_ROOT)
+    except Exception:
+        return alerts
+    for name in entries:
+        if not name.startswith("task-"):
+            continue
+        try:
+            task_id = int(name.split("-", 1)[1])
+        except Exception:
+            continue
+        if task_id in wip_ids:
+            continue
+        lease = load_lease(task_id)
+        if not lease:
+            continue
+        verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+        update_lease_liveness(task_id, lease, verdict, note)
+        if verdict == "alive":
+            alerts.append(
+                f"manual-fix: task #{task_id} has live worker pid {pid} but is not in WIP (orphan)."
+            )
+    return alerts
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Worker diagnostics (pid-based)
+# -----------------------------------------------------------------------------
+
+WORKER_LOG_TAIL_LINES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_LINES", "10"))
+WORKER_LOG_EXPAND_LINES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_EXPAND_LINES", "80"))
+
+# Very small heuristic classifier. These strings are intentionally broad.
+_DIAG_PATTERNS = [
+    ("quota", re.compile(r"\b(quota|rate limit|429|insufficient_quota)\b", re.IGNORECASE)),
+    ("auth", re.compile(r"\b(unauthorized|forbidden|401|403|invalid api key|expired token)\b", re.IGNORECASE)),
+    ("permissions", re.compile(r"\b(permission denied|operation not permitted|EPERM|EACCES)\b", re.IGNORECASE)),
+    ("git", re.compile(r"\b(fatal:|could not read from remote repository|not a git repository|merge conflict)\b", re.IGNORECASE)),
+    ("network", re.compile(r"\b(network is unreachable|timed out|timeout|ENOTFOUND|ECONNRESET|EAI_AGAIN|Temporary failure in name resolution)\b", re.IGNORECASE)),
+    ("tooling", re.compile(r"\b(traceback|exception|panic|segmentation fault)\b", re.IGNORECASE)),
+]
+
+
+def tail_lines(path: str, n: int) -> list[str]:
+    if not path or not os.path.isfile(path) or n <= 0:
+        return []
+    try:
+        raw = read_tail(path, WORKER_LOG_TAIL_BYTES)
+        lines = raw.splitlines()
+        return lines[-n:] if len(lines) > n else lines
+    except Exception:
+        return []
+
+
+def diagnose_worker_failure(task_id: int, log_path: str) -> Dict[str, Any]:
+    # Return a small diagnosis payload for a dead/stale worker.
+    lines = tail_lines(log_path, WORKER_LOG_TAIL_LINES)
+    joined = "\n".join(lines)
+
+    category = "unknown"
+    for name, pat in _DIAG_PATTERNS:
+        if pat.search(joined or ""):
+            category = name
+            break
+
+    expanded = False
+    if category == "unknown":
+        more = tail_lines(log_path, WORKER_LOG_EXPAND_LINES)
+        if more and more != lines:
+            expanded = True
+            lines = more
+            joined = "\n".join(lines)
+            for name, pat in _DIAG_PATTERNS:
+                if pat.search(joined or ""):
+                    category = name
+                    break
+
+    suggestion = None
+    if category in ("quota", "auth"):
+        suggestion = "Manual intervention likely (quota/auth)."
+    elif category == "permissions":
+        suggestion = "Likely filesystem/permission issue; may need manual fix."
+    elif category == "git":
+        suggestion = "Likely git/config issue; may need manual fix."
+    elif category == "network":
+        suggestion = "Transient network; safe to retry once."
+    elif category == "tooling":
+        suggestion = "Worker/tool crashed; safe to retry once, then pause+alert."
+
+    return {
+        "taskId": task_id,
+        "category": category,
+        "expanded": expanded,
+        "tail": (lines[-20:] if lines else []),
+        "suggestion": suggestion,
+    }
 def default_worker_log_path(task_id: int) -> str:
     return os.path.join(WORKER_LOG_DIR, f"task-{task_id}.log")
+
+def default_worker_patch_path(task_id: int) -> str:
+    # Must match scripts/spawn_worker_codex.sh
+    return os.path.join("/Users/joshwegener/clawd/tmp/worker-patches", f"task-{task_id}.patch")
+
+
+def default_worker_comment_path(task_id: int) -> str:
+    # Must match scripts/spawn_worker_codex.sh
+    return os.path.join("/Users/joshwegener/clawd/tmp", f"kanboard-task-{task_id}-comment.md")
+
 
 
 def default_reviewer_log_path(task_id: int) -> str:
@@ -608,22 +1142,47 @@ def read_tail(path: str, max_bytes: int) -> str:
         return ""
 
 
-def detect_worker_completion(task_id: int, log_path: str) -> Optional[Dict[str, str]]:
-    # Be conservative: only treat a worker as "complete" when we have a patch marker AND the patch exists.
-    # This avoids false positives where filenames appear in error output.
+def detect_worker_completion(
+    task_id: int,
+    log_path: str,
+    *,
+    patch_path: Optional[str] = None,
+    comment_path: Optional[str] = None,
+    started_at_ms: Optional[int] = None,
+) -> Optional[Dict[str, str]]:
+    # Prefer log marker detection, but fall back to artifact detection because
+    # Codex may keep logging after printing the marker, pushing it out of the tail window.
     if not log_path or not os.path.isfile(log_path):
         return None
     tail = read_tail(log_path, WORKER_LOG_TAIL_BYTES)
-    if not tail:
+    if tail:
+        patch_match = PATCH_MARKER_RE.search(tail)
+        if patch_match:
+            p = patch_match.group(1)
+            if p and os.path.isfile(p):
+                return {"logPath": log_path, "patchPath": p}
+
+    if patch_path is None:
+        patch_path = default_worker_patch_path(task_id)
+    if comment_path is None:
+        comment_path = default_worker_comment_path(task_id)
+
+    if not (patch_path and comment_path):
+        return None
+    if not (os.path.isfile(patch_path) and os.path.isfile(comment_path)):
         return None
 
-    patch_match = PATCH_MARKER_RE.search(tail)
-    if not patch_match:
+    try:
+        patch_mtime_ms = int(os.path.getmtime(patch_path) * 1000)
+        comment_mtime_ms = int(os.path.getmtime(comment_path) * 1000)
+    except Exception:
         return None
 
-    patch_path = patch_match.group(1)
-    if not patch_path or not os.path.isfile(patch_path):
-        return None
+    if started_at_ms is not None:
+        # allow 60s clock/flush slack
+        slack_ms = 60 * 1000
+        if patch_mtime_ms + slack_ms < started_at_ms or comment_mtime_ms + slack_ms < started_at_ms:
+            return None
 
     return {"logPath": log_path, "patchPath": patch_path}
 
@@ -772,9 +1331,7 @@ def detect_review_result(task_id: int, log_path: str) -> Optional[Dict[str, Any]
     return result
 
 
-def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not WORKER_SPAWN_CMD:
-        return None
+def format_worker_spawn_cmd(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> Tuple[str, str, str]:
     safe_repo_key = repo_key or ""
     safe_repo_path = repo_path or ""
     try:
@@ -785,6 +1342,13 @@ def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]
         )
     except Exception:
         cmd = WORKER_SPAWN_CMD
+    return cmd, safe_repo_key, safe_repo_path
+
+
+def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not WORKER_SPAWN_CMD:
+        return None
+    cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
     try:
         out = subprocess.run(
             cmd,
@@ -820,6 +1384,8 @@ def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]
         "kind": "codex",
         "execSessionId": handle,
         "logPath": log_path,
+        "patchPath": default_worker_patch_path(task_id),
+        "commentPath": default_worker_comment_path(task_id),
         "startedAtMs": now_ms(),
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
@@ -885,6 +1451,8 @@ def spawn_reviewer(
         "kind": "reviewer",
         "execSessionId": handle,
         "logPath": log_path,
+        "patchPath": default_worker_patch_path(task_id),
+        "commentPath": default_worker_comment_path(task_id),
         "startedAtMs": now_ms(),
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
@@ -1017,12 +1585,19 @@ def emit_json(
 
 
 def main() -> int:
-    if not acquire_lock():
+    run_id = make_run_id()
+    lock = acquire_lock(run_id)
+    if not lock:
         print("NO_REPLY")
         return 0
 
     try:
         state = load_state()
+        if WORKER_LEASES_ENABLED:
+            try:
+                gc_worker_leases()
+            except Exception:
+                pass
 
         # Repo mapping (self-healing):
         # - Merge any persisted mapping with optional JSON mapping file and
@@ -1105,6 +1680,28 @@ def main() -> int:
         done_tasks = tasks_for_column(int(col_done["id"]))
 
         review_ids = {int(t.get("id")) for t, _sl in review_tasks}
+        lease_warnings: List[str] = []
+
+        # Prefer leases as the canonical source for active workers.
+        if WORKER_LEASES_ENABLED and wip_tasks:
+            for wt, _wsl_id in wip_tasks:
+                tid = int(wt.get("id"))
+                lease = load_lease(tid)
+                if lease:
+                    verdict, pid, note = evaluate_lease_liveness(tid, lease)
+                    update_lease_liveness(tid, lease, verdict, note)
+                    if verdict == "dead":
+                        workers_by_task.pop(str(tid), None)
+                        workers_by_task.pop(tid, None)
+                    else:
+                        workers_by_task[str(tid)] = lease_worker_entry(tid, lease)
+                        if verdict == "unknown":
+                            lease_warnings.append(
+                                f"manual-fix: WIP #{tid} worker liveness unknown ({note or 'unknown'})."
+                            )
+                else:
+                    workers_by_task.pop(str(tid), None)
+                    workers_by_task.pop(tid, None)
 
         # Self-heal state: drop stale bookkeeping for tasks no longer in those columns.
         blocked_ids = {int(t.get("id")) for t, _sl in blocked_tasks}
@@ -1185,6 +1782,14 @@ def main() -> int:
         moved_to_wip: List[int] = []
         created_tasks: List[int] = []
         errors: List[str] = []
+        wip_ids = {int(t.get("id")) for t, _sl_id in wip_tasks}
+        if lease_warnings:
+            errors.extend(lease_warnings)
+        if WORKER_LEASES_ENABLED:
+            try:
+                errors.extend(scan_orphan_leases(wip_ids))
+            except Exception:
+                pass
 
         missing_worker_tasks: List[Tuple[Dict[str, Any], int]] = []
 
@@ -1293,7 +1898,7 @@ def main() -> int:
             except Exception:
                 pass
 
-        def ensure_worker_handle_for_task(
+        def ensure_worker_handle_for_task_legacy(
             task_id: int,
             repo_key: Optional[str],
             repo_path: Optional[str],
@@ -1302,12 +1907,109 @@ def main() -> int:
             handle = worker_handle(entry)
             if handle and worker_is_alive(handle):
                 return True
-            # If we have a pid-based handle but the process is dead, drop the stale entry
-            # so we can spawn a replacement worker.
+
+            # If we have a pid-based handle but the process is dead, diagnose + decide.
             if handle and not worker_is_alive(handle):
+                log_path = None
+                if isinstance(entry, dict):
+                    log_path = entry.get("logPath")
+                if not log_path:
+                    log_path = default_worker_log_path(task_id)
+
+                diag = diagnose_worker_failure(task_id, log_path)
+                category = str(diag.get("category") or "unknown")
+
+                # Persist some breadcrumbs for later debugging.
+                if isinstance(entry, dict):
+                    entry["lastDeadAtMs"] = now_ms()
+                    entry["lastDiagnosis"] = diag
+
+                # If the failure smells like a manual issue, pause + alert.
+                manual_categories = {"quota", "auth", "permissions", "git"}
+                if category in manual_categories:
+                    try:
+                        t = get_task(task_id)
+                        title = task_title(t)
+                        sl_id = int(t.get("swimlane_id") or 0)
+                    except Exception:
+                        title = str(task_id)
+                        sl_id = 0
+
+                    reason = f"worker failed ({category})"
+                    pause_missing_worker(task_id, sl_id, title, reason, force=True, label="WIP")
+                    add_tag(task_id, f"paused:{category}")
+
+                    tail = diag.get("tail") or []
+                    tail_text = "\n".join([str(x) for x in tail][-10:])
+                    msg = (
+                        "Auto-pause: worker died and needs manual attention.\n"
+                        + f"Category: {category}\n"
+                        + (f"Suggestion: {diag.get('suggestion')}\n" if diag.get('suggestion') else "")
+                        + ("Last log lines:\n" + tail_text if tail_text else "")
+                    )
+                    add_comment(task_id, msg)
+
+                    # Ensure this results in a Telegram alert via the cron wrapper.
+                    errors.append(
+                        f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
+                    )
+
+                    # Drop stale handle so it doesn't get treated as alive.
+                    workers_by_task.pop(str(task_id), None)
+                    workers_by_task.pop(task_id, None)
+                    return False
+
+                # Otherwise, attempt a controlled respawn (anti-thrash).
+                restart_count = 0
+                last_restart = 0
+                started_at = 0
+                if isinstance(entry, dict):
+                    restart_count = int(entry.get("restartCount") or 0)
+                    last_restart = int(entry.get("lastRestartAtMs") or 0)
+                    started_at = int(entry.get("startedAtMs") or 0)
+
+                nowm = now_ms()
+                # Within 30 minutes, allow at most 2 restarts.
+                window_ms = 30 * 60 * 1000
+                if last_restart and (nowm - last_restart) < window_ms and restart_count >= 2:
+                    try:
+                        t = get_task(task_id)
+                        title = task_title(t)
+                        sl_id = int(t.get("swimlane_id") or 0)
+                    except Exception:
+                        title = str(task_id)
+                        sl_id = 0
+
+                    pause_missing_worker(task_id, sl_id, title, "worker restart thrash", force=True, label="WIP")
+                    add_tag(task_id, "paused:thrash")
+                    errors.append(
+                        f"manual-fix: WIP #{task_id} ({title}) worker keeps dying; paused (thrash guard)."
+                    )
+                    workers_by_task.pop(str(task_id), None)
+                    workers_by_task.pop(task_id, None)
+                    return False
+
+                # Never spawn workers during dry-run.
+                if dry_run:
+                    return False
+
+                # Drop stale entry and respawn.
                 workers_by_task.pop(str(task_id), None)
                 workers_by_task.pop(task_id, None)
-            # Never spawn workers during dry-run.
+
+                if WORKER_SPAWN_CMD and repo_path:
+                    spawned = spawn_worker(task_id, repo_key, repo_path)
+                    if spawned:
+                        spawned["restartCount"] = restart_count + 1
+                        spawned["lastRestartAtMs"] = nowm
+                        workers_by_task[str(task_id)] = spawned
+                        actions.append(
+                            f"Respawned worker for WIP #{task_id} (diagnosed dead pid; category {category})"
+                        )
+                        return True
+                return False
+
+            # No handle: spawn if allowed.
             if dry_run:
                 return False
             if WORKER_SPAWN_CMD and repo_path:
@@ -1316,6 +2018,226 @@ def main() -> int:
                     workers_by_task[str(task_id)] = spawned
                     return True
             return False
+
+        def ensure_worker_handle_for_task(
+            task_id: int,
+            repo_key: Optional[str],
+            repo_path: Optional[str],
+        ) -> bool:
+            if not WORKER_LEASES_ENABLED:
+                return ensure_worker_handle_for_task_legacy(task_id, repo_key, repo_path)
+
+            entry = worker_entry_for(task_id, workers_by_task)
+            lease = load_lease(task_id)
+            lease_id = None
+            if lease:
+                lease_id = lease.get("leaseId")
+                verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+                update_lease_liveness(task_id, lease, verdict, note)
+                if verdict == "alive":
+                    workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
+                    return True
+                if verdict == "unknown":
+                    errors.append(
+                        f"manual-fix: WIP #{task_id} worker liveness unknown ({note or 'unknown'})."
+                    )
+                    workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
+                    return False
+
+            # If we have a dead lease or a dead pid-based handle, diagnose + decide.
+            handle = worker_handle(entry)
+            pid = extract_pid(handle)
+            if lease or (pid and not pid_alive(pid)):
+                log_path = lease_log_path(lease, task_id) if lease else None
+                if not log_path and isinstance(entry, dict):
+                    log_path = entry.get("logPath")
+                if not log_path:
+                    log_path = default_worker_log_path(task_id)
+
+                diag = diagnose_worker_failure(task_id, log_path)
+                category = str(diag.get("category") or "unknown")
+
+                # Persist some breadcrumbs for later debugging.
+                if isinstance(entry, dict):
+                    entry["lastDeadAtMs"] = now_ms()
+                    entry["lastDiagnosis"] = diag
+
+                # If the failure smells like a manual issue, pause + alert.
+                manual_categories = {"quota", "auth", "permissions", "git"}
+                if category in manual_categories:
+                    try:
+                        t = get_task(task_id)
+                        title = task_title(t)
+                        sl_id = int(t.get("swimlane_id") or 0)
+                    except Exception:
+                        title = str(task_id)
+                        sl_id = 0
+
+                    reason = f"worker failed ({category})"
+                    pause_missing_worker(task_id, sl_id, title, reason, force=True, label="WIP")
+                    add_tag(task_id, f"paused:{category}")
+
+                    tail = diag.get("tail") or []
+                    tail_text = "\n".join([str(x) for x in tail][-10:])
+                    msg = (
+                        "Auto-pause: worker died and needs manual attention.\n"
+                        + f"Category: {category}\n"
+                        + (f"Suggestion: {diag.get('suggestion')}\n" if diag.get('suggestion') else "")
+                        + ("Last log lines:\n" + tail_text if tail_text else "")
+                    )
+                    add_comment(task_id, msg)
+
+                    errors.append(
+                        f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
+                    )
+                    workers_by_task.pop(str(task_id), None)
+                    workers_by_task.pop(task_id, None)
+                    if lease:
+                        archive_lease_dir(task_id, lease_id or lease.get("leaseId"))
+                    record_spawn_attempt(task_id, lease_id, run_id, "refused", f"manual-{category}")
+                    return False
+
+                # Otherwise, attempt a controlled respawn (anti-thrash).
+                nowm = now_ms()
+                if not thrash_guard_allows(task_id, nowm):
+                    try:
+                        t = get_task(task_id)
+                        title = task_title(t)
+                        sl_id = int(t.get("swimlane_id") or 0)
+                    except Exception:
+                        title = str(task_id)
+                        sl_id = 0
+
+                    pause_missing_worker(task_id, sl_id, title, "worker restart thrash", force=True, label="WIP")
+                    add_tag(task_id, THRASH_PAUSE_TAG)
+                    errors.append(
+                        f"manual-fix: WIP #{task_id} ({title}) worker keeps dying; paused (thrash guard)."
+                    )
+                    workers_by_task.pop(str(task_id), None)
+                    workers_by_task.pop(task_id, None)
+                    if lease:
+                        archive_lease_dir(task_id, lease_id or lease.get("leaseId"))
+                    record_spawn_attempt(task_id, lease_id, run_id, "refused", "thrash")
+                    return False
+
+                # Never spawn workers during dry-run.
+                if dry_run:
+                    record_spawn_attempt(task_id, lease_id, run_id, "refused", "dry-run")
+                    return False
+
+                # Drop stale entry and stale lease before respawn.
+                workers_by_task.pop(str(task_id), None)
+                workers_by_task.pop(task_id, None)
+                if lease:
+                    archive_lease_dir(task_id, lease_id or lease.get("leaseId"))
+
+            # If we have a live pid-based handle but no lease, seed one for recovery.
+            if not lease and pid and pid_alive(pid):
+                if acquire_lease_dir(task_id):
+                    cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
+                    lease_payload = init_lease_payload(
+                        task_id,
+                        run_id,
+                        safe_repo_key or (entry.get("repoKey") if isinstance(entry, dict) else ""),
+                        safe_repo_path or (entry.get("repoPath") if isinstance(entry, dict) else ""),
+                        (entry.get("logPath") if isinstance(entry, dict) else None) or default_worker_log_path(task_id),
+                        (entry.get("patchPath") if isinstance(entry, dict) else None) or default_worker_patch_path(task_id),
+                        (entry.get("commentPath") if isinstance(entry, dict) else None)
+                        or default_worker_comment_path(task_id),
+                        cmd,
+                        WORKER_SPAWN_TIMEOUT_SEC,
+                    )
+                    lease_payload["worker"]["pid"] = pid
+                    lease_payload["worker"]["startedAtMs"] = (
+                        entry.get("startedAtMs") if isinstance(entry, dict) else None
+                    ) or now_ms()
+                    lease_payload["worker"]["execSessionId"] = handle
+                    write_lease_files(task_id, lease_payload)
+                    workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
+                    return True
+
+            # No lease or lease cleaned up: attempt to acquire + spawn.
+            if dry_run:
+                record_spawn_attempt(task_id, lease_id, run_id, "refused", "dry-run")
+                return False
+            if not WORKER_SPAWN_CMD or not repo_path:
+                reason = "no-spawn-cmd" if not WORKER_SPAWN_CMD else "missing-repo-path"
+                record_spawn_attempt(task_id, lease_id, run_id, "refused", reason)
+                return False
+
+            if not thrash_guard_allows(task_id, now_ms()):
+                try:
+                    t = get_task(task_id)
+                    title = task_title(t)
+                    sl_id = int(t.get("swimlane_id") or 0)
+                except Exception:
+                    title = str(task_id)
+                    sl_id = 0
+                pause_missing_worker(task_id, sl_id, title, "worker restart thrash", force=True, label="WIP")
+                add_tag(task_id, THRASH_PAUSE_TAG)
+                errors.append(
+                    f"manual-fix: WIP #{task_id} ({title}) worker keeps dying; paused (thrash guard)."
+                )
+                record_spawn_attempt(task_id, lease_id, run_id, "refused", "thrash")
+                return False
+
+            if not acquire_lease_dir(task_id):
+                # Another process owns/created the lease; read + reconcile.
+                lease = load_lease(task_id)
+                if lease:
+                    verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+                    update_lease_liveness(task_id, lease, verdict, note)
+                    if verdict == "alive":
+                        workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
+                        return True
+                    if verdict == "unknown":
+                        errors.append(
+                            f"manual-fix: WIP #{task_id} worker liveness unknown ({note or 'unknown'})."
+                        )
+                        workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
+                        return False
+                    # Dead/invalid lease: archive and retry once.
+                    archive_lease_dir(task_id, lease.get("leaseId"))
+                    if not acquire_lease_dir(task_id):
+                        record_spawn_attempt(task_id, lease.get("leaseId"), run_id, "refused", "lease-race")
+                        return False
+                else:
+                    record_spawn_attempt(task_id, lease_id, run_id, "refused", "lease-race")
+                    return False
+
+            cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
+            lease_payload = init_lease_payload(
+                task_id,
+                run_id,
+                safe_repo_key,
+                safe_repo_path,
+                default_worker_log_path(task_id),
+                default_worker_patch_path(task_id),
+                default_worker_comment_path(task_id),
+                cmd,
+                WORKER_SPAWN_TIMEOUT_SEC,
+            )
+            write_lease_files(task_id, lease_payload)
+            lease_id = lease_payload.get("leaseId")
+
+            spawned = spawn_worker(task_id, repo_key, repo_path)
+            if not spawned:
+                record_spawn_attempt(task_id, lease_id, run_id, "failed", "spawn-failed")
+                archive_lease_dir(task_id, lease_id)
+                return False
+
+            worker_pid = extract_pid(worker_handle(spawned))
+            lease_payload["worker"]["pid"] = worker_pid
+            lease_payload["worker"]["startedAtMs"] = spawned.get("startedAtMs") or now_ms()
+            lease_payload["worker"]["execSessionId"] = spawned.get("execSessionId")
+            lease_payload["worker"]["logPath"] = spawned.get("logPath") or default_worker_log_path(task_id)
+            lease_payload["worker"]["patchPath"] = spawned.get("patchPath") or default_worker_patch_path(task_id)
+            lease_payload["worker"]["commentPath"] = spawned.get("commentPath") or default_worker_comment_path(task_id)
+            write_lease_files(task_id, lease_payload)
+
+            record_spawn_attempt(task_id, lease_id, run_id, "spawned")
+            workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
+            return True
 
         def resolve_patch_path_for_task(task_id: int) -> Optional[str]:
             entry = worker_entry_for(task_id, workers_by_task)
@@ -1326,7 +2248,20 @@ def main() -> int:
                 log_path = entry.get("logPath")
             if not log_path:
                 log_path = default_worker_log_path(task_id)
-            completion = detect_worker_completion(task_id, log_path)
+            started_at_ms = None
+            patch_path = None
+            comment_path = None
+            if isinstance(entry, dict):
+                started_at_ms = entry.get("startedAtMs")
+                patch_path = entry.get("patchPath")
+                comment_path = entry.get("commentPath")
+            completion = detect_worker_completion(
+                task_id,
+                log_path,
+                patch_path=patch_path,
+                comment_path=comment_path,
+                started_at_ms=started_at_ms,
+            )
             if completion and isinstance(entry, dict):
                 entry["patchPath"] = completion.get("patchPath")
                 return completion.get("patchPath")
@@ -1478,7 +2413,20 @@ def main() -> int:
                     log_path = entry.get("logPath")
                 if not log_path:
                     log_path = default_worker_log_path(wid)
-                completion = detect_worker_completion(wid, log_path)
+                patch_path = None
+                comment_path = None
+                started_at_ms = None
+                if isinstance(entry, dict):
+                    patch_path = entry.get("patchPath")
+                    comment_path = entry.get("commentPath")
+                    started_at_ms = entry.get("startedAtMs")
+                completion = detect_worker_completion(
+                    wid,
+                    log_path,
+                    patch_path=patch_path,
+                    comment_path=comment_path,
+                    started_at_ms=started_at_ms,
+                )
                 if not completion:
                     continue
                 if dry_run:
@@ -1502,6 +2450,13 @@ def main() -> int:
                         entry["completedAtMs"] = now_ms()
                         if completion.get("patchPath"):
                             entry["patchPath"] = completion.get("patchPath")
+                    if WORKER_LEASES_ENABLED:
+                        try:
+                            lease = load_lease(wid)
+                            if lease:
+                                archive_lease_dir(wid, lease.get("leaseId"))
+                        except Exception:
+                            pass
                     actions.append(f"Moved WIP #{wid} ({wtitle}) -> Review (worker output complete)")
                 completed_wip_ids.append(wid)
                 budget -= 1
@@ -2539,7 +3494,7 @@ def main() -> int:
         return 0
 
     finally:
-        release_lock()
+        release_lock(lock)
 
 
 if __name__ == "__main__":
