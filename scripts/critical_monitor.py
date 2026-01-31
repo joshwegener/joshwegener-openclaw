@@ -3,6 +3,7 @@
 
 Outputs:
 - NO_REPLY (healthy / no critical tasks)
+- STATUS: ... when multiple critical tasks are queued
 - One line starting with "ALERT:" when drift/invariant violation is detected.
 
 Uses Kanboard JSON-RPC via stdlib urllib.
@@ -116,20 +117,51 @@ def main() -> int:
         print("NO_REPLY")
         return 0
 
-    def swim_key(task: Dict[str, Any]) -> Tuple[int, int]:
+    def swimlane_priority(task: Dict[str, Any]) -> int:
         sid = int(task.get("swimlane_id") or 0)
-        s = sw_by_id.get(sid, {"name": "", "position": 999})
+        s = sw_by_id.get(sid, {"name": ""})
         name = s["name"]
-        return (prio_index.get(name, 999), s["position"])
+        return prio_index.get(name, 999)
 
-    critical_sorted = sorted(
-        critical,
-        key=lambda item: (swim_key(item[0]), int(item[0].get("position") or 999), int(item[0]["id"])),
-    )
+    def critical_column_priority(col_name: str) -> int:
+        if col_name == "Work in progress":
+            return 0
+        if col_name == "Review":
+            return 1
+        if col_name == "Ready":
+            return 2
+        return 3
+
+    def critical_sort_key(item: Tuple[Dict[str, Any], List[str], str]) -> Tuple[int, int, int, int]:
+        t, _tags, col = item
+        return (
+            critical_column_priority(col),
+            swimlane_priority(t),
+            int(t.get("position") or 999),
+            int(t["id"]),
+        )
+
+    critical_sorted = sorted(critical, key=critical_sort_key)
 
     # Multiple critical tasks are allowed; monitor only the top-priority one.
     active_task, _active_tags, active_col = critical_sorted[0]
     active_id = int(active_task["id"])
+    queued = critical_sorted[1:]
+
+    def format_task(item: Tuple[Dict[str, Any], List[str], str]) -> str:
+        t, _tags, col = item
+        tid = int(t["id"])
+        title = (t.get("title") or "").strip()
+        label = f"#{tid} {title}".strip()
+        if col:
+            label += f" ({col})"
+        return label
+
+    queue_summary = ""
+    if queued:
+        active_label = format_task((active_task, _active_tags, active_col))
+        queued_labels = ", ".join(format_task(item) for item in queued[:8])
+        queue_summary = f"Active critical: {active_label}. Queued: {queued_labels}"
 
     # Only enforce the "WIP must be critical-only" invariant when the critical task is actually
     # active (in WIP or Review). If a critical ticket is still sitting in Backlog/Ready/Blocked,
@@ -149,11 +181,20 @@ def main() -> int:
             msg = "ALERT: Non-critical tasks still in WIP while critical is active:\n" + "\n".join(
                 [f"#{tid} {title}" for tid, title in noncrit_in_wip]
             )
+            if queue_summary:
+                msg += "\n" + queue_summary
             print(msg)
             return 0
 
     if active_col == "Work in progress" and (str(active_id) not in workers and active_id not in workers):
-        print(f"ALERT: Active critical #{active_id} is in WIP but has no worker handle recorded in state")
+        msg = f"ALERT: Active critical #{active_id} is in WIP but has no worker handle recorded in state"
+        if queue_summary:
+            msg += "\n" + queue_summary
+        print(msg)
+        return 0
+
+    if queue_summary:
+        print(f"STATUS: {queue_summary}")
         return 0
 
     print("NO_REPLY")

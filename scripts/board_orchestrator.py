@@ -1513,41 +1513,7 @@ def main() -> int:
         # task cannot start, we do NOT pause everything (avoids deadlock) and we
         # emit an error instead.
 
-        # Collect all non-Done tasks so we can find critical candidates anywhere.
-        all_open: List[Tuple[Dict[str, Any], int, int]] = []
-        for sl in swimlanes:
-            for c in (sl.get("columns") or []):
-                col_id = int(c.get("id") or 0)
-                if col_id == int(col_done["id"]):
-                    continue
-                for t in (c.get("tasks") or []):
-                    all_open.append((t, int(sl.get("id") or 0), col_id))
-
-        critical_candidates: List[Tuple[Dict[str, Any], int, int]] = []
-        critical_task_ids: set[int] = set()
-        for t, sl_id, col_id in all_open:
-            tid = int(t.get("id"))
-            try:
-                tags = get_task_tags(tid)
-            except Exception:
-                tags = []
-            if is_critical(tags) and not is_held(tags):
-                critical_candidates.append((t, sl_id, col_id))
-                critical_task_ids.add(tid)
-
-        # Prefer critical already in WIP/Review, then Ready, then other columns.
-        active_critical: Optional[Tuple[Dict[str, Any], int, int]] = None
-        if critical_candidates:
-            active_critical = sorted(
-                critical_candidates,
-                key=lambda item: critical_sort_key(
-                    item[2],
-                    int(col_wip["id"]),
-                    int(col_review["id"]),
-                    int(col_ready["id"]),
-                    sort_key(item),
-                ),
-            )[0]
+        # Critical queue (active + queued) computed earlier to keep drift checks consistent.
 
         # If multiple critical tasks exist, auto-queue the non-active ones.
         # This prevents the monitor from treating multiple critical tags as an invariant violation,
