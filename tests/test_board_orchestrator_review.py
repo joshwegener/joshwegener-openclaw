@@ -45,6 +45,21 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertEqual(result.get("score"), 70)
         self.assertEqual(result.get("verdict"), "REWORK")
 
+    def test_parse_review_result_embedded_json(self) -> None:
+        embedded = '{"score": 93, "verdict": "PASS", "notes": "ok"}'
+        text = 'review_result: {"type": "result", "result": "' + embedded.replace('"', '\\"') + '"}'
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 93)
+        self.assertEqual(result.get("verdict"), "PASS")
+        self.assertEqual(result.get("notes"), "ok")
+
+    def test_parse_review_result_review_revision(self) -> None:
+        text = 'review_result: {"score": 90, "verdict": "PASS", "review_revision": "abc123"}'
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("reviewRevision"), "abc123")
+
 
 class TestDetectReviewResult(unittest.TestCase):
     def test_detect_review_result_after_marker(self) -> None:
