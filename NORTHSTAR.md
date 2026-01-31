@@ -118,7 +118,7 @@ Contract:
 - Otherwise emits a single JSON object with actions and errors.
 
 Safety valves:
-- Lock file (stale-safe): `/tmp/board-orchestrator.lock`
+- Lock file (OS-level lock): `/tmp/board-orchestrator.lock` (`flock` by default).
 - Action budget per run (prevents thrash)
 - Cooldown per task via `lastActionsByTaskId`
 
@@ -186,11 +186,13 @@ Failure:
 ### 4.3 WIP steady-state (reconciliation)
 A task in WIP must have:
 - a repo mapping (unless `no-repo`), and
-- a worker handle recorded in `workersByTaskId`.
+- an active worker lease (`task-<id>/lease/lease.json`) when leases are enabled.
 
-If a WIP task is missing a worker handle:
-- If `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=spawn`: attempt to spawn.
-- Else: tag `paused` + `paused:missing-worker`.
+`workersByTaskId` is treated as a cache rebuilt from leases each run (when enabled).
+
+If a WIP task is missing a worker lease or the lease is dead:
+- Attempt a respawn (subject to thrash guard).
+- Otherwise tag `paused` + `paused:missing-worker` and alert.
 
 ### 4.4 WIP → Review (completion detection)
 Contract:
