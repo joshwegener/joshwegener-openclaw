@@ -66,6 +66,12 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.get("critical_items"), ["Missing tests"])
 
+    def test_parse_review_result_critical_items_camel_list(self) -> None:
+        text = 'REVIEW_RESULT: {"score": 70, "verdict": "REWORK", "criticalItems": ["Bad index", "Missing retry"]}'
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("critical_items"), ["Bad index", "Missing retry"])
+
     def test_parse_review_result_uppercase_space_sentinel(self) -> None:
         text = "REVIEW RESULT: score=82 verdict=PASS"
         result = bo.parse_review_result(text)
