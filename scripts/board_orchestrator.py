@@ -1837,12 +1837,13 @@ def main() -> int:
                 if budget <= 0:
                     break
                 rid = int(rt.get("id"))
-                if wip_count >= WIP_LIMIT:
+                try:
+                    rtags = get_task_tags(rid)
+                except Exception:
+                    rtags = []
+                is_critical_review = is_critical(rtags)
+                if wip_count >= WIP_LIMIT and not is_critical_review:
                     # Can't move yet; mark it so we keep prioritizing it.
-                    try:
-                        rtags = get_task_tags(rid)
-                    except Exception:
-                        rtags = []
                     if not has_tag(rtags, TAG_REVIEW_BLOCKED_WIP):
                         if dry_run:
                             actions.append(f"Would tag Review #{rid} as review:blocked:wip (waiting for WIP capacity)")
@@ -1855,10 +1856,6 @@ def main() -> int:
                     if rid != active_id:
                         continue
                 rtitle = task_title(rt)
-                try:
-                    rtags = get_task_tags(rid)
-                except Exception:
-                    rtags = []
                 if is_held(rtags):
                     continue
                 if dry_run:
