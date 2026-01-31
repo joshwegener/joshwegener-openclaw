@@ -1184,18 +1184,17 @@ def main() -> int:
             *,
             force: bool = False,
             label: str = "WIP",
-        ) -> None:
-            nonlocal budget
+        ) -> bool:
+            # Budget accounting is handled by callers to avoid double-decrement bugs.
             if budget <= 0 and not force:
-                return
+                return False
             if dry_run:
                 actions.append(f"Would tag {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
             else:
                 record_action(task_id)
                 add_tags(task_id, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
                 actions.append(f"Tagged {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
-            if budget > 0:
-                budget -= 1
+            return True
 
         def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str], source: Optional[str]) -> None:
             if not repo_key or not repo_path:
@@ -1379,7 +1378,8 @@ def main() -> int:
                 reason = "missing worker handle"
                 if not repo_ok and not repo_path:
                     reason = "missing worker handle + repo mapping"
-                pause_missing_worker(wid, wsl_id, wtitle, reason, label=label)
+                if pause_missing_worker(wid, wsl_id, wtitle, reason, label=label):
+                    budget -= 1
                 paused_missing_worker_ids.append(wid)
                 if budget <= 0:
                     break
@@ -1754,20 +1754,22 @@ def main() -> int:
                         if worker_handle(worker_entry_for(cid, workers_by_task)):
                             actions.append(f"Spawned worker for active critical #{cid} ({ctitle})")
                         else:
-                            pause_missing_worker(
+                            if pause_missing_worker(
                                 cid,
                                 int(csl_id),
                                 ctitle,
                                 "worker spawn returned no handle",
                                 label="critical",
-                            )
+                            ):
+                                budget -= 1
                     else:
                         reason = "missing worker handle"
                         if not repo_ok and not repo_path:
                             reason = "missing worker handle + repo mapping"
                         if not WORKER_SPAWN_CMD:
                             reason = "missing worker handle (no worker spawn command configured)"
-                        pause_missing_worker(cid, int(csl_id), ctitle, reason, label="critical")
+                        if pause_missing_worker(cid, int(csl_id), ctitle, reason, label="critical"):
+                            budget -= 1
                 pause_noncritical_wip()
 
             else:

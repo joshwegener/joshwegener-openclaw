@@ -90,7 +90,14 @@ def main() -> int:
 
     def is_held(tags: List[str]) -> bool:
         lower = {x.lower() for x in tags}
-        return "hold" in lower or "no-auto" in lower
+        if "hold" in lower or "no-auto" in lower:
+            return True
+        # Treat paused tags as manual escape hatch for critical monitoring.
+        if "paused" in lower:
+            return True
+        if any(t.startswith("paused:") for t in lower):
+            return True
+        return False
 
     critical: List[Tuple[Dict[str, Any], List[str], str]] = []
     for t in all_tasks:
@@ -137,7 +144,9 @@ def main() -> int:
         for t in wip:
             tid = int(t["id"])
             tags = tags_for(tid)
-            if "critical" not in [x.lower() for x in tags]:
+            lower = [x.lower() for x in tags]
+            # Allow non-critical tasks to remain in WIP if they are explicitly paused for a critical.
+            if "critical" not in lower and "paused:critical" not in lower:
                 noncrit_in_wip.append((tid, (t.get("title") or "").strip()))
 
         if noncrit_in_wip:
@@ -147,7 +156,7 @@ def main() -> int:
             print(msg)
             return 0
 
-    if active_col == "Work in progress" and str(active_id) not in workers:
+    if active_col == "Work in progress" and (str(active_id) not in workers and active_id not in workers):
         print(f"ALERT: Active critical #{active_id} is in WIP but has no worker handle recorded in state")
         return 0
 

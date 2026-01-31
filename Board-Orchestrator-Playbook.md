@@ -77,8 +77,10 @@ Do not rely on OS PIDs.
   - `taskId -> { execSessionId, logPath, startedAtMs, repoKey, repoPath }`
 - Missing handles are reconciled deterministically:
   - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=spawn` will attempt to spawn via `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD`.
-  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=pause` will move the task to `Paused`.
-- If a task is moved to WIP but no worker handle can be recorded, it is auto-paused to avoid silent WIP.
+  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=pause` will tag the task as paused (no column move).
+- Pausing is tag-based and should always include a reason tag when automated (e.g. `paused:missing-worker`, `paused:critical`).
+- The Paused column is optional/legacy; prefer keeping cards in place and using tags.
+- A task is only moved into WIP when a worker handle can be recorded immediately (no silent WIP).
 - If a worker log shows a completed output (patch marker / kanboard comment file), auto-move WIP → Review.
 
 ## Safety valves

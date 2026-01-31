@@ -129,7 +129,7 @@ Runs every 15 minutes.
 4) Worker start:
    - For every task moved into WIP, start a worker (Codex) and record the handle.
    - If `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD` is configured, the orchestrator will attempt to spawn and record the handle immediately.
-   - WIP tasks missing a worker handle are deterministically reconciled: auto-spawn (policy `spawn`) or auto-pause to `Paused` (policy `pause`) via `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY`.
+   - WIP tasks missing a worker handle are deterministically reconciled: auto-spawn (policy `spawn`) or auto-pause via tags (policy `pause`) via `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY`.
    - If a task is moved to WIP but no worker handle can be recorded, it is auto-paused to avoid silent WIP.
    - If a worker log (from `BOARD_ORCHESTRATOR_WORKER_LOG_DIR`) shows a completed output (patch marker / kanboard comment file), the orchestrator auto-moves WIP → Review.
    - If no safe repo mapping is available, do **not** start; instead comment and/or move to Blocked.
