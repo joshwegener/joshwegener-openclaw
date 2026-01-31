@@ -107,6 +107,7 @@ WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "1").str
 )
 WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
 WORKER_LEASE_ARCHIVE_TTL_HOURS = int(os.environ.get("RECALLDECK_WORKER_LEASE_ARCHIVE_TTL_HOURS", "72"))
+LEASE_STALE_GRACE_MS = int(os.environ.get("RECALLDECK_WORKER_LEASE_GRACE_MS", "2000"))
 WORKER_LOG_STALE_MS = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_STALE_MS", "0"))
 THRASH_WINDOW_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_WINDOW_MIN", "30"))
 THRASH_MAX_RESPAWNS = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_MAX_RESPAWNS", "3"))
@@ -945,6 +946,13 @@ def recover_stale_lease_dir(task_id: int) -> bool:
     lease = load_lease(task_id)
     if lease_is_valid(task_id, lease):
         return False
+    if LEASE_STALE_GRACE_MS > 0:
+        try:
+            mtime_ms = int(os.path.getmtime(lease_dir(task_id)) * 1000)
+            if now_ms() - mtime_ms < LEASE_STALE_GRACE_MS:
+                return False
+        except Exception:
+            pass
     archived = archive_lease_dir(task_id)
     return archived is not None
 
