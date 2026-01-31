@@ -125,13 +125,7 @@ def main() -> int:
         key=lambda item: (swim_key(item[0]), int(item[0].get("position") or 999), int(item[0]["id"])),
     )
 
-    if len(critical_sorted) > 1:
-        lines = [
-            f"#{int(t['id'])} {(t.get('title') or '').strip()} ({col})" for (t, _tags, col) in critical_sorted
-        ]
-        print("ALERT: Multiple critical tasks present:\n" + "\n".join(lines))
-        return 0
-
+    # Multiple critical tasks are allowed; monitor only the top-priority one.
     active_task, _active_tags, active_col = critical_sorted[0]
     active_id = int(active_task["id"])
 
