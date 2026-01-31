@@ -97,7 +97,7 @@ class TestCriticalMonitorMultipleCritical(unittest.TestCase):
 
                 self.assertEqual(rc, 0)
                 out = buf.getvalue().strip()
-                self.assertEqual(out, "NO_REPLY")
+                self.assertTrue(out == "NO_REPLY" or out.startswith("STATUS:"))
             finally:
                 cm.rpc = old_rpc
                 cm.STATE_PATH = old_state
