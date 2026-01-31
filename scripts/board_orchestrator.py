@@ -97,7 +97,7 @@ REVIEWER_LOG_DIR = os.environ.get(
 REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TAIL_BYTES", "20000"))
 REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
 REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "60"))
-REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "90"))
+REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "85"))
 REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
     "0",
     "false",
@@ -121,7 +121,6 @@ COL_BACKLOG = "Backlog"
 COL_READY = "Ready"
 COL_WIP = "Work in progress"
 COL_REVIEW = "Review"
-COL_PAUSED = "Paused"
 COL_BLOCKED = "Blocked"
 COL_DONE = "Done"
 
@@ -508,6 +507,50 @@ def worker_handle(entry: Any) -> Optional[str]:
         if val:
             return str(val)
     return None
+
+PID_HANDLE_RE = re.compile(r"\bpid:(\d+)\b")
+
+
+def extract_pid(handle: Optional[str]) -> Optional[int]:
+    if not handle:
+        return None
+    m = PID_HANDLE_RE.search(str(handle))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def pid_alive(pid: Optional[int]) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        # Signal 0: check existence without sending a signal.
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Exists but we may not own it; treat as alive.
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return False
+
+
+def worker_is_alive(handle: Optional[str]) -> bool:
+    """Best-effort liveness check.
+
+    Today we can reliably validate pid-based handles emitted by spawn_worker_codex.sh
+    (e.g. 'pid:12345'). For non-pid handles (exec sessions, opaque IDs),
+    treat as alive (unknown).
+    """
+    pid = extract_pid(handle)
+    if pid is None:
+        return True
+    return pid_alive(pid)
+
 
 
 def default_worker_log_path(task_id: int) -> str:
@@ -991,7 +1034,6 @@ def main() -> int:
         col_ready = find_column(columns, COL_READY)
         col_wip = find_column(columns, COL_WIP)
         col_review = find_column(columns, COL_REVIEW)
-        col_paused = find_column(columns, COL_PAUSED)
         col_blocked = find_column(columns, COL_BLOCKED)
         col_done = find_column(columns, COL_DONE)
 
@@ -1133,7 +1175,13 @@ def main() -> int:
             if tid in queued_critical_ids:
                 continue
             entry = worker_entry_for(tid, workers_by_task)
-            if not worker_handle(entry):
+            handle = worker_handle(entry)
+            if not handle or not worker_is_alive(handle):
+                # If we recorded a pid-based handle but the process is dead,
+                # drop it so reconciliation can respawn deterministically.
+                if handle and not worker_is_alive(handle):
+                    workers_by_task.pop(str(tid), None)
+                    workers_by_task.pop(tid, None)
                 missing_worker_tasks.append((t, sl_id))
             try:
                 if str(tid) in repo_by_task and os.path.isdir(str(repo_by_task.get(str(tid), {}).get("path") or "")):
@@ -1231,8 +1279,14 @@ def main() -> int:
             repo_path: Optional[str],
         ) -> bool:
             entry = worker_entry_for(task_id, workers_by_task)
-            if worker_handle(entry):
+            handle = worker_handle(entry)
+            if handle and worker_is_alive(handle):
                 return True
+            # If we have a pid-based handle but the process is dead, drop the stale entry
+            # so we can spawn a replacement worker.
+            if handle and not worker_is_alive(handle):
+                workers_by_task.pop(str(task_id), None)
+                workers_by_task.pop(task_id, None)
             # Never spawn workers during dry-run.
             if dry_run:
                 return False
