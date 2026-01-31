@@ -17,6 +17,7 @@ Env:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -500,6 +501,40 @@ def default_reviewer_log_path(task_id: int) -> str:
     return os.path.join(REVIEWER_LOG_DIR, f"review-task-{task_id}.log")
 
 
+def compute_patch_revision(path: Optional[str]) -> Optional[str]:
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 64)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except Exception:
+        return None
+    return h.hexdigest()
+
+
+def extract_review_revision(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("reviewRevision", "review_revision", "revision"):
+        val = payload.get(key)
+        if val:
+            return str(val)
+    return None
+
+
+def review_revision_matches(current: Optional[str], recorded: Optional[str]) -> bool:
+    if not current:
+        return True
+    if not recorded:
+        return False
+    return current == recorded
+
+
 def read_tail(path: str, max_bytes: int) -> str:
     try:
         with open(path, "rb") as f:
@@ -600,10 +635,12 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
     verdict = None
     notes = None
     critical_items: list[str] = []
+    review_revision = None
     if isinstance(payload, dict):
         score = payload.get("score") if score is None else score
         verdict = payload.get("verdict") if verdict is None else verdict
         notes = payload.get("notes") or payload.get("comment") or payload.get("summary")
+        review_revision = extract_review_revision(payload)
         ci = payload.get("critical_items") or payload.get("criticalIssues") or payload.get("critical")
         if isinstance(ci, list):
             critical_items = [str(x) for x in ci if str(x).strip()]
@@ -633,6 +670,8 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         result["notes"] = str(notes)
     if critical_items:
         result["critical_items"] = critical_items
+    if review_revision:
+        result["reviewRevision"] = review_revision
     return result
 
 
@@ -642,6 +681,10 @@ def detect_review_result(task_id: int, log_path: str) -> Optional[Dict[str, Any]
     tail = read_tail(log_path, REVIEWER_LOG_TAIL_BYTES)
     if not tail:
         return None
+    marker = "### REVIEW START"
+    idx = tail.rfind(marker)
+    if idx >= 0:
+        tail = tail[idx:]
     result = parse_review_result(tail)
     if not result:
         return None
@@ -708,12 +751,14 @@ def spawn_reviewer(
     repo_key: Optional[str],
     repo_path: Optional[str],
     patch_path: Optional[str],
+    review_revision: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     if not REVIEWER_SPAWN_CMD:
         return None
     safe_repo_key = repo_key or ""
     safe_repo_path = repo_path or ""
     safe_patch_path = patch_path or ""
+    safe_review_revision = review_revision or ""
     try:
         cmd = REVIEWER_SPAWN_CMD.format(
             task_id=task_id,
@@ -721,6 +766,7 @@ def spawn_reviewer(
             repo_path=shlex.quote(safe_repo_path),
             patch_path=shlex.quote(safe_patch_path),
             log_path=shlex.quote(default_reviewer_log_path(task_id)),
+            review_revision=shlex.quote(safe_review_revision),
         )
     except Exception:
         cmd = REVIEWER_SPAWN_CMD
@@ -763,6 +809,7 @@ def spawn_reviewer(
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
         "patchPath": safe_patch_path or None,
+        "reviewRevision": safe_review_revision or None,
     }
 
 
@@ -1167,13 +1214,14 @@ def main() -> int:
             task_id: int,
             repo_key: Optional[str],
             repo_path: Optional[str],
+            patch_path: Optional[str],
+            review_revision: Optional[str],
         ) -> bool:
             entry = worker_entry_for(task_id, reviewers_by_task)
             if worker_handle(entry):
                 return True
-            patch_path = resolve_patch_path_for_task(task_id)
             if REVIEWER_SPAWN_CMD:
-                spawned = spawn_reviewer(task_id, repo_key, repo_path, patch_path)
+                spawned = spawn_reviewer(task_id, repo_key, repo_path, patch_path, review_revision)
                 if spawned:
                     reviewers_by_task[str(task_id)] = spawned
                     return True
@@ -1472,9 +1520,50 @@ def main() -> int:
             if has_tag(rtags, TAG_REVIEW_SKIP):
                 continue
 
+            patch_path = resolve_patch_path_for_task(rid)
+            current_revision = compute_patch_revision(patch_path)
             stored_result = review_results_by_task.get(str(rid))
+            stored_revision = extract_review_revision(stored_result)
+            rerun_requested = has_tag(rtags, TAG_REVIEW_RERUN)
+            stored_matches = review_revision_matches(current_revision, stored_revision)
+
+            stale_result = stored_result is not None and (rerun_requested or not stored_matches)
+            if stale_result:
+                if dry_run:
+                    actions.append(f"Would clear stale review result for Review #{rid} ({rtitle})")
+                else:
+                    review_results_by_task.pop(str(rid), None)
+                stored_result = None
 
             entry = worker_entry_for(rid, reviewers_by_task)
+            entry_revision = extract_review_revision(entry)
+            entry_matches = review_revision_matches(current_revision, entry_revision)
+            entry_mismatch = entry is not None and (rerun_requested or not entry_matches)
+            if entry_mismatch:
+                if dry_run:
+                    actions.append(f"Would reset reviewer handle for Review #{rid} ({rtitle})")
+                else:
+                    reviewers_by_task.pop(str(rid), None)
+                entry = None
+
+            if rerun_requested or stale_result:
+                if dry_run:
+                    actions.append(f"Would reset review state for Review #{rid} ({rtitle})")
+                else:
+                    remove_tags(
+                        rid,
+                        [
+                            TAG_REVIEW_PASS,
+                            TAG_REVIEW_REWORK,
+                            TAG_NEEDS_REWORK,
+                            TAG_REVIEW_ERROR,
+                            TAG_REVIEW_INFLIGHT,
+                            TAG_REVIEW_PENDING,
+                            TAG_REVIEW_RERUN,
+                        ],
+                    )
+                    add_tag(rid, TAG_REVIEW_PENDING)
+
             if not worker_handle(entry) and not stored_result:
                 if dry_run:
                     actions.append(f"Would spawn reviewer for Review #{rid} ({rtitle})")
@@ -1491,7 +1580,7 @@ def main() -> int:
                     except Exception:
                         rdesc = ""
                     _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
-                    if ensure_reviewer_handle_for_task(rid, repo_key, repo_path):
+                    if ensure_reviewer_handle_for_task(rid, repo_key, repo_path, patch_path, current_revision):
                         add_tag(rid, TAG_REVIEW_INFLIGHT)
                         actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
 
@@ -1506,6 +1595,12 @@ def main() -> int:
                 if not log_path:
                     log_path = default_reviewer_log_path(rid)
                 result_payload = detect_review_result(rid, log_path)
+                if result_payload:
+                    result_revision = extract_review_revision(result_payload)
+                    if not result_revision:
+                        result_revision = extract_review_revision(entry)
+                    if not review_revision_matches(current_revision, result_revision):
+                        result_payload = None
 
             if result_payload and not stored_result:
                 score = int(result_payload.get("score") or 0)
@@ -1518,26 +1613,54 @@ def main() -> int:
                     if not isinstance(critical_items, list):
                         critical_items = []
 
+                    review_revision = extract_review_revision(result_payload) or current_revision or extract_review_revision(entry)
+                    short_rev = review_revision[:12] if review_revision else None
+                    header = "Opus review checklist"
+                    if short_rev:
+                        header += f" (rev {short_rev})"
+
+                    score_ok = score >= REVIEW_THRESHOLD
+                    verdict_ok = verdict == "PASS"
+
                     comment_lines = [
-                        "Automated review result:",
-                        f"- Score: {score}",
-                        f"- Verdict: {verdict}",
-                        f"- Threshold: {REVIEW_THRESHOLD}",
-                        f"- Fail on critical items: {'yes' if REVIEW_FAIL_ON_CRITICAL_ITEMS else 'no'}",
+                        header,
+                        "- [x] Review completed",
+                        f"- [{'x' if score_ok else ' '}] Score >= {REVIEW_THRESHOLD} (score {score})",
+                        f"- [{'x' if verdict_ok else ' '}] Verdict PASS (verdict {verdict})",
                     ]
                     if critical_items:
-                        comment_lines.append("- Critical items:")
+                        comment_lines.append(f"- [ ] Critical items found ({len(critical_items)})")
                         for item in critical_items[:10]:
                             comment_lines.append(f"  - {item}")
+                    else:
+                        comment_lines.append("- [x] No critical items found")
+                    decision = "approve" if (score_ok and verdict_ok and not critical_items) else "request-changes"
+                    comment_lines.append(f"- Recommendation: {decision}")
+                    comment_lines.append("- Risks:")
+                    if critical_items:
+                        for item in critical_items[:10]:
+                            comment_lines.append(f"  - {item}")
+                    else:
+                        comment_lines.append("  - None noted")
+                    comment_lines.append("- Correctness:")
                     if notes:
-                        comment_lines.append(f"- Notes: {notes}")
+                        comment_lines.append(f"  - {notes}")
+                    else:
+                        comment_lines.append("  - No correctness notes provided")
+                    comment_lines.append("- Tests to run/add:")
+                    comment_lines.append("  - Run: python3 -m unittest discover -s tests")
+                    if review_revision:
+                        comment_lines.append(f"- Review revision: `{review_revision}`")
                     add_comment(rid, "\n".join(comment_lines))
                     review_results_by_task[str(rid)] = {
                         "score": score,
                         "verdict": verdict,
                         "notes": notes,
+                        "critical_items": critical_items,
                         "commentedAtMs": now_ms(),
                         "logPath": result_payload.get("logPath"),
+                        "reviewRevision": review_revision,
+                        "patchPath": patch_path,
                     }
 
             if result_payload:

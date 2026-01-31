@@ -123,6 +123,7 @@ def main() -> int:
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "opus"))
     ap.add_argument("--timeout-sec", type=int, default=int(os.environ.get("CLAUDE_REVIEW_TIMEOUT_SEC", "600")))
     ap.add_argument("--prompt", required=True)
+    ap.add_argument("--revision", default="")
     args = ap.parse_args()
 
     log_path = args.log_path
@@ -156,6 +157,8 @@ def main() -> int:
             "critical_items": [f"Reviewer timed out after {args.timeout_sec}s"],
             "notes": "Claude review command did not return in time; investigate claude CLI/auth/quota.",
         }
+        if args.revision:
+            result["review_revision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
         return 0
     except Exception as e:
@@ -165,6 +168,8 @@ def main() -> int:
             "critical_items": [f"Reviewer execution error: {type(e).__name__}: {e}"],
             "notes": "Claude review command failed to execute.",
         }
+        if args.revision:
+            result["review_revision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
         return 0
 
@@ -189,6 +194,8 @@ def main() -> int:
             ],
             "notes": (out[:400] if out else (err[:400] if err else "no output")),
         }
+        if args.revision:
+            result["review_revision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
         return 0
 
@@ -211,6 +218,8 @@ def main() -> int:
         "critical_items": [str(x) for x in critical_items if str(x).strip()][:20],
         "notes": str(parsed.get("notes") or "")[:1000],
     }
+    if args.revision:
+        result["review_revision"] = args.revision
 
     append_line(log_path, "review_result: " + compact_json(result))
     return 0
