@@ -39,16 +39,81 @@ def compact_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
-def parse_review_json(s: str) -> Optional[Dict[str, Any]]:
-    try:
-        obj = json.loads(s)
-    except Exception:
-        return None
+def parse_review_json_obj(obj: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
     if "score" not in obj or "verdict" not in obj:
         return None
     return obj
+
+
+def extract_review_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """Extract a {score, verdict, ...} JSON object from model output.
+
+    Claude sometimes prints prose plus a fenced JSON block.
+    We try to recover the embedded JSON object.
+    """
+    if not text:
+        return None
+
+    s = text.strip()
+
+    # Fast path: pure JSON.
+    if s.startswith("{"):
+        try:
+            return parse_review_json_obj(json.loads(s))
+        except Exception:
+            pass
+
+    # Heuristic: find an object starting with {"score" (optionally with whitespace)
+    candidates = []
+    for needle in ("{\"score\"", "{ \"score\""):
+        start = 0
+        while True:
+            i = s.find(needle, start)
+            if i < 0:
+                break
+            candidates.append(i)
+            start = i + 1
+
+    # Also try to locate JSON in fenced code blocks by looking for "score" key.
+    if not candidates:
+        j = s.find("\"score\"")
+        if j >= 0:
+            # back up to nearest '{'
+            i = s.rfind("{", 0, j)
+            if i >= 0:
+                candidates.append(i)
+
+    def brace_slice(src: str, start_idx: int) -> Optional[str]:
+        depth = 0
+        end = None
+        for k in range(start_idx, len(src)):
+            ch = src[k]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+        if end is None:
+            return None
+        return src[start_idx:end]
+
+    for i in candidates:
+        frag = brace_slice(s, i)
+        if not frag:
+            continue
+        try:
+            obj = json.loads(frag)
+        except Exception:
+            continue
+        parsed = parse_review_json_obj(obj)
+        if parsed:
+            return parsed
+
+    return None
 
 
 def main() -> int:
@@ -112,14 +177,14 @@ def main() -> int:
     if err:
         append_line(log_path, "[stderr] " + err[:20000])
 
-    parsed = parse_review_json(out)
+    parsed = extract_review_json_from_text(out)
     if not parsed:
-        # Non-JSON output: treat as blocker.
+        # Could not recover JSON: treat as blocker.
         result = {
             "score": 1,
             "verdict": "BLOCKER",
             "critical_items": [
-                "Reviewer did not output valid JSON",
+                "Reviewer did not output valid JSON (or could not be extracted)",
                 f"exit_code={p.returncode}",
             ],
             "notes": (out[:400] if out else (err[:400] if err else "no output")),
