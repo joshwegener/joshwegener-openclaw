@@ -60,6 +60,12 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.get("reviewRevision"), "abc123")
 
+    def test_parse_review_result_critical_items_string(self) -> None:
+        text = 'REVIEW_RESULT: {"score": 65, "verdict": "REWORK", "critical_items": "Missing tests"}'
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("critical_items"), ["Missing tests"])
+
 
 class TestDetectReviewResult(unittest.TestCase):
     def test_detect_review_result_after_marker(self) -> None:

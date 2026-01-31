@@ -704,6 +704,10 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         ci = payload.get("critical_items") or payload.get("criticalIssues") or payload.get("critical")
         if isinstance(ci, list):
             critical_items = [str(x) for x in ci if str(x).strip()]
+        elif isinstance(ci, str):
+            item = ci.strip()
+            if item:
+                critical_items = [item]
 
     if score is None:
         score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", raw, re.IGNORECASE)
