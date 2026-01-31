@@ -694,6 +694,21 @@ def safe_write_json(path: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def lease_is_valid(task_id: int, lease: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(lease, dict):
+        return False
+    try:
+        if int(lease.get("taskId") or 0) != int(task_id):
+            return False
+    except Exception:
+        return False
+    if lease.get("schemaVersion") != LEASE_SCHEMA_VERSION:
+        return False
+    if not lease.get("leaseId"):
+        return False
+    return True
+
+
 def generate_lease_id() -> str:
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     return f"{ts}-{secrets.token_hex(4)}"
@@ -807,7 +822,8 @@ def write_lease_files(task_id: int, lease: Dict[str, Any]) -> None:
 
 
 def load_lease(task_id: int) -> Optional[Dict[str, Any]]:
-    return safe_read_json(lease_json_path(task_id))
+    lease = safe_read_json(lease_json_path(task_id))
+    return lease if lease_is_valid(task_id, lease) else None
 
 
 def lease_worker_pid(lease: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -917,6 +933,20 @@ def acquire_lease_dir(task_id: int) -> bool:
         if e.errno == errno.EEXIST:
             return False
         return False
+
+
+def recover_stale_lease_dir(task_id: int) -> bool:
+    """Archive a lease dir when lease.json is missing/unreadable.
+
+    Returns True if a stale lease dir was archived.
+    """
+    if not os.path.isdir(lease_dir(task_id)):
+        return False
+    lease = load_lease(task_id)
+    if lease_is_valid(task_id, lease):
+        return False
+    archived = archive_lease_dir(task_id)
+    return archived is not None
 
 
 def gc_worker_leases() -> None:
@@ -2130,28 +2160,39 @@ def main() -> int:
 
             # If we have a live pid-based handle but no lease, seed one for recovery.
             if not lease and pid and pid_alive(pid):
-                if acquire_lease_dir(task_id):
-                    cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
-                    lease_payload = init_lease_payload(
-                        task_id,
-                        run_id,
-                        safe_repo_key or (entry.get("repoKey") if isinstance(entry, dict) else ""),
-                        safe_repo_path or (entry.get("repoPath") if isinstance(entry, dict) else ""),
-                        (entry.get("logPath") if isinstance(entry, dict) else None) or default_worker_log_path(task_id),
-                        (entry.get("patchPath") if isinstance(entry, dict) else None) or default_worker_patch_path(task_id),
-                        (entry.get("commentPath") if isinstance(entry, dict) else None)
-                        or default_worker_comment_path(task_id),
-                        cmd,
-                        WORKER_SPAWN_TIMEOUT_SEC,
-                    )
-                    lease_payload["worker"]["pid"] = pid
-                    lease_payload["worker"]["startedAtMs"] = (
-                        entry.get("startedAtMs") if isinstance(entry, dict) else None
-                    ) or now_ms()
-                    lease_payload["worker"]["execSessionId"] = handle
-                    write_lease_files(task_id, lease_payload)
-                    workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
-                    return True
+                if not acquire_lease_dir(task_id):
+                    existing = load_lease(task_id)
+                    if existing:
+                        verdict, _pid, note = evaluate_lease_liveness(task_id, existing)
+                        update_lease_liveness(task_id, existing, verdict, note)
+                        workers_by_task[str(task_id)] = lease_worker_entry(task_id, existing)
+                        return verdict == "alive"
+                    if recover_stale_lease_dir(task_id):
+                        if not acquire_lease_dir(task_id):
+                            return False
+                    else:
+                        return False
+                cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
+                lease_payload = init_lease_payload(
+                    task_id,
+                    run_id,
+                    safe_repo_key or (entry.get("repoKey") if isinstance(entry, dict) else ""),
+                    safe_repo_path or (entry.get("repoPath") if isinstance(entry, dict) else ""),
+                    (entry.get("logPath") if isinstance(entry, dict) else None) or default_worker_log_path(task_id),
+                    (entry.get("patchPath") if isinstance(entry, dict) else None) or default_worker_patch_path(task_id),
+                    (entry.get("commentPath") if isinstance(entry, dict) else None)
+                    or default_worker_comment_path(task_id),
+                    cmd,
+                    WORKER_SPAWN_TIMEOUT_SEC,
+                )
+                lease_payload["worker"]["pid"] = pid
+                lease_payload["worker"]["startedAtMs"] = (
+                    entry.get("startedAtMs") if isinstance(entry, dict) else None
+                ) or now_ms()
+                lease_payload["worker"]["execSessionId"] = handle
+                write_lease_files(task_id, lease_payload)
+                workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
+                return True
 
             # No lease or lease cleaned up: attempt to acquire + spawn.
             if dry_run:
@@ -2199,8 +2240,11 @@ def main() -> int:
                         record_spawn_attempt(task_id, lease.get("leaseId"), run_id, "refused", "lease-race")
                         return False
                 else:
-                    record_spawn_attempt(task_id, lease_id, run_id, "refused", "lease-race")
-                    return False
+                    if recover_stale_lease_dir(task_id) and acquire_lease_dir(task_id):
+                        pass
+                    else:
+                        record_spawn_attempt(task_id, lease_id, run_id, "refused", "lease-race")
+                        return False
 
             cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
             lease_payload = init_lease_payload(
