@@ -1176,16 +1176,24 @@ def main() -> int:
                     return True
             return False
 
-        def pause_missing_worker(task_id: int, sl_id: int, title: str, reason: str, *, force: bool = False) -> None:
+        def pause_missing_worker(
+            task_id: int,
+            sl_id: int,
+            title: str,
+            reason: str,
+            *,
+            force: bool = False,
+            label: str = "WIP",
+        ) -> None:
             nonlocal budget
             if budget <= 0 and not force:
                 return
             if dry_run:
-                actions.append(f"Would tag WIP #{task_id} ({title}) as paused:missing-worker ({reason})")
+                actions.append(f"Would tag {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
             else:
                 record_action(task_id)
                 add_tags(task_id, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
-                actions.append(f"Tagged WIP #{task_id} ({title}) as paused:missing-worker ({reason})")
+                actions.append(f"Tagged {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
             if budget > 0:
                 budget -= 1
 
@@ -1786,20 +1794,31 @@ def main() -> int:
                             )
                         elif budget > 0:
                             if dry_run:
-                                actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                                 if not WORKER_SPAWN_CMD:
                                     actions.append(
-                                        f"Would pause WIP #{cid} ({ctitle}) -> Paused (missing worker handle)"
+                                        f"Would NOT start critical #{cid} ({ctitle}) -> WIP (no worker spawn command configured)"
                                     )
+                                    actions.append(
+                                        f"Would tag critical #{cid} ({ctitle}) as paused:missing-worker (cannot start worker)"
+                                    )
+                                else:
+                                    actions.append(f"Would spawn worker for critical #{cid} ({ctitle})")
+                                    actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                             else:
-                                move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
-                                record_action(cid)
-                                moved_to_wip.append(cid)
-                                actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
-                                if not ensure_worker_handle_for_task(cid, repo_key, repo_path):
-                                    pause_missing_worker(cid, int(csl_id), ctitle, "missing worker handle", force=True)
-                                    if cid in moved_to_wip:
-                                        moved_to_wip.remove(cid)
+                                if ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                                    move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
+                                    record_action(cid)
+                                    moved_to_wip.append(cid)
+                                    actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                                else:
+                                    pause_missing_worker(
+                                        cid,
+                                        int(csl_id),
+                                        ctitle,
+                                        "cannot start worker",
+                                        force=True,
+                                        label="critical",
+                                    )
                             budget -= 1
 
             # While critical exists anywhere not Done, freeze normal pulling.
