@@ -1136,6 +1136,9 @@ def main() -> int:
             entry = worker_entry_for(task_id, workers_by_task)
             if worker_handle(entry):
                 return True
+            # Never spawn workers during dry-run.
+            if dry_run:
+                return False
             if WORKER_SPAWN_CMD and repo_path:
                 spawned = spawn_worker(task_id, repo_key, repo_path)
                 if spawned:
