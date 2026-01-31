@@ -66,6 +66,24 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.get("critical_items"), ["Missing tests"])
 
+    def test_parse_review_result_uppercase_space_sentinel(self) -> None:
+        text = "REVIEW RESULT: score=82 verdict=PASS"
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 82)
+        self.assertEqual(result.get("verdict"), "PASS")
+
+    def test_parse_review_result_with_trailing_noise(self) -> None:
+        text = (
+            "noise\n"
+            "review_result: {\"score\": 90, \"verdict\": \"PASS\"}\n"
+            "more noise\n"
+        )
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("score"), 90)
+        self.assertEqual(result.get("verdict"), "PASS")
+
 
 class TestDetectReviewResult(unittest.TestCase):
     def test_detect_review_result_after_marker(self) -> None:
