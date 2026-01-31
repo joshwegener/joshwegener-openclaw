@@ -637,8 +637,14 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
     if not match:
         return None
     raw = (match.group(1) or "").strip()
-    if not raw:
+    tail = text[match.end():]
+    parse_text = raw
+    if tail:
+        parse_text = (raw + "\n" + tail) if raw else tail.lstrip()
+    if not parse_text.strip():
         return None
+    if not raw:
+        raw = parse_text.strip()
 
     def extract_review_json_from_string(s: str) -> Optional[Dict[str, Any]]:
         """Best-effort extraction of a {score, verdict, ...} object from a string.
@@ -682,6 +688,11 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         except Exception:
             payload = None
 
+    if payload is None:
+        embedded = extract_review_json_from_string(parse_text)
+        if embedded and isinstance(embedded, dict):
+            payload = embedded
+
     # If the reviewer wrote a Claude JSON envelope (e.g. {type:'result', result:'...{score...}'})
     # attempt to recover the embedded review JSON.
     if isinstance(payload, dict) and ("score" not in payload or "verdict" not in payload):
@@ -710,11 +721,11 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
                 critical_items = [item]
 
     if score is None:
-        score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", raw, re.IGNORECASE)
+        score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", parse_text, re.IGNORECASE)
         if score_match:
             score = score_match.group(1)
     if verdict is None:
-        verdict_match = re.search(r"verdict\s*[:=]\s*([A-Za-z]+)", raw, re.IGNORECASE)
+        verdict_match = re.search(r"verdict\s*[:=]\s*([A-Za-z]+)", parse_text, re.IGNORECASE)
         if verdict_match:
             verdict = verdict_match.group(1)
 
