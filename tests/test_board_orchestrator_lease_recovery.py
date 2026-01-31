@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,9 @@ class TestLeaseRecovery(unittest.TestCase):
     def test_recover_stale_lease_dir_archives(self) -> None:
         task_id = 60
         os.makedirs(bo.lease_dir(task_id))
+        if bo.LEASE_STALE_GRACE_MS > 0:
+            past = time.time() - (bo.LEASE_STALE_GRACE_MS / 1000.0) - 1
+            os.utime(bo.lease_dir(task_id), (past, past))
 
         recovered = bo.recover_stale_lease_dir(task_id)
 
