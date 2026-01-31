@@ -10,7 +10,7 @@ class TestWorkerOutputDetection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "task-30.log"
             patch_path = Path(tmp) / "RecallDeck-Server-task30-api-contracts.patch"
-            patch_path.write_text("dummy patch")
+            patch_path.write_text("diff --git a/foo b/foo\n")
             # Log contains a patch marker pointing at an existing file.
             log_path.write_text(f"Patch file: `{patch_path}`")
 
