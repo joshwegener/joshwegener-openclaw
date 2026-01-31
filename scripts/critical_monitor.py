@@ -92,6 +92,8 @@ def main() -> int:
         lower = {x.lower() for x in tags}
         if "hold" in lower or "no-auto" in lower:
             return True
+        if any(t.startswith("hold:") for t in lower):
+            return True
         # Treat paused tags as manual escape hatch for critical monitoring.
         if "paused" in lower:
             return True

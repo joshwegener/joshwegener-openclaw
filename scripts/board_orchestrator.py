@@ -25,7 +25,7 @@ import shlex
 import subprocess
 import time
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 STATE_PATH = os.environ.get(
     "BOARD_ORCHESTRATOR_STATE",
@@ -46,6 +46,7 @@ FIRST_RUN_DRYRUNS = 1  # first run only
 
 TAG_EPIC = "epic"
 TAG_HOLD = "hold"
+TAG_HOLD_QUEUED_CRITICAL = "hold:queued-critical"
 TAG_NOAUTO = "no-auto"
 TAG_STORY = "story"
 TAG_EPIC_CHILD = "epic-child"
@@ -147,6 +148,22 @@ def critical_sort_key(
     base_sort: Tuple[int, int],
 ) -> Tuple[int, int, int]:
     return (critical_column_priority(column_id, col_wip_id, col_review_id, col_ready_id),) + tuple(base_sort)
+
+
+def pick_critical_queue(
+    critical_candidates: List[Tuple[Dict[str, Any], int, int]],
+    col_wip_id: int,
+    col_review_id: int,
+    col_ready_id: int,
+    sort_key_fn: Callable[[Tuple[Any, ...]], Tuple[int, int]],
+) -> Tuple[Optional[Tuple[Dict[str, Any], int, int]], List[Tuple[Dict[str, Any], int, int]]]:
+    if not critical_candidates:
+        return None, []
+    critical_sorted = sorted(
+        critical_candidates,
+        key=lambda item: critical_sort_key(item[2], col_wip_id, col_review_id, col_ready_id, sort_key_fn(item)),
+    )
+    return critical_sorted[0], critical_sorted[1:]
 
 
 def plan_pause_wip(
@@ -877,7 +894,7 @@ def task_title(t: Dict[str, Any]) -> str:
 
 def is_held(tags: List[str]) -> bool:
     lower = {x.lower() for x in tags}
-    if TAG_HOLD in lower or TAG_NOAUTO in lower:
+    if TAG_HOLD in lower or TAG_NOAUTO in lower or any(t.startswith("hold:") for t in lower):
         return True
     # Treat any paused tag as an explicit "do not advance/start" escape hatch.
     if TAG_PAUSED in lower:
@@ -1069,6 +1086,37 @@ def main() -> int:
             pri = pri_list.index(sl_name) if sl_name in pri_list else len(pri_list)
             return (pri, int(t.get("position") or 10**9))
 
+        # Determine critical queue early so drift checks don't flag queued criticals.
+        all_open: List[Tuple[Dict[str, Any], int, int]] = []
+        for sl in swimlanes:
+            for c in (sl.get("columns") or []):
+                col_id = int(c.get("id") or 0)
+                if col_id == int(col_done["id"]):
+                    continue
+                for t in (c.get("tasks") or []):
+                    all_open.append((t, int(sl.get("id") or 0), col_id))
+
+        critical_candidates: List[Tuple[Dict[str, Any], int, int]] = []
+        critical_task_ids: set[int] = set()
+        for t, sl_id, col_id in all_open:
+            tid = int(t.get("id"))
+            try:
+                tags = get_task_tags(tid)
+            except Exception:
+                tags = []
+            if is_critical(tags) and not is_held(tags):
+                critical_candidates.append((t, sl_id, col_id))
+                critical_task_ids.add(tid)
+
+        active_critical, queued_critical = pick_critical_queue(
+            critical_candidates,
+            int(col_wip["id"]),
+            int(col_review["id"]),
+            int(col_ready["id"]),
+            sort_key,
+        )
+        queued_critical_ids = {int(t.get("id")) for t, _sl_id, _col_id in queued_critical}
+
         wip_count = len(wip_tasks)
         actions: List[str] = []
         promoted_to_ready: List[int] = []
@@ -1082,6 +1130,8 @@ def main() -> int:
         for t, sl_id in wip_tasks:
             tid = int(t.get("id"))
             title = task_title(t)
+            if tid in queued_critical_ids:
+                continue
             entry = worker_entry_for(tid, workers_by_task)
             if not worker_handle(entry):
                 missing_worker_tasks.append((t, sl_id))
@@ -1498,6 +1548,46 @@ def main() -> int:
                     sort_key(item),
                 ),
             )[0]
+
+        # If multiple critical tasks exist, auto-queue the non-active ones.
+        # This prevents the monitor from treating multiple critical tags as an invariant violation,
+        # while still preserving the priority order on the board.
+        if active_critical is not None and len(critical_candidates) > 1:
+            active_id = int(active_critical[0].get("id") or 0)
+
+            # Ensure the active critical isn't held (it may have been queued previously).
+            try:
+                atags = get_task_tags(active_id)
+            except Exception:
+                atags = []
+            if any(t.lower() in (TAG_HOLD, TAG_HOLD_QUEUED_CRITICAL) for t in atags):
+                if dry_run:
+                    actions.append(f"Would untag hold/hold:queued-critical for active critical #{active_id}")
+                else:
+                    remove_tags(active_id, [TAG_HOLD, TAG_HOLD_QUEUED_CRITICAL])
+                    record_action(active_id)
+                    actions.append(f"Unqueued active critical #{active_id} (removed hold:queued-critical)")
+
+            for t, _sl_id, _col_id in critical_candidates:
+                tid = int(t.get("id"))
+                if tid == active_id:
+                    continue
+                if budget <= 0:
+                    break
+                ttitle = task_title(t)
+                try:
+                    ttags = get_task_tags(tid)
+                except Exception:
+                    ttags = []
+                if is_held(ttags):
+                    continue
+                if dry_run:
+                    actions.append(f"Would tag queued critical #{tid} ({ttitle}) as hold:queued-critical")
+                else:
+                    add_tags(tid, [TAG_HOLD, TAG_HOLD_QUEUED_CRITICAL])
+                    record_action(tid)
+                    actions.append(f"Queued critical #{tid} ({ttitle}) (tagged hold:queued-critical)")
+                budget -= 1
 
         # ---------------------------------------------------------------------
         # REVIEW AUTOMATION
