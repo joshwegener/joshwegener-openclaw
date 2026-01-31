@@ -646,6 +646,7 @@ def worker_is_alive(handle: Optional[str]) -> bool:
 
 LEASE_SCHEMA_VERSION = 1
 HISTORY_SCHEMA_VERSION = 1
+LEASE_PENDING_NOTE = "awaiting worker pid"
 
 
 def lease_task_dir(task_id: int) -> str:
@@ -876,6 +877,15 @@ def evaluate_lease_liveness(task_id: int, lease: Optional[Dict[str, Any]]) -> Tu
         return "unknown", None, "missing lease metadata"
     pid = lease_worker_pid(lease)
     if not pid:
+        if LEASE_STALE_GRACE_MS > 0:
+            nowm = now_ms()
+            for key in ("updatedAtMs", "createdAtMs"):
+                try:
+                    ts = int(lease.get(key) or 0)
+                except Exception:
+                    ts = 0
+                if ts and (nowm - ts) <= LEASE_STALE_GRACE_MS:
+                    return "unknown", None, LEASE_PENDING_NOTE
         return "dead", None, "missing worker pid"
     verdict = "alive" if pid_alive(pid) else "dead"
     log_path = lease_log_path(lease, task_id)
@@ -1716,6 +1726,7 @@ def main() -> int:
 
         review_ids = {int(t.get("id")) for t, _sl in review_tasks}
         lease_warnings: List[str] = []
+        lease_pending_ids: set[int] = set()
 
         # Prefer leases as the canonical source for active workers.
         if WORKER_LEASES_ENABLED and wip_tasks:
@@ -1731,9 +1742,12 @@ def main() -> int:
                     else:
                         workers_by_task[str(tid)] = lease_worker_entry(tid, lease)
                         if verdict == "unknown":
-                            lease_warnings.append(
-                                f"manual-fix: WIP #{tid} worker liveness unknown ({note or 'unknown'})."
-                            )
+                            if note == LEASE_PENDING_NOTE:
+                                lease_pending_ids.add(tid)
+                            else:
+                                lease_warnings.append(
+                                    f"manual-fix: WIP #{tid} worker liveness unknown ({note or 'unknown'})."
+                                )
                 else:
                     workers_by_task.pop(str(tid), None)
                     workers_by_task.pop(tid, None)
@@ -1837,6 +1851,8 @@ def main() -> int:
             entry = worker_entry_for(tid, workers_by_task)
             handle = worker_handle(entry)
             if not handle or not worker_is_alive(handle):
+                if tid in lease_pending_ids:
+                    continue
                 # If we recorded a pid-based handle but the process is dead,
                 # drop it so reconciliation can respawn deterministically.
                 if handle and not worker_is_alive(handle):
@@ -2073,6 +2089,9 @@ def main() -> int:
                     workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
                     return True
                 if verdict == "unknown":
+                    if note == LEASE_PENDING_NOTE:
+                        workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
+                        return True
                     errors.append(
                         f"manual-fix: WIP #{task_id} worker liveness unknown ({note or 'unknown'})."
                     )
