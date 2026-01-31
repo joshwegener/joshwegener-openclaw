@@ -27,6 +27,7 @@ STATE_PATH = os.environ.get(
     "RECALLDECK_STATE_PATH",
     "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
 )
+WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
 
 # Spam control: suppress repeating the exact same alert for a short window.
 ALERT_STATE_PATH = os.environ.get(
@@ -36,6 +37,68 @@ ALERT_STATE_PATH = os.environ.get(
 ALERT_DEDUP_SECONDS = int(os.environ.get("RECALLDECK_ALERT_DEDUP_SECONDS", "1800"))
 
 REVIEW_STALE_SECONDS = int(os.environ.get("RECALLDECK_REVIEW_STALE_SECONDS", "7200"))
+
+LEASE_SCHEMA_VERSION = 1
+
+
+def lease_json_path(task_id: int) -> str:
+    return os.path.join(WORKER_LEASE_ROOT, f"task-{task_id}", "lease", "lease.json")
+
+
+def load_lease(task_id: int) -> dict | None:
+    path = lease_json_path(task_id)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        if int(raw.get("taskId") or 0) != int(task_id):
+            return None
+    except Exception:
+        return None
+    if raw.get("schemaVersion") != LEASE_SCHEMA_VERSION:
+        return None
+    if not raw.get("leaseId"):
+        return None
+    return raw
+
+
+def lease_worker_pid(lease: dict | None) -> int | None:
+    if not lease:
+        return None
+    worker = lease.get("worker")
+    if not isinstance(worker, dict):
+        return None
+    try:
+        pid = int(worker.get("pid") or 0)
+    except Exception:
+        pid = 0
+    return pid if pid > 0 else None
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return False
+
+
+def lease_has_live_pid(task_id: int) -> bool:
+    lease = load_lease(task_id)
+    pid = lease_worker_pid(lease)
+    return pid_alive(pid)
 
 
 def load_alert_state() -> dict:
@@ -213,7 +276,8 @@ def main() -> None:
     missing_workers: list[tuple[int, str]] = []
     for t in wip_tasks:
         tid = int(t["id"])
-        if str(tid) not in workers_by_task and tid not in workers_by_task:
+        has_worker = str(tid) in workers_by_task or tid in workers_by_task or lease_has_live_pid(tid)
+        if not has_worker:
             missing_workers.append((tid, (t.get("title") or "").strip()))
 
     if missing_workers:
