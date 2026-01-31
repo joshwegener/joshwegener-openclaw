@@ -50,12 +50,17 @@ TAG_STORY = "story"
 TAG_EPIC_CHILD = "epic-child"
 TAG_DOCS_REQUIRED = "docs-required"
 TAG_CRITICAL = "critical"
-TAG_PAUSED = "paused"
+TAG_PAUSED = "paused"  # generic/manual pause
+TAG_PAUSED_CRITICAL = "paused:critical"
+TAG_PAUSED_MISSING_WORKER = "paused:missing-worker"
+TAG_PAUSED_DEPS = "paused:deps"
+TAG_PAUSED_EXCLUSIVE = "paused:exclusive"
 TAG_AUTO_BLOCKED = "auto-blocked"
 TAG_BLOCKED_DEPS = "blocked:deps"
 TAG_BLOCKED_EXCLUSIVE = "blocked:exclusive"
 TAG_BLOCKED_REPO = "blocked:repo"
 TAG_NO_REPO = "no-repo"
+TAG_NEEDS_REWORK = "needs-rework"
 
 # Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -65,6 +70,7 @@ PATCH_MARKER_RE = re.compile(
     r"(?:patch file|patch to apply|generated patch)\s*:\s*`?([^\s`]+)`?",
     re.IGNORECASE,
 )
+REVIEW_RESULT_RE = re.compile(r"review_result\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 REPO_ROOT = os.environ.get("RECALLDECK_REPO_ROOT", "/Users/joshwegener/Projects/RecallDeck")
 REPO_MAP_PATH = os.environ.get("BOARD_ORCHESTRATOR_REPO_MAP", "")
@@ -72,6 +78,11 @@ WORKER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_DIR", "/Users/jos
 WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_BYTES", "20000"))
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
 WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "60"))
+REVIEWER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_DIR", WORKER_LOG_DIR)
+REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TAIL_BYTES", "20000"))
+REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
+REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "60"))
+REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "85"))
 MISSING_WORKER_POLICY = os.environ.get("BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY", "pause").strip().lower()
 ALLOW_TITLE_REPO_HINT = os.environ.get("BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT", "1").strip().lower() not in (
     "0",
@@ -178,6 +189,9 @@ def load_state() -> Dict[str, Any]:
         "repoMap": {},
         "repoByTaskId": {},
         "autoBlockedByOrchestrator": {},
+        # review automation bookkeeping (optional, self-healing)
+        "reviewersByTaskId": {},
+        "reviewResultsByTaskId": {},
     }
 
 
@@ -452,6 +466,10 @@ def default_worker_log_path(task_id: int) -> str:
     return os.path.join(WORKER_LOG_DIR, f"task-{task_id}.log")
 
 
+def default_reviewer_log_path(task_id: int) -> str:
+    return os.path.join(REVIEWER_LOG_DIR, f"review-task-{task_id}.log")
+
+
 def read_tail(path: str, max_bytes: int) -> str:
     try:
         with open(path, "rb") as f:
@@ -466,19 +484,89 @@ def read_tail(path: str, max_bytes: int) -> str:
 
 
 def detect_worker_completion(task_id: int, log_path: str) -> Optional[Dict[str, str]]:
+    # Be conservative: only treat a worker as "complete" when we have a patch marker AND the patch exists.
+    # This avoids false positives where filenames appear in error output.
     if not log_path or not os.path.isfile(log_path):
         return None
     tail = read_tail(log_path, WORKER_LOG_TAIL_BYTES)
     if not tail:
         return None
+
     patch_match = PATCH_MARKER_RE.search(tail)
-    comment_marker = f"kanboard-task-{task_id}-comment.md"
-    if patch_match or comment_marker in tail:
-        payload: Dict[str, str] = {"logPath": log_path}
-        if patch_match:
-            payload["patchPath"] = patch_match.group(1)
-        return payload
-    return None
+    if not patch_match:
+        return None
+
+    patch_path = patch_match.group(1)
+    if not patch_path or not os.path.isfile(patch_path):
+        return None
+
+    return {"logPath": log_path, "patchPath": patch_path}
+
+
+def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    match = None
+    for m in REVIEW_RESULT_RE.finditer(text):
+        match = m
+    if not match:
+        return None
+    raw = (match.group(1) or "").strip()
+    if not raw:
+        return None
+
+    payload: Any = None
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = None
+
+    score = None
+    verdict = None
+    notes = None
+    if isinstance(payload, dict):
+        score = payload.get("score") if score is None else score
+        verdict = payload.get("verdict") if verdict is None else verdict
+        notes = payload.get("notes") or payload.get("comment") or payload.get("summary")
+
+    if score is None:
+        score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", raw, re.IGNORECASE)
+        if score_match:
+            score = score_match.group(1)
+    if verdict is None:
+        verdict_match = re.search(r"verdict\s*[:=]\s*([A-Za-z]+)", raw, re.IGNORECASE)
+        if verdict_match:
+            verdict = verdict_match.group(1)
+
+    try:
+        score_int = int(score)
+    except Exception:
+        return None
+    if score_int < 1 or score_int > 100:
+        return None
+
+    verdict_norm = str(verdict or "").strip().upper()
+    if verdict_norm not in ("PASS", "REWORK", "BLOCKER"):
+        return None
+
+    result: Dict[str, Any] = {"score": score_int, "verdict": verdict_norm, "raw": raw}
+    if notes:
+        result["notes"] = str(notes)
+    return result
+
+
+def detect_review_result(task_id: int, log_path: str) -> Optional[Dict[str, Any]]:
+    if not log_path or not os.path.isfile(log_path):
+        return None
+    tail = read_tail(log_path, REVIEWER_LOG_TAIL_BYTES)
+    if not tail:
+        return None
+    result = parse_review_result(tail)
+    if not result:
+        return None
+    result["logPath"] = log_path
+    return result
 
 
 def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -532,6 +620,69 @@ def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]
         "startedAtMs": now_ms(),
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
+    }
+
+
+def spawn_reviewer(
+    task_id: int,
+    repo_key: Optional[str],
+    repo_path: Optional[str],
+    patch_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not REVIEWER_SPAWN_CMD:
+        return None
+    safe_repo_key = repo_key or ""
+    safe_repo_path = repo_path or ""
+    safe_patch_path = patch_path or ""
+    try:
+        cmd = REVIEWER_SPAWN_CMD.format(
+            task_id=task_id,
+            repo_key=shlex.quote(safe_repo_key),
+            repo_path=shlex.quote(safe_repo_path),
+            patch_path=shlex.quote(safe_patch_path),
+            log_path=shlex.quote(default_reviewer_log_path(task_id)),
+        )
+    except Exception:
+        cmd = REVIEWER_SPAWN_CMD
+    try:
+        out = subprocess.run(
+            cmd,
+            shell=True,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=REVIEWER_SPAWN_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    raw = (out.stdout or "").strip()
+    if not raw:
+        return None
+    handle: Optional[str] = None
+    log_path: Optional[str] = None
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                handle = payload.get("execSessionId") or payload.get("handle") or payload.get("sessionId")
+                log_path = payload.get("logPath")
+        except Exception:
+            handle = None
+    if not handle:
+        handle = raw.splitlines()[-1].strip()
+    if not log_path:
+        log_path = default_reviewer_log_path(task_id)
+    return {
+        "kind": "reviewer",
+        "execSessionId": handle,
+        "logPath": log_path,
+        "startedAtMs": now_ms(),
+        "repoKey": safe_repo_key,
+        "repoPath": safe_repo_path,
+        "patchPath": safe_patch_path or None,
     }
 
 
@@ -599,7 +750,14 @@ def task_title(t: Dict[str, Any]) -> str:
 
 def is_held(tags: List[str]) -> bool:
     lower = {x.lower() for x in tags}
-    return TAG_HOLD in lower or TAG_NOAUTO in lower
+    if TAG_HOLD in lower or TAG_NOAUTO in lower:
+        return True
+    # Treat any paused tag as an explicit "do not advance/start" escape hatch.
+    if TAG_PAUSED in lower:
+        return True
+    if any(t.startswith("paused:") for t in lower):
+        return True
+    return False
 
 
 def is_epic(tags: List[str]) -> bool:
@@ -672,6 +830,8 @@ def main() -> int:
         repo_map: Dict[str, str] = (state.get("repoMap") or {})
         repo_by_task: Dict[str, Any] = (state.get("repoByTaskId") or {})
         auto_blocked: Dict[str, Any] = (state.get("autoBlockedByOrchestrator") or {})
+        reviewers_by_task: Dict[str, Any] = (state.get("reviewersByTaskId") or {})
+        review_results_by_task: Dict[str, Any] = (state.get("reviewResultsByTaskId") or {})
 
         pid = get_project_id()
         board = get_board(pid)
@@ -698,7 +858,7 @@ def main() -> int:
                 (COL_READY, col_ready),
                 (COL_WIP, col_wip),
                 (COL_REVIEW, col_review),
-                (COL_PAUSED, col_paused),
+                # NOTE: Paused is now tag-based; the Paused column is optional/legacy.
                 (COL_BLOCKED, col_blocked),
                 (COL_DONE, col_done),
             ]
@@ -734,9 +894,11 @@ def main() -> int:
         ready_tasks = tasks_for_column(int(col_ready["id"]))
         backlog_tasks = tasks_for_column(int(col_backlog["id"]))
         review_tasks = tasks_for_column(int(col_review["id"]))
-        paused_tasks = tasks_for_column(int(col_paused["id"]))
+        # Paused is now tag-based; the Paused column is optional/legacy.
         blocked_tasks = tasks_for_column(int(col_blocked["id"]))
         done_tasks = tasks_for_column(int(col_done["id"]))
+
+        review_ids = {int(t.get("id")) for t, _sl in review_tasks}
 
         # Self-heal state: drop stale bookkeeping for tasks no longer in those columns.
         blocked_ids = {int(t.get("id")) for t, _sl in blocked_tasks}
@@ -753,6 +915,18 @@ def main() -> int:
                     repo_by_task.pop(k, None)
             except Exception:
                 repo_by_task.pop(k, None)
+        for k in list(reviewers_by_task.keys()):
+            try:
+                if int(k) not in review_ids:
+                    reviewers_by_task.pop(k, None)
+            except Exception:
+                reviewers_by_task.pop(k, None)
+        for k in list(review_results_by_task.keys()):
+            try:
+                if int(k) not in review_ids:
+                    review_results_by_task.pop(k, None)
+            except Exception:
+                review_results_by_task.pop(k, None)
 
         # Sort helper
         def sort_key(item: Tuple[Any, ...]) -> Tuple[int, int]:
@@ -809,6 +983,19 @@ def main() -> int:
         def record_action(task_id: int) -> None:
             last_actions[str(task_id)] = now_ms()
 
+        comment_user_id: Optional[int] = None
+
+        def ensure_comment_user_id() -> int:
+            nonlocal comment_user_id
+            if comment_user_id is not None:
+                return comment_user_id
+            try:
+                me = rpc("getMe")
+                comment_user_id = int(me.get("id") or 0)
+            except Exception:
+                comment_user_id = 0
+            return comment_user_id
+
         def add_tag(task_id: int, tag: str) -> None:
             try:
                 tags = get_task_tags(task_id)
@@ -852,6 +1039,15 @@ def main() -> int:
             except Exception:
                 pass
 
+        def add_comment(task_id: int, comment: str) -> None:
+            if not comment:
+                return
+            try:
+                user_id = ensure_comment_user_id()
+                rpc("createComment", {"task_id": task_id, "user_id": user_id, "comment": comment})
+            except Exception:
+                pass
+
         def ensure_worker_handle_for_task(
             task_id: int,
             repo_key: Optional[str],
@@ -867,17 +1063,49 @@ def main() -> int:
                     return True
             return False
 
+        def resolve_patch_path_for_task(task_id: int) -> Optional[str]:
+            entry = worker_entry_for(task_id, workers_by_task)
+            if isinstance(entry, dict) and entry.get("patchPath"):
+                return str(entry.get("patchPath"))
+            log_path = None
+            if isinstance(entry, dict):
+                log_path = entry.get("logPath")
+            if not log_path:
+                log_path = default_worker_log_path(task_id)
+            completion = detect_worker_completion(task_id, log_path)
+            if completion and isinstance(entry, dict):
+                entry["patchPath"] = completion.get("patchPath")
+                return completion.get("patchPath")
+            if completion:
+                return completion.get("patchPath")
+            return None
+
+        def ensure_reviewer_handle_for_task(
+            task_id: int,
+            repo_key: Optional[str],
+            repo_path: Optional[str],
+        ) -> bool:
+            entry = worker_entry_for(task_id, reviewers_by_task)
+            if worker_handle(entry):
+                return True
+            patch_path = resolve_patch_path_for_task(task_id)
+            if REVIEWER_SPAWN_CMD:
+                spawned = spawn_reviewer(task_id, repo_key, repo_path, patch_path)
+                if spawned:
+                    reviewers_by_task[str(task_id)] = spawned
+                    return True
+            return False
+
         def pause_missing_worker(task_id: int, sl_id: int, title: str, reason: str, *, force: bool = False) -> None:
             nonlocal budget
             if budget <= 0 and not force:
                 return
             if dry_run:
-                actions.append(f"Would pause WIP #{task_id} ({title}) -> Paused ({reason})")
+                actions.append(f"Would tag WIP #{task_id} ({title}) as paused:missing-worker ({reason})")
             else:
-                move_task(pid, task_id, int(col_paused["id"]), 1, sl_id)
                 record_action(task_id)
-                add_tag(task_id, TAG_PAUSED)
-                actions.append(f"Paused WIP #{task_id} ({title}) -> Paused ({reason})")
+                add_tags(task_id, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
+                actions.append(f"Tagged WIP #{task_id} ({title}) as paused:missing-worker ({reason})")
             if budget > 0:
                 budget -= 1
 
@@ -998,6 +1226,8 @@ def main() -> int:
                     record_action(wid)
                     if isinstance(entry, dict):
                         entry["completedAtMs"] = now_ms()
+                        if completion.get("patchPath"):
+                            entry["patchPath"] = completion.get("patchPath")
                     actions.append(f"Moved WIP #{wid} ({wtitle}) -> Review (worker output complete)")
                 completed_wip_ids.append(wid)
                 budget -= 1
@@ -1052,9 +1282,7 @@ def main() -> int:
                 if budget <= 0:
                     break
 
-        if paused_missing_worker_ids:
-            wip_tasks = [(t, sl_id) for t, sl_id in wip_tasks if int(t.get("id")) not in paused_missing_worker_ids]
-            wip_count = len(wip_tasks)
+        # NOTE: pause is tag-based; tasks remain in WIP, so do not remove from wip_tasks/wip_count.
 
         if missing_worker_tasks and budget <= 0:
             remaining = []
@@ -1118,61 +1346,173 @@ def main() -> int:
                 ),
             )[0]
 
+        # ---------------------------------------------------------------------
+        # REVIEW AUTOMATION
+        # ---------------------------------------------------------------------
+        review_rework_queue: List[Tuple[Dict[str, Any], int]] = []
+        for rt, rsl_id in sorted(review_tasks, key=sort_key):
+            rid = int(rt.get("id"))
+            rtitle = task_title(rt)
+            try:
+                rtags = get_task_tags(rid)
+            except Exception:
+                rtags = []
+            if is_held(rtags):
+                continue
+
+            stored_result = review_results_by_task.get(str(rid))
+
+            entry = worker_entry_for(rid, reviewers_by_task)
+            if not worker_handle(entry) and not stored_result:
+                if dry_run:
+                    actions.append(f"Would spawn reviewer for Review #{rid} ({rtitle})")
+                else:
+                    try:
+                        full = get_task(rid)
+                        rdesc = (full.get("description") or "")
+                    except Exception:
+                        rdesc = ""
+                    _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
+                    if ensure_reviewer_handle_for_task(rid, repo_key, repo_path):
+                        actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
+
+            result_payload: Optional[Dict[str, Any]] = None
+            if stored_result:
+                result_payload = stored_result
+            else:
+                log_path = None
+                entry = worker_entry_for(rid, reviewers_by_task)
+                if isinstance(entry, dict):
+                    log_path = entry.get("logPath")
+                if not log_path:
+                    log_path = default_reviewer_log_path(rid)
+                result_payload = detect_review_result(rid, log_path)
+
+            if result_payload and not stored_result:
+                score = int(result_payload.get("score") or 0)
+                verdict = str(result_payload.get("verdict") or "").upper()
+                notes = result_payload.get("notes")
+                if dry_run:
+                    actions.append(f"Would comment review results on Review #{rid} ({rtitle})")
+                else:
+                    comment_lines = [
+                        "Automated review result:",
+                        f"- Score: {score}",
+                        f"- Verdict: {verdict}",
+                        f"- Threshold: {REVIEW_THRESHOLD}",
+                    ]
+                    if notes:
+                        comment_lines.append(f"- Notes: {notes}")
+                    add_comment(rid, "\n".join(comment_lines))
+                    review_results_by_task[str(rid)] = {
+                        "score": score,
+                        "verdict": verdict,
+                        "notes": notes,
+                        "commentedAtMs": now_ms(),
+                        "logPath": result_payload.get("logPath"),
+                    }
+
+            if result_payload:
+                score = int(result_payload.get("score") or 0)
+                verdict = str(result_payload.get("verdict") or "").upper()
+                needs_rework = score < REVIEW_THRESHOLD or verdict in ("REWORK", "BLOCKER")
+                if needs_rework:
+                    if not has_tag(rtags, TAG_NEEDS_REWORK):
+                        if dry_run:
+                            actions.append(
+                                f"Would tag Review #{rid} ({rtitle}) as needs-rework (score {score}, verdict {verdict})"
+                            )
+                        else:
+                            add_tag(rid, TAG_NEEDS_REWORK)
+                    review_rework_queue.append((rt, rsl_id))
+                else:
+                    if has_tag(rtags, TAG_NEEDS_REWORK):
+                        if dry_run:
+                            actions.append(f"Would clear needs-rework tag for Review #{rid} ({rtitle})")
+                        else:
+                            remove_tag(rid, TAG_NEEDS_REWORK)
+
+        # Move rework items back to WIP before pulling new Ready work.
+        if review_rework_queue and budget > 0:
+            for rt, rsl_id in sorted(review_rework_queue, key=sort_key):
+                if budget <= 0 or wip_count >= WIP_LIMIT:
+                    break
+                rid = int(rt.get("id"))
+                if active_critical is not None:
+                    active_id = int(active_critical[0].get("id") or 0)
+                    if rid != active_id:
+                        continue
+                rtitle = task_title(rt)
+                try:
+                    rtags = get_task_tags(rid)
+                except Exception:
+                    rtags = []
+                if is_held(rtags):
+                    continue
+                if dry_run:
+                    actions.append(f"Would move Review #{rid} ({rtitle}) -> WIP (rework)")
+                else:
+                    move_task(pid, rid, int(col_wip["id"]), 1, int(rsl_id))
+                    record_action(rid)
+                    actions.append(f"Moved Review #{rid} ({rtitle}) -> WIP (rework)")
+                wip_tasks.append((rt, rsl_id))
+                wip_count += 1
+                review_results_by_task.pop(str(rid), None)
+                reviewers_by_task.pop(str(rid), None)
+                budget -= 1
+
         # Resume paused tasks only when NO critical tasks remain.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
 
         if active_critical is None and paused_by_critical:
             budget = max(budget, ACTION_BUDGET_CRITICAL)
-            paused_tasks = tasks_for_column(int(col_paused["id"]))
-            paused_task_ids = {int(t.get("id")) for t, _ in paused_tasks}
-            paused_by_id = {int(t.get("id")): (t, sl_id) for t, sl_id in paused_tasks}
-            wip_now = len(tasks_for_column(int(col_wip["id"])))
 
-            resume_to_wip, resume_to_ready, drop_ids = plan_resume_from_state(
-                paused_by_critical, paused_task_ids, wip_now, WIP_LIMIT
-            )
+            # Clear paused:critical tags when no critical remains.
+            def paused_reason_tags(tags: list[str]) -> set[str]:
+                lower = {t.lower() for t in tags}
+                return {t for t in lower if t.startswith('paused:')}
 
-            def resume_task(tid: int, dest_col: int) -> None:
-                nonlocal budget
+            for tid_s, info in list(paused_by_critical.items()):
+                try:
+                    tid = int(tid_s)
+                except Exception:
+                    paused_by_critical.pop(tid_s, None)
+                    continue
                 if budget <= 0:
-                    return
-                info = paused_by_critical.get(str(tid), {})
-                sl_id = int(info.get("swimlaneId") or 0)
-                if not sl_id:
-                    sl_id = int(paused_by_id.get(tid, ({}, 0))[1])
+                    break
                 if dry_run:
-                    actions.append(
-                        f"Would resume paused #{tid} -> {'WIP' if dest_col==int(col_wip['id']) else 'Ready'}"
-                    )
+                    actions.append(f'Would untag paused:critical for #{tid} (critical cleared)')
                 else:
-                    move_task(pid, tid, dest_col, 1, sl_id)
+                    try:
+                        tags = get_task_tags(tid)
+                    except Exception:
+                        tags = []
+                    lower = {t.lower() for t in tags}
+                    # Always remove the critical reason tag.
+                    if TAG_PAUSED_CRITICAL in lower:
+                        remove_tag(tid, TAG_PAUSED_CRITICAL)
+                    # If we added the generic paused tag solely for critical, remove it when no other pause reasons remain.
+                    added_paused = bool(info.get('addedPaused'))
+                    try:
+                        tags2 = get_task_tags(tid)
+                    except Exception:
+                        tags2 = []
+                    reasons = paused_reason_tags(tags2)
+                    if added_paused and (not reasons) and (TAG_PAUSED in {t.lower() for t in tags2}):
+                        remove_tag(tid, TAG_PAUSED)
                     record_action(tid)
-                    remove_tag(tid, TAG_PAUSED)
-                    actions.append(
-                        f"Resumed paused #{tid} -> {'WIP' if dest_col==int(col_wip['id']) else 'Ready'}"
-                    )
+                    actions.append(f'Cleared paused:critical for #{tid} (critical cleared)')
                     paused_by_critical.pop(str(tid), None)
                 budget -= 1
 
-            for tid in resume_to_wip:
-                resume_task(tid, int(col_wip["id"]))
-
-            for tid in resume_to_ready:
-                resume_task(tid, int(col_ready["id"]))
-
-            for tid in drop_ids:
-                if dry_run:
-                    actions.append(f"Would clear paused state for #{tid} (no longer in Paused)")
-                else:
-                    paused_by_critical.pop(str(tid), None)
-                    actions.append(f"Cleared paused state for #{tid} (no longer in Paused)")
-
             if not dry_run:
-                state["pausedByCritical"] = paused_by_critical
-                state["lastActionsByTaskId"] = last_actions
-                state["repoByTaskId"] = repo_by_task
-                state["workersByTaskId"] = workers_by_task
-                state["autoBlockedByOrchestrator"] = auto_blocked
+                state['pausedByCritical'] = paused_by_critical
+                state['lastActionsByTaskId'] = last_actions
+                state['repoByTaskId'] = repo_by_task
+                state['workersByTaskId'] = workers_by_task
+                state['autoBlockedByOrchestrator'] = auto_blocked
+                state['reviewersByTaskId'] = reviewers_by_task
+                state['reviewResultsByTaskId'] = review_results_by_task
                 save_state(state)
 
             emit_json(
@@ -1184,7 +1524,6 @@ def main() -> int:
                 errors=errors,
             )
             return 0
-
         if active_critical is not None:
             ct, csl_id, c_col_id = active_critical
             cid = int(ct.get("id"))
@@ -1196,11 +1535,11 @@ def main() -> int:
             def pause_noncritical_wip() -> None:
                 nonlocal budget
                 budget = max(budget, ACTION_BUDGET_CRITICAL)
-                current_wip = sorted(tasks_for_column(int(col_wip["id"])), key=sort_key)
-                paused_state = state.get("pausedByCritical") or {}
-                wip_by_id = {int(t.get("id")): (t, sl_id) for t, sl_id in current_wip}
+                current_wip = sorted(tasks_for_column(int(col_wip['id'])), key=sort_key)
+                paused_state = state.get('pausedByCritical') or {}
+                wip_by_id = {int(t.get('id')): (t, sl_id) for t, sl_id in current_wip}
                 pause_ids = plan_pause_wip(
-                    [int(t.get("id")) for t, _ in current_wip],
+                    [int(t.get('id')) for t, _ in current_wip],
                     critical_task_ids,
                     paused_state,
                 )
@@ -1209,24 +1548,31 @@ def main() -> int:
                     if budget <= 0:
                         break
                     wt, wsl_id = wip_by_id[wid]
-
+                    wtitle = task_title(wt)
                     if dry_run:
-                        actions.append(f"Would pause non-critical WIP #{wid} -> Paused (for critical #{cid})")
+                        actions.append(f'Would tag non-critical WIP #{wid} ({wtitle}) as paused:critical (for critical #{cid})')
                         budget -= 1
                         continue
 
-                    move_task(pid, wid, int(col_paused["id"]), 1, int(wsl_id))
+                    # Tag-based pause: do not move columns; keep position intact.
+                    try:
+                        existing_tags = get_task_tags(wid)
+                    except Exception:
+                        existing_tags = []
+                    lower = {t.lower() for t in existing_tags}
+                    added_paused = TAG_PAUSED not in lower
+                    add_tags(wid, [TAG_PAUSED, TAG_PAUSED_CRITICAL])
                     record_action(wid)
-                    add_tag(wid, TAG_PAUSED)
                     paused_state[str(wid)] = {
-                        "criticalTaskId": cid,
-                        "pausedAtMs": now_ms(),
-                        "swimlaneId": int(wsl_id),
+                        'criticalTaskId': cid,
+                        'pausedAtMs': now_ms(),
+                        'swimlaneId': int(wsl_id),
+                        'addedPaused': bool(added_paused),
                     }
-                    actions.append(f"Paused WIP #{wid} -> Paused (for critical #{cid})")
+                    actions.append(f'Tagged WIP #{wid} ({wtitle}) as paused:critical (for critical #{cid})')
                     budget -= 1
 
-                state["pausedByCritical"] = paused_state
+                state['pausedByCritical'] = paused_state
 
             if critical_in_progress:
                 pause_noncritical_wip()
@@ -1307,6 +1653,8 @@ def main() -> int:
             state["repoByTaskId"] = repo_by_task
             state["workersByTaskId"] = workers_by_task
             state["autoBlockedByOrchestrator"] = auto_blocked
+            state["reviewersByTaskId"] = reviewers_by_task
+            state["reviewResultsByTaskId"] = review_results_by_task
             save_state(state)
 
             emit_json(
@@ -1330,6 +1678,8 @@ def main() -> int:
             state["repoByTaskId"] = repo_by_task
             state["workersByTaskId"] = workers_by_task
             state["autoBlockedByOrchestrator"] = auto_blocked
+            state["reviewersByTaskId"] = reviewers_by_task
+            state["reviewResultsByTaskId"] = review_results_by_task
             save_state(state)
             emit_json(
                 mode=mode,
@@ -1643,25 +1993,35 @@ def main() -> int:
                     did_something = True
                     ready_tasks_sorted = ready_tasks_sorted[1:]
                     continue
-                paused_after_start = False
+                # Never create silent WIP.
+                # We only move Ready -> WIP when we have (or can spawn) a worker handle immediately.
+                started = False
                 if dry_run:
-                    actions.append(f"Would move Ready #{cid} ({ctitle}) -> WIP")
                     if not WORKER_SPAWN_CMD:
-                        actions.append(f"Would pause WIP #{cid} ({ctitle}) -> Paused (missing worker handle)")
-                        paused_after_start = True
+                        actions.append(
+                            f"Would NOT move Ready #{cid} ({ctitle}) -> WIP (no worker spawn command configured)"
+                        )
+                        actions.append(f"Would tag Ready #{cid} ({ctitle}) as paused:missing-worker")
+                    else:
+                        actions.append(f"Would spawn worker for #{cid} ({ctitle}) then move Ready -> WIP")
+                        started = True
                 else:
-                    move_task(pid, cid, int(col_wip["id"]), 1, sl_id)
-                    record_action(cid)
-                    moved_to_wip.append(cid)
-                    actions.append(f"Moved Ready #{cid} ({ctitle}) -> WIP")
-                    if not ensure_worker_handle_for_task(cid, repo_key, repo_path):
-                        pause_missing_worker(cid, sl_id, ctitle, "missing worker handle", force=True)
-                        if cid in moved_to_wip:
-                            moved_to_wip.remove(cid)
-                        paused_after_start = True
+                    if ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                        move_task(pid, cid, int(col_wip["id"]), 1, sl_id)
+                        record_action(cid)
+                        moved_to_wip.append(cid)
+                        actions.append(f"Moved Ready #{cid} ({ctitle}) -> WIP")
+                        started = True
+                    else:
+                        # Can't start worker (misconfig or spawn failure). Leave the card in Ready,
+                        # tag it so it doesn't keep getting retried, and surface the problem.
+                        record_action(cid)
+                        add_tags(cid, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
+                        actions.append(f"Tagged Ready #{cid} ({ctitle}) as paused:missing-worker (cannot start worker)")
+
                 # simulate state
                 ready_tasks_sorted = ready_tasks_sorted[1:]
-                if not paused_after_start:
+                if started:
                     wip_count += 1
                     for k in ex_keys:
                         wip_exclusive_keys.add(k)
@@ -1676,6 +2036,8 @@ def main() -> int:
         state["repoByTaskId"] = repo_by_task
         state["workersByTaskId"] = workers_by_task
         state["autoBlockedByOrchestrator"] = auto_blocked
+        state["reviewersByTaskId"] = reviewers_by_task
+        state["reviewResultsByTaskId"] = review_results_by_task
         if dry_run:
             if dry_runs_remaining > 0:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1
