@@ -1044,7 +1044,7 @@ def main() -> int:
                 return
             try:
                 user_id = ensure_comment_user_id()
-                rpc("createComment", {"task_id": task_id, "user_id": user_id, "comment": comment})
+                rpc("createComment", {"task_id": task_id, "user_id": user_id, "content": comment})
             except Exception:
                 pass
 
