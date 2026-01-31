@@ -71,7 +71,16 @@ If a task cannot be started due to a deterministic constraint, the orchestrator 
 When the constraint clears (deps done, exclusive freed, repo mapping available), the orchestrator will auto-heal the task from `Blocked` back to `Ready` and remove those tags.
 
 ## State + safety
-State file: `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
+State file (cache): `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
+
+Canonical worker identity lives in per-task leases:
+- Root: `RECALLDECK_WORKER_LEASE_ROOT` (default `/tmp/recalldeck-workers`)
+- Active lease: `task-<id>/lease/lease.json`
+- History (thrash guard): `task-<id>/history.json`
+- Archive: `task-<id>/archive/<leaseId>/`
+
+If leases are enabled (`BOARD_ORCHESTRATOR_USE_LEASES=1`, default), the orchestrator rebuilds
+`workersByTaskId` from the lease metadata each run. The state file is a convenience cache only.
 
 Schema (MVP):
 ```json
@@ -87,7 +96,8 @@ Schema (MVP):
       "logPath": "/Users/joshwegener/clawd/memory/worker-logs/task-28.log",
       "repoKey": "server",
       "repoPath": "/Users/joshwegener/Projects/RecallDeck/RecallDeck-Server",
-      "startedAtMs": 1769730000000
+      "startedAtMs": 1769730000000,
+      "leaseId": "20260131T101500Z-acde1234"
     }
   }
 }
@@ -95,7 +105,9 @@ Schema (MVP):
 
 Locking:
 - Lock file: `/tmp/board-orchestrator.lock`
-- Stale lock: 10 minutes
+- Default strategy: OS-level lock (`flock`); no TTL guesswork.
+- Optional fallback: `BOARD_ORCHESTRATOR_LOCK_STRATEGY=legacy-stale-file` (10m stale).
+- `BOARD_ORCHESTRATOR_LOCK_WAIT_MS` controls wait time before giving up (default 0).
 
 Action budget:
 - Max 3 actions per run (moves/creates)
@@ -127,9 +139,13 @@ Runs every 15 minutes.
      - If top Backlog is `epic`, create/find breakdown task and (in MVP) leave it in Backlog unless explicitly promoted.
    - Move top Ready item into WIP.
 4) Worker start:
-   - For every task moved into WIP, start a worker (Codex) and record the handle.
+   - For every task moved into WIP, acquire the per-task lease and start a worker (Codex).
    - If `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD` is configured, the orchestrator will attempt to spawn and record the handle immediately.
-   - WIP tasks missing a worker handle are deterministically reconciled: auto-spawn (policy `spawn`) or auto-pause via tags (policy `pause`) via `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY`.
+   - WIP tasks missing a worker handle are reconciled via leases:
+     - If lease is alive: no spawn.
+     - If lease is dead: archive lease + respawn (subject to thrash guard).
+     - If lease is unknown: alert + avoid aggressive respawn.
+   - Thrash guard: `BOARD_ORCHESTRATOR_THRASH_WINDOW_MIN` + `BOARD_ORCHESTRATOR_THRASH_MAX_RESPAWNS` → pause + tag (default `paused:thrash`).
    - If a task is moved to WIP but no worker handle can be recorded, it is auto-paused to avoid silent WIP.
    - If a worker log (from `BOARD_ORCHESTRATOR_WORKER_LOG_DIR`) shows a completed output (patch marker / kanboard comment file), the orchestrator auto-moves WIP → Review.
    - If no safe repo mapping is available, do **not** start; instead comment and/or move to Blocked.

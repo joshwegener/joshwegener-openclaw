@@ -70,14 +70,16 @@ MVP behavior:
 - Prefer the **Default swimlane**.
 - If/when multiple swimlanes matter, introduce an explicit priority list in state.
 
-## Worker tracking (v1 approach)
+## Worker tracking (leases)
 
-Do not rely on OS PIDs.
-- Track a worker handle in state:
-  - `taskId -> { execSessionId, logPath, startedAtMs, repoKey, repoPath }`
-- Missing handles are reconciled deterministically:
-  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=spawn` will attempt to spawn via `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD`.
-  - `BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY=pause` will tag the task as paused (no column move).
+Leases are canonical; PID is used for liveness checks (best-effort).
+- Per-task lease root: `RECALLDECK_WORKER_LEASE_ROOT` (default `/tmp/recalldeck-workers`)
+- Active lease: `task-<id>/lease/lease.json` (contains worker pid/paths/run id)
+- State `workersByTaskId` is a cache rebuilt from leases when enabled (`BOARD_ORCHESTRATOR_USE_LEASES=1`).
+- Missing/failed workers are reconciled deterministically:
+  - Alive lease → no spawn.
+  - Dead lease → archive + respawn (thrash guard).
+  - Unknown lease → alert + avoid aggressive respawn.
 - Pausing is tag-based and should always include a reason tag when automated (e.g. `paused:missing-worker`, `paused:critical`).
 - The Paused column is optional/legacy; prefer keeping cards in place and using tags.
 - A task is only moved into WIP when a worker handle can be recorded immediately (no silent WIP).
@@ -85,7 +87,7 @@ Do not rely on OS PIDs.
 
 ## Safety valves
 
-- **Locking:** only one orchestrator run at a time (lock file; stale after 10 minutes).
+- **Locking:** OS-level lock (`flock`) on `/tmp/board-orchestrator.lock` (no stale TTL). Optional fallback: `BOARD_ORCHESTRATOR_LOCK_STRATEGY=legacy-stale-file`.
 - **Action budget:** max 3 actions per run (moves/creates) to avoid thrash.
 - **Cooldown:** allow multiple transitions in a *single run* (e.g., Backlog→Ready→WIP), but don’t repeatedly re-move the same task across runs (30m cooldown per task).
 - **Never auto-Done (MVP):** orchestrator may move WIP→Review, but should not mark Done based on inference.
