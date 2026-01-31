@@ -62,6 +62,36 @@ class TestCriticalHelpers(unittest.TestCase):
             bo.critical_column_priority(col_other, col_wip, col_review, col_ready),
         )
 
+    def test_pick_critical_queue_prefers_column_then_position(self) -> None:
+        col_wip = 10
+        col_review = 11
+        col_ready = 12
+
+        candidates = [
+            ({"id": 1, "position": 5}, 1, col_ready),
+            ({"id": 2, "position": 1}, 1, col_wip),
+            ({"id": 3, "position": 2}, 1, col_wip),
+        ]
+
+        def sort_key(item):
+            t = item[0]
+            return (0, int(t.get("position") or 999))
+
+        active, queued = bo.pick_critical_queue(candidates, col_wip, col_review, col_ready, sort_key)
+
+        self.assertIsNotNone(active)
+        self.assertEqual(int(active[0]["id"]), 2)
+        queued_ids = [int(t["id"]) for t, _sl_id, _col_id in queued]
+        self.assertEqual(queued_ids, [3, 1])
+
+    def test_pick_critical_queue_empty(self) -> None:
+        def sort_key(_item):
+            return (0, 0)
+
+        active, queued = bo.pick_critical_queue([], 1, 2, 3, sort_key)
+        self.assertIsNone(active)
+        self.assertEqual(queued, [])
+
 
 class TestRepoMappingHelpers(unittest.TestCase):
     def test_normalize_repo_key(self) -> None:
