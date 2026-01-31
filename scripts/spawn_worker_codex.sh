@@ -34,7 +34,7 @@ Steps:
      git diff > ${PATCH_PATH}
 
    Then print EXACTLY this line (so automation can detect completion):
-   Patch file: `${PATCH_PATH}`
+   Patch file: \`${PATCH_PATH}\`
 
 5) Write a ready-to-paste Kanboard comment to:
    ${COMMENT_PATH}
