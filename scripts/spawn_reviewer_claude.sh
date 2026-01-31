@@ -33,7 +33,7 @@ JSON schema (you MUST output exactly this object; no wrapper fields):
 }
 
 Policy:
-- Use a high bar. Default passing threshold is 90.
+- Use a high bar. Default passing threshold is 85.
 - If there are ANY critical_items, the review MUST fail (verdict must be REWORK or BLOCKER) regardless of score.
 - critical_items should be concrete, actionable, and limited to the truly blocking issues.
 EOF
