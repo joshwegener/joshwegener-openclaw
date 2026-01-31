@@ -42,15 +42,26 @@ EOF
 # - Write to a temp file then append, to avoid tee/tail races writing to the same file.
 # - Emit a single-line `review_result: {...}` marker for the orchestrator to parse.
 
-nohup bash -lc "set -euo pipefail; \
-  cd \"$REPO_PATH\"; \
-  tmp=\"$(mktemp -t review-${TASK_ID}.XXXXXX)\"; \
-  printf '### REVIEW START %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> \"$LOG_PATH\"; \
-  claude -p --model opus --dangerously-skip-permissions --output-format text \"$PROMPT\" > \"$tmp\"; \
-  compact=\"$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin),separators=(\",\",\":\")))' < \"$tmp\")\"; \
-  printf '%s\\n' \"$compact\" >> \"$LOG_PATH\"; \
-  printf 'review_result: %s\\n' \"$compact\" >> \"$LOG_PATH\"; \
-  rm -f \"$tmp\"" >/dev/null 2>&1 &
+export TASK_ID REPO_PATH LOG_PATH PROMPT
+
+nohup bash -lc '
+set -euo pipefail
+
+cd "$REPO_PATH"
+
+tmp="$(mktemp -t "review-${TASK_ID}.XXXXXX")"
+
+printf "### REVIEW START %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_PATH"
+
+claude -p --model opus --dangerously-skip-permissions --output-format text "$PROMPT" > "$tmp"
+
+compact="$(python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin),separators=(",",":")))' < "$tmp")"
+
+printf "%s\n" "$compact" >> "$LOG_PATH"
+printf "review_result: %s\n" "$compact" >> "$LOG_PATH"
+
+rm -f "$tmp"
+' >/dev/null 2>&1 &
 
 PID=$!
 
