@@ -712,7 +712,12 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         verdict = payload.get("verdict") if verdict is None else verdict
         notes = payload.get("notes") or payload.get("comment") or payload.get("summary")
         review_revision = extract_review_revision(payload)
-        ci = payload.get("critical_items") or payload.get("criticalIssues") or payload.get("critical")
+        ci = (
+            payload.get("critical_items")
+            or payload.get("criticalItems")
+            or payload.get("criticalIssues")
+            or payload.get("critical")
+        )
         if isinstance(ci, list):
             critical_items = [str(x) for x in ci if str(x).strip()]
         elif isinstance(ci, str):
