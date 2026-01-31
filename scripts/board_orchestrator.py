@@ -331,11 +331,8 @@ def acquire_lock(run_id: str) -> Optional[Dict[str, Any]]:
     if strategy == "legacy-stale-file":
         return acquire_lock_legacy(run_id)
     if strategy == "flock":
-        lock = acquire_lock_flock(run_id)
-        if lock is not None:
-            return lock
-        # If flock unavailable, fall back to legacy.
-        return acquire_lock_legacy(run_id)
+        # No implicit fallback: explicit config switch required.
+        return acquire_lock_flock(run_id)
     # Unknown strategy: fall back to legacy for safety.
     return acquire_lock_legacy(run_id)
 
