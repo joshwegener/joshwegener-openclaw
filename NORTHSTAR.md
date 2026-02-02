@@ -206,13 +206,20 @@ When completion is detected:
 ### 4.5 Review automation (Claude scoring + rework loop)
 North Star behavior:
 
+Reviewer spawn contract:
+- Orchestrator uses `BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD`.
+- The spawn command must output JSON to stdout:
+  - `{"execSessionId":"pid:<pid>","logPath":"..."}`
+- Default implementation in this repo:
+  - `scripts/spawn_reviewer_claude.sh {task_id} {repo_key} {repo_path} {patch_path} {log_path} {review_revision}`
+
 1) When a task enters Review (and has `review:auto`, or is auto-moved there by the orchestrator):
 - Add `review:pending`.
 - Spawn a reviewer (Claude/opus) and add `review:inflight`.
 
 2) Reviewer output contract:
 - Reviewer writes a single machine-parseable result line near the end:
-  - `REVIEW_RESULT: {"score":87,"verdict":"PASS",...}`
+  - `review_result: {"score":87,"verdict":"PASS",...}`
 - Or it outputs strict JSON that includes `score` + `verdict`.
 
 3) Decision policy:
@@ -305,7 +312,6 @@ Review keys (North Star):
 
 ## 8) Known gaps / follow-ups (as of now)
 
-- Automated review loop (reviewer spawning + scoring + rework) must be fully implemented (ticket #60).
 - Quota guardrail messages should include reset weekday + time remaining (ticket #61).
 - Ensure repoMap always includes `clawd` (or derive it deterministically) so `repo:clawd` works.
 - Ensure the Kanboard comment API is consistently used for worker/reviewer outputs.
