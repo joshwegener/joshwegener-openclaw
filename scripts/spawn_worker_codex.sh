@@ -18,6 +18,19 @@ COMMENT_PATH="/Users/joshwegener/clawd/tmp/kanboard-task-${TASK_ID}-comment.md"
 read -r -d '' PROMPT <<EOF || true
 You are the RecallDeck worker for Kanboard task #${TASK_ID}.
 
+HARD SAFETY RULES (must follow):
+- NEVER read, open, or print any of these assistant/user context files:
+  - /Users/joshwegener/clawd/MEMORY.md
+  - /Users/joshwegener/clawd/USER.md
+  - /Users/joshwegener/clawd/SOUL.md
+  - /Users/joshwegener/clawd/AGENTS.md
+  - /Users/joshwegener/clawd/TOOLS.md
+  - /Users/joshwegener/clawd/HEARTBEAT.md
+  - /Users/joshwegener/clawd/IDENTITY.md
+  - anything under /Users/joshwegener/clawd/memory/
+- Do not search for secrets/keys/tokens or paste private content into logs/comments.
+- Only read/edit code relevant to the task inside the repo (typically scripts/, tests/, src/).
+
 Work in the repo at: ${REPO_PATH}
 Repo key: ${REPO_KEY}
 
@@ -39,6 +52,7 @@ Steps:
 5) Write a ready-to-paste Kanboard comment to:
    ${COMMENT_PATH}
    Mention that file path in your output.
+   Then STOP (no extra chatter).
 
 6) If you cannot commit/push in this environment, still produce the patch + comment file.
 EOF
