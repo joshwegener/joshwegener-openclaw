@@ -36,9 +36,11 @@ try:
 except Exception:  # pragma: no cover - platform dependent
     fcntl = None
 
-STATE_PATH = os.environ.get(
-    "BOARD_ORCHESTRATOR_STATE",
-    "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
+STATE_PATH = (
+    os.environ.get("BOARD_ORCHESTRATOR_STATE")
+    or os.environ.get("RECALLDECK_STATE_PATH")
+    or os.environ.get("STATE_PATH")
+    or "/Users/joshwegener/clawd/memory/board-orchestrator-state.json"
 )
 LOCK_PATH = os.environ.get("BOARD_ORCHESTRATOR_LOCK", "/tmp/board-orchestrator.lock")
 LOCK_STRATEGY = os.environ.get("BOARD_ORCHESTRATOR_LOCK_STRATEGY", "flock").strip().lower()
@@ -2012,11 +2014,15 @@ def main() -> int:
 
         # Docs drift is handled after dry-run mode is computed.
 
-        last_actions = state.get("lastActionsByTaskId") or {}
+        # Cooldown is meant to prevent repeating the same move decision across runs.
+        # Snapshot the last-actions map at the start of the run so a single tick can
+        # still perform multiple transitions (e.g., Backlog -> Ready -> WIP).
+        last_actions_prev = state.get("lastActionsByTaskId") or {}
+        last_actions = dict(last_actions_prev)
         cooldown_ms = TASK_COOLDOWN_MIN * 60 * 1000
 
         def cooled(task_id: int) -> bool:
-            last = int(last_actions.get(str(task_id), 0) or 0)
+            last = int(last_actions_prev.get(str(task_id), 0) or 0)
             return (now_ms() - last) >= cooldown_ms
 
         def record_action(task_id: int) -> None:
@@ -3402,6 +3408,10 @@ def main() -> int:
                         epic = t
                     continue
 
+                # Cooldown: don't keep re-moving the same backlog item across runs.
+                if not cooled(tid):
+                    continue
+
                 full = get_task(tid)
                 desc = (full.get('description') or '')
 
@@ -3594,6 +3604,7 @@ def main() -> int:
             if budget > 0 and wip_active_count() < WIP_LIMIT and ready_tasks_sorted:
                 candidate, sl_id = ready_tasks_sorted[0]
                 cid = int(candidate.get("id"))
+                ctitle = task_title(candidate)
                 tags = get_task_tags(cid)
 
                 if is_held(tags):
@@ -3606,7 +3617,14 @@ def main() -> int:
                 deps = parse_depends_on(desc)
                 unmet = [d for d in deps if not is_done(d)]
                 if unmet:
-                    ctitle = task_title(candidate)
+                    if not cooled(cid):
+                        actions.append(
+                            f"Skipped Ready #{cid} ({ctitle}) -> Blocked due to cooldown; leaving in Ready"
+                        )
+                        ready_tasks_sorted = ready_tasks_sorted[1:] + [(candidate, sl_id)]
+                        budget -= 1
+                        did_something = True
+                        continue
                     reason = "Depends on " + ", ".join("#" + str(x) for x in unmet)
                     if dry_run:
                         actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): {reason}")
@@ -3630,7 +3648,6 @@ def main() -> int:
                 ex_keys = parse_exclusive_keys(tags, desc)
                 if any(k in wip_exclusive_keys for k in ex_keys):
                     # exclusive conflict, keep in Ready but don't start
-                    ctitle = task_title(candidate)
                     actions.append(
                         f"Skipped Ready #{cid} ({ctitle}) due to exclusive conflict: {', '.join('exclusive:'+k for k in ex_keys if k in wip_exclusive_keys)}"
                     )
@@ -3640,9 +3657,16 @@ def main() -> int:
                     did_something = True
                     continue
 
-                ctitle = task_title(candidate)
                 repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, tags, desc)
                 if not repo_ok:
+                    if not cooled(cid):
+                        actions.append(
+                            f"Skipped Ready #{cid} ({ctitle}) -> Blocked due to cooldown; leaving in Ready"
+                        )
+                        ready_tasks_sorted = ready_tasks_sorted[1:] + [(candidate, sl_id)]
+                        budget -= 1
+                        did_something = True
+                        continue
                     if dry_run:
                         actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
                     else:

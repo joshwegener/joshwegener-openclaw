@@ -18,6 +18,10 @@ Definitions:
 - **WIP** means active coding/execution. **Hard limit = 2** (except temporary overflow when a review failure must return to WIP; when WIP > 2, do not pull new work).
 - **Review** is separate and can be unlimited.
 
+State path:
+- Default: `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
+- Override: `BOARD_ORCHESTRATOR_STATE` (preferred), with `RECALLDECK_STATE_PATH` / `STATE_PATH` as legacy fallbacks
+
 ## Tags
 
 - `epic` = epic container card
