@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import urllib.error
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -156,6 +157,7 @@ COL_DONE = "Done"
 # - BOARD_ORCHESTRATOR_NOTIFY_MESSAGE
 NOTIFY_CMD = os.environ.get("BOARD_ORCHESTRATOR_NOTIFY_CMD", "").strip()
 NOTIFY_DEDUP_SECONDS = int(os.environ.get("BOARD_ORCHESTRATOR_NOTIFY_DEDUP_SECONDS", "60"))
+DEBUG_RPC = os.environ.get("BOARD_ORCHESTRATOR_DEBUG_RPC", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def now_ms() -> int:
@@ -442,6 +444,9 @@ def rpc(method: str, params: Any = None) -> Any:
     if not KANBOARD_USER or not KANBOARD_TOKEN:
         raise RuntimeError("KANBOARD_USER/KANBOARD_TOKEN not set")
 
+    if DEBUG_RPC:
+        print(f"[rpc] {method}", flush=True)
+
     payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method, "id": 1}
     if params is not None:
         payload["params"] = params
@@ -453,8 +458,17 @@ def rpc(method: str, params: Any = None) -> Any:
         headers={"Content-Type": "application/json", "Authorization": f"Basic {auth}"},
     )
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        snippet = body[:200].replace("\n", "\\n") if body else ""
+        raise RuntimeError(f"Kanboard HTTP {e.code} for {method}: {e.reason}; body={snippet!r}")
 
     # Kanboard can emit PHP fatals as HTML; guard
     try:
