@@ -20,8 +20,8 @@ window_exists() {
 
 window_ids_by_name() {
   local name="$1"
-  tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}\t#{window_name}' 2>/dev/null \
-    | awk -F $'\t' -v n="$name" '$2 == n { print $1 }'
+  tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
+    | awk -F: -v n="$name" '$2 == n { print $1 }'
 }
 
 ensure_window_cmd() {
