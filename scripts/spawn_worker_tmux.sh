@@ -115,7 +115,15 @@ if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   tmux new-session -d -s "$TMUX_SESSION" -n orchestrator "bash"
 fi
 
-tmux new-window -k -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$RUN_PATH"
+# Deduplicate by name (tmux allows duplicate window names).
+tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
+  | awk -F: -v n="$TMUX_WINDOW" '$2 == n { print $1 }' \
+  | while IFS= read -r wid; do
+      [[ -n "$wid" ]] || continue
+      tmux kill-window -t "$wid" 2>/dev/null || true
+    done
+
+tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$RUN_PATH"
 
 pid=""
 for _ in $(seq 1 50); do
@@ -132,4 +140,3 @@ if [[ "$pid" =~ ^[0-9]+$ ]]; then
 fi
 
 printf '{"execSessionId":"%s","logPath":"%s"}\n' "$handle" "$LOG_PATH"
-
