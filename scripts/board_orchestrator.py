@@ -87,6 +87,7 @@ TAG_REVIEW_BLOCKED_WIP = "review:blocked:wip"
 TAG_REVIEW_ERROR = "review:error"
 TAG_REVIEW_SKIP = "review:skip"
 TAG_REVIEW_RERUN = "review:rerun"
+TAG_REVIEW_RETRY = "review:retry"  # alias for review:rerun (human muscle memory)
 
 # Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -2991,7 +2992,7 @@ def main() -> int:
             current_revision = compute_patch_revision(patch_path)
             stored_result = review_results_by_task.get(str(rid))
             stored_revision = extract_review_revision(stored_result)
-            rerun_requested = has_tag(rtags, TAG_REVIEW_RERUN)
+            rerun_requested = has_tag(rtags, TAG_REVIEW_RERUN) or has_tag(rtags, TAG_REVIEW_RETRY)
             stored_matches = review_revision_matches(current_revision, stored_revision)
 
             stale_result = stored_result is not None and (rerun_requested or not stored_matches)
@@ -3027,6 +3028,7 @@ def main() -> int:
                             TAG_REVIEW_INFLIGHT,
                             TAG_REVIEW_PENDING,
                             TAG_REVIEW_RERUN,
+                            TAG_REVIEW_RETRY,
                         ],
                     )
                     add_tag(rid, TAG_REVIEW_PENDING)
