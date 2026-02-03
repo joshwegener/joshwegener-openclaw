@@ -198,7 +198,7 @@ nohup "$CODEX_BIN" exec \
 PID=$!
 echo "$PID" >"$PID_PATH"
 # Stream logs to the tmux pane so the window isn't "empty".
-tail -n 0 -f "$LOG_PATH" &
+tail -n 80 -f "$LOG_PATH" &
 TAIL_PID=$!
 wait "$PID" || true
 kill "$TAIL_PID" 2>/dev/null || true
