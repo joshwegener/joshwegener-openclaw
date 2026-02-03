@@ -1988,23 +1988,35 @@ def main() -> int:
             title = task_title(t)
             if tid in queued_critical_ids:
                 continue
-            entry = worker_entry_for(tid, workers_by_task)
-            handle = worker_handle(entry)
-            if not handle or not worker_is_alive(handle):
-                if tid in lease_pending_ids:
-                    continue
-                # If we recorded a pid-based handle but the process is dead,
-                # drop it so reconciliation can respawn deterministically.
-                if handle and not worker_is_alive(handle):
-                    workers_by_task.pop(str(tid), None)
-                    workers_by_task.pop(tid, None)
-                missing_worker_tasks.append((t, sl_id))
+            tags: List[str] = []
+            desc = ""
             try:
-                if str(tid) in repo_by_task and os.path.isdir(str(repo_by_task.get(str(tid), {}).get("path") or "")):
-                    continue
                 tags = get_task_tags(tid)
                 full = get_task(tid)
                 desc = (full.get("description") or "")
+            except Exception:
+                tags = []
+                desc = ""
+
+            # If a card is explicitly paused/held, don't keep trying to respawn workers every tick.
+            # Exception: critical cards can still be reconciled.
+            reconcile_worker = (not is_held(tags)) or is_critical(tags)
+            if reconcile_worker:
+                entry = worker_entry_for(tid, workers_by_task)
+                handle = worker_handle(entry)
+                if not handle or not worker_is_alive(handle):
+                    if tid in lease_pending_ids:
+                        continue
+                    # If we recorded a pid-based handle but the process is dead,
+                    # drop it so reconciliation can respawn deterministically.
+                    if handle and not worker_is_alive(handle):
+                        workers_by_task.pop(str(tid), None)
+                        workers_by_task.pop(tid, None)
+                    missing_worker_tasks.append((t, sl_id))
+
+            try:
+                if str(tid) in repo_by_task and os.path.isdir(str(repo_by_task.get(str(tid), {}).get("path") or "")):
+                    continue
                 if not has_repo_mapping(tid, title, tags, desc):
                     errors.append(
                         f"drift: WIP #{tid} ({title}) has no repo mapping (add 'Repo:' in description or tag repo:<key>)"
