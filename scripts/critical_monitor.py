@@ -13,7 +13,8 @@ Env:
 - KANBOARD_USER
 - KANBOARD_TOKEN
 - RECALLDECK_PROJECT (default RecallDeck)
-- STATE_PATH (default /Users/joshwegener/clawd/memory/board-orchestrator-state.json)
+- BOARD_ORCHESTRATOR_STATE (preferred; defaults to /Users/joshwegener/clawd/memory/board-orchestrator-state.json)
+- RECALLDECK_STATE_PATH / STATE_PATH (legacy fallbacks)
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ KANBOARD_BASE = os.environ.get("KANBOARD_BASE", "http://localhost:8401/jsonrpc.p
 KANBOARD_USER = os.environ.get("KANBOARD_USER")
 KANBOARD_TOKEN = os.environ.get("KANBOARD_TOKEN")
 PROJECT = os.environ.get("RECALLDECK_PROJECT", "RecallDeck")
-STATE_PATH = os.environ.get("STATE_PATH", "/Users/joshwegener/clawd/memory/board-orchestrator-state.json")
+STATE_PATH = (
+    os.environ.get("BOARD_ORCHESTRATOR_STATE")
+    or os.environ.get("RECALLDECK_STATE_PATH")
+    or os.environ.get("STATE_PATH")
+    or "/Users/joshwegener/clawd/memory/board-orchestrator-state.json"
+)
 WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
 
 LEASE_SCHEMA_VERSION = 1

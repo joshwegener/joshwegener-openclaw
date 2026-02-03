@@ -24,8 +24,14 @@ KANBOARD_TOKEN = os.environ.get("KANBOARD_TOKEN")
 PROJECT_NAME = os.environ.get("RECALLDECK_PROJECT", "RecallDeck")
 TARGET_SWIMLANE = os.environ.get("RECALLDECK_SWIMLANE", "MVP")
 STATE_PATH = os.environ.get(
-    "RECALLDECK_STATE_PATH",
-    "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
+    "BOARD_ORCHESTRATOR_STATE",
+    os.environ.get(
+        "RECALLDECK_STATE_PATH",
+        os.environ.get(
+            "STATE_PATH",
+            "/Users/joshwegener/clawd/memory/board-orchestrator-state.json",
+        ),
+    ),
 )
 WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalldeck-workers")
 

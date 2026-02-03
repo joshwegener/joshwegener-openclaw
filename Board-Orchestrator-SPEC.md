@@ -73,6 +73,10 @@ When the constraint clears (deps done, exclusive freed, repo mapping available),
 ## State + safety
 State file (cache): `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
 
+State path env:
+- `BOARD_ORCHESTRATOR_STATE` (preferred)
+- `RECALLDECK_STATE_PATH` / `STATE_PATH` (legacy fallbacks used by some monitors)
+
 Canonical worker identity lives in per-task leases:
 - Root: `RECALLDECK_WORKER_LEASE_ROOT` (default `/tmp/recalldeck-workers`)
 - Active lease: `task-<id>/lease/lease.json`
@@ -115,6 +119,7 @@ Action budget:
 Cooldown:
 - Prevent repeated moves across runs for the same task: 30 minutes.
 - Exception: `Ready -> WIP` should **not** be blocked by cooldown.
+- Implementation note: cooldown should be evaluated against the prior-run timestamps (snapshot at tick start) so a single run can still do `Backlog -> Ready -> WIP`.
 
 Dry-run arming:
 - First run is DRY RUN.
