@@ -150,6 +150,13 @@ COL_REVIEW = "Review"
 COL_BLOCKED = "Blocked"
 COL_DONE = "Done"
 
+# Optional notification hook (best-effort).
+# If BOARD_ORCHESTRATOR_NOTIFY_CMD is set, the orchestrator will invoke it when
+# there are actions/errors to surface. Message is passed via env var:
+# - BOARD_ORCHESTRATOR_NOTIFY_MESSAGE
+NOTIFY_CMD = os.environ.get("BOARD_ORCHESTRATOR_NOTIFY_CMD", "").strip()
+NOTIFY_DEDUP_SECONDS = int(os.environ.get("BOARD_ORCHESTRATOR_NOTIFY_DEDUP_SECONDS", "60"))
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -272,6 +279,77 @@ def save_state(state: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w") as f:
         json.dump(state, f, indent=2, sort_keys=True)
+
+
+def _notify_digest(message: str) -> str:
+    try:
+        return hashlib.sha256(message.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def maybe_notify(state: Dict[str, Any], *, actions: List[str], errors: List[str]) -> None:
+    """Best-effort notification for humans.
+
+    Guardrails:
+    - Only fires when there are actions or errors.
+    - Dedupes repeats for a short window to avoid spam.
+    - Never raises (orchestrator must keep running).
+    """
+    if not NOTIFY_CMD:
+        return
+    if not actions and not errors:
+        return
+
+    msg_lines: List[str] = []
+    if errors:
+        msg_lines.append("RecallDeck board: errors")
+        msg_lines.extend(f"- {e}" for e in errors[:10])
+    if actions:
+        if msg_lines:
+            msg_lines.append("")
+        msg_lines.append("RecallDeck board: actions")
+        msg_lines.extend(f"- {a}" for a in actions[:12])
+        extra = max(0, len(actions) - 12)
+        if extra:
+            msg_lines.append(f"- …and {extra} more")
+
+    message = "\n".join(msg_lines).strip()
+    if not message:
+        return
+
+    now_s = int(time.time())
+    dedup = state.get("notify") if isinstance(state.get("notify"), dict) else {}
+    last_digest = str(dedup.get("lastDigest") or "")
+    last_at_s = 0
+    try:
+        last_at_s = int(dedup.get("lastAtS") or 0)
+    except Exception:
+        last_at_s = 0
+
+    digest = _notify_digest(message)
+    if digest and digest == last_digest and last_at_s and (now_s - last_at_s) < NOTIFY_DEDUP_SECONDS:
+        return
+
+    env = dict(os.environ)
+    env["BOARD_ORCHESTRATOR_NOTIFY_MESSAGE"] = message
+    try:
+        subprocess.run(
+            NOTIFY_CMD,
+            shell=True,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+    try:
+        state["notify"] = {"lastDigest": digest, "lastAtS": now_s}
+    except Exception:
+        pass
 
 
 def acquire_lock_legacy(run_id: str) -> Optional[Dict[str, Any]]:
@@ -3617,6 +3695,9 @@ def main() -> int:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1
                 if state["dryRunRunsRemaining"] <= 0:
                     state["dryRun"] = False
+
+        # Best-effort human notification (no impact on orchestration decisions).
+        maybe_notify(state, actions=actions, errors=errors)
         save_state(state)
 
         emit_json(
