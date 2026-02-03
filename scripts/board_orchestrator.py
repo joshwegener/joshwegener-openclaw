@@ -2532,6 +2532,11 @@ def main() -> int:
                 record_action(task_id)
                 add_tags(task_id, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
                 actions.append(f"Tagged {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
+                # Keep WIP/Ready clean: paused cards shouldn't sit in active columns.
+                try:
+                    move_task(pid, task_id, int(col_blocked["id"]), 1, int(sl_id))
+                except Exception:
+                    pass
             return True
 
         def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str], source: Optional[str]) -> None:
