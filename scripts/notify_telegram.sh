@@ -16,11 +16,19 @@ if [[ -z "$TARGET" || -z "$MSG" ]]; then
 fi
 
 {
-  clawdbot message send \
-    --channel telegram \
-    --target "$TARGET" \
-    --message "$MSG" \
-    --json \
-    >/dev/null
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw message send \
+      --channel telegram \
+      --target "$TARGET" \
+      --message "$MSG" \
+      --json \
+      >/dev/null
+  else
+    clawdbot message send \
+      --channel telegram \
+      --target "$TARGET" \
+      --message "$MSG" \
+      --json \
+      >/dev/null
+  fi
 } || true
-
