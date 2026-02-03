@@ -37,6 +37,8 @@ COMMENT_PATH="/Users/joshwegener/clawd/tmp/kanboard-task-${TASK_ID}-comment.md"
 
 KB_TITLE=""
 KB_DESC=""
+KB_TITLE_B64=""
+KB_DESC_B64=""
 if [[ -n "${KANBOARD_BASE:-}" && -n "${KANBOARD_USER:-}" && -n "${KANBOARD_TOKEN:-}" ]]; then
   # Best-effort fetch; do not fail worker spawn if Kanboard is down.
   kb_json="$(python3 - <<'PY' "$TASK_ID" 2>/dev/null || true
@@ -69,6 +71,10 @@ PY
   fi
 fi
 
+# Encode to avoid heredoc delimiter collisions / shell injection from arbitrary Kanboard content.
+KB_TITLE_B64="$(printf '%s' "$KB_TITLE" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
+KB_DESC_B64="$(printf '%s' "$KB_DESC" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
+
 cat >"$RUN_PATH" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -80,16 +86,37 @@ LOG_PATH="${LOG_PATH}"
 PID_PATH="${PID_PATH}"
 PATCH_PATH="${PATCH_PATH}"
 COMMENT_PATH="${COMMENT_PATH}"
+KB_TITLE_B64="${KB_TITLE_B64}"
+KB_DESC_B64="${KB_DESC_B64}"
 
 mkdir -p "\$(dirname "\$LOG_PATH")" "\$(dirname "\$PID_PATH")"
 
-read -r -d '' PROMPT <<'PROMPT' || true
-You are the RecallDeck worker for Kanboard task #${TASK_ID}.
+PROMPT="$(python3 - <<'PY'
+import base64
+import os
+
+def b64(s: str) -> str:
+    if not s:
+        return ""
+    try:
+        return base64.b64decode(s.encode("ascii")).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+task_id = os.environ.get("TASK_ID", "")
+repo_key = os.environ.get("REPO_KEY", "")
+repo_path = os.environ.get("REPO_PATH", "")
+patch_path = os.environ.get("PATCH_PATH", "")
+comment_path = os.environ.get("COMMENT_PATH", "")
+title = b64(os.environ.get("KB_TITLE_B64", ""))
+desc = b64(os.environ.get("KB_DESC_B64", ""))
+
+prompt = f"""You are the RecallDeck worker for Kanboard task #{task_id}.
 
 Task context (already fetched for you; do NOT attempt to log into Kanboard UI):
-Title: ${KB_TITLE}
+Title: {title}
 Description:
-${KB_DESC}
+{desc}
 
 HARD SAFETY RULES (must follow):
 - NEVER read, open, or print any of these assistant/user context files:
@@ -104,8 +131,8 @@ HARD SAFETY RULES (must follow):
 - Do not search for secrets/keys/tokens or paste private content into logs/comments.
 - Only read/edit code relevant to the task inside the repo (typically scripts/, tests/, src/).
 
-Work in the repo at: ${REPO_PATH}
-Repo key: ${REPO_KEY}
+Work in the repo at: {repo_path}
+Repo key: {repo_key}
 
 Steps:
 1) Use the task context above (title/description). Do NOT try to log into Kanboard.
@@ -113,22 +140,26 @@ Steps:
 3) Commit changes with a clear message and push if origin is configured.
 
 4) Export a patch to this exact path:
-   ${PATCH_PATH}
+   {patch_path}
    - If you created a commit, prefer:
-     git format-patch -1 HEAD --stdout > ${PATCH_PATH}
+     git format-patch -1 HEAD --stdout > {patch_path}
    - Otherwise:
-     git diff > ${PATCH_PATH}
+     git diff > {patch_path}
 
    Then print EXACTLY this line (so automation can detect completion):
-   Patch file: \`${PATCH_PATH}\`
+   Patch file: `{patch_path}`
 
 5) Write a ready-to-paste Kanboard comment to:
-   ${COMMENT_PATH}
+   {comment_path}
    Mention that file path in your output.
    Then STOP (no extra chatter).
 
 6) If you cannot commit/push in this environment, still produce the patch + comment file.
-PROMPT
+"""
+
+print(prompt)
+PY
+)"
 
 rm -f "\$PID_PATH"
 
