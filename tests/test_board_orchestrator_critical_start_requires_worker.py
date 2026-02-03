@@ -120,7 +120,8 @@ class TestCriticalStartRequiresWorker(unittest.TestCase):
 
                 # Should tag paused:missing-worker and NOT move to WIP.
                 self.assertTrue(any("paused:missing-worker" in a for a in payload.get("actions", [])))
-                self.assertEqual(fake.task["column_id"], fake.col_ready)
+                # New policy: paused cards should not sit in Ready/WIP; they go to Blocked.
+                self.assertEqual(fake.task["column_id"], fake.col_blocked)
                 self.assertFalse(any(col == fake.col_wip for (_tid, col) in fake.moves))
 
                 tags = {t.lower() for t in fake.tags_by_task_id[57]}

@@ -34,6 +34,13 @@ def append_line(path: str, text: str) -> None:
         if not text.endswith("\n"):
             f.write("\n")
 
+def write_json(path: str, obj: Any) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True, ensure_ascii=False)
+
 
 def compact_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
@@ -120,6 +127,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-path", required=True)
     ap.add_argument("--log-path", required=True)
+    ap.add_argument("--result-path", default="")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "opus"))
     ap.add_argument("--timeout-sec", type=int, default=int(os.environ.get("CLAUDE_REVIEW_TIMEOUT_SEC", "600")))
     ap.add_argument("--prompt", required=True)
@@ -158,8 +166,9 @@ def main() -> int:
             "notes": "Claude review command did not return in time; investigate claude CLI/auth/quota.",
         }
         if args.revision:
-            result["review_revision"] = args.revision
+            result["reviewRevision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
+        write_json(args.result_path, result)
         return 0
     except Exception as e:
         result = {
@@ -169,8 +178,9 @@ def main() -> int:
             "notes": "Claude review command failed to execute.",
         }
         if args.revision:
-            result["review_revision"] = args.revision
+            result["reviewRevision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
+        write_json(args.result_path, result)
         return 0
 
     out = (p.stdout or "").strip()
@@ -195,8 +205,9 @@ def main() -> int:
             "notes": (out[:400] if out else (err[:400] if err else "no output")),
         }
         if args.revision:
-            result["review_revision"] = args.revision
+            result["reviewRevision"] = args.revision
         append_line(log_path, "review_result: " + compact_json(result))
+        write_json(args.result_path, result)
         return 0
 
     # Normalize fields + ensure marker line.
@@ -219,9 +230,10 @@ def main() -> int:
         "notes": str(parsed.get("notes") or "")[:1000],
     }
     if args.revision:
-        result["review_revision"] = args.revision
+        result["reviewRevision"] = args.revision
 
     append_line(log_path, "review_result: " + compact_json(result))
+    write_json(args.result_path, result)
     return 0
 
 

@@ -75,6 +75,9 @@ TAG_AUTO_BLOCKED = "auto-blocked"
 TAG_BLOCKED_DEPS = "blocked:deps"
 TAG_BLOCKED_EXCLUSIVE = "blocked:exclusive"
 TAG_BLOCKED_REPO = "blocked:repo"
+TAG_BLOCKED_CONTEXT = "blocked:context"
+TAG_BLOCKED_ARTIFACT = "blocked:artifact"
+TAG_BLOCKED_THRASH = "blocked:thrash"
 TAG_NO_REPO = "no-repo"
 TAG_NEEDS_REWORK = "needs-rework"  # legacy
 
@@ -106,7 +109,7 @@ WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_B
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
 # Cron tick safety: spawning a worker should return quickly (worker runs in the background).
 WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "2"))
-WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "1").strip().lower() not in (
+WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "0").strip().lower() not in (
     "0",
     "false",
     "no",
@@ -119,6 +122,8 @@ WORKER_LOG_STALE_ACTION = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_STALE_AC
 THRASH_WINDOW_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_WINDOW_MIN", "30"))
 THRASH_MAX_RESPAWNS = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_MAX_RESPAWNS", "3"))
 THRASH_PAUSE_TAG = os.environ.get("BOARD_ORCHESTRATOR_THRASH_PAUSE_TAG", "paused:thrash")
+WORKER_RUN_TIMEOUT_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_RUN_TIMEOUT_MIN", "180"))
+REVIEW_RUN_TIMEOUT_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_RUN_TIMEOUT_MIN", "60"))
 REVIEWER_LOG_DIR = os.environ.get(
     "BOARD_ORCHESTRATOR_REVIEWER_LOG_DIR",
     "/Users/joshwegener/clawd/memory/review-logs",
@@ -127,6 +132,8 @@ REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TA
 REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
 # Cron tick safety: reviewer spawns should return quickly (reviewer runs in the background).
 REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "2"))
+TMUX_SESSION = os.environ.get("CLAWD_TMUX_SESSION", "clawd")
+TMUX_CLEANUP_WINDOWS = os.environ.get("CLAWD_CLEANUP_TMUX_WINDOWS", "1").strip().lower() not in ("0", "false", "no")
 # "90+" means >= 91 (strictly higher than 90).
 REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "91"))
 REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
@@ -278,6 +285,7 @@ def load_state() -> Dict[str, Any]:
         # review automation bookkeeping (optional, self-healing)
         "reviewersByTaskId": {},
         "reviewResultsByTaskId": {},
+        "reviewReworkHistoryByTaskId": {},
     }
 
 
@@ -354,6 +362,28 @@ def maybe_notify(state: Dict[str, Any], *, actions: List[str], errors: List[str]
 
     try:
         state["notify"] = {"lastDigest": digest, "lastAtS": now_s}
+    except Exception:
+        pass
+
+
+def tmux_kill_window(window_name: str) -> None:
+    """Best-effort cleanup for per-task tmux windows (avoids accumulating dead panes)."""
+    if not TMUX_CLEANUP_WINDOWS:
+        return
+    if not window_name:
+        return
+    tmux_bin = shutil.which("tmux") or ""
+    if not tmux_bin:
+        return
+    target = f"{TMUX_SESSION}:{window_name}"
+    try:
+        subprocess.run(
+            [tmux_bin, "kill-window", "-t", target],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
     except Exception:
         pass
 
@@ -813,6 +843,53 @@ def safe_write_json(path: str, payload: Dict[str, Any]) -> None:
     ensure_dir(os.path.dirname(path))
     with open(path, "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+def json_file(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    return safe_read_json(path)
+
+
+def is_done_payload(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    # For worker done.json and reviewer review.json we use schemaVersion=1.
+    try:
+        return int(payload.get("schemaVersion") or 0) == 1
+    except Exception:
+        return False
+
+
+def worker_done_from_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    done_path = entry.get("donePath") or entry.get("done_path")
+    if not done_path or not os.path.isfile(str(done_path)):
+        return None
+    payload = json_file(str(done_path))
+    if not is_done_payload(payload):
+        return None
+    payload = dict(payload)
+    payload["donePath"] = str(done_path)
+    return payload
+
+
+def reviewer_result_from_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    result_path = entry.get("resultPath") or entry.get("result_path")
+    if not result_path or not os.path.isfile(str(result_path)):
+        return None
+    payload = json_file(str(result_path))
+    if not isinstance(payload, dict):
+        return None
+    # run_claude_review writes {score, verdict, ...} with optional schemaVersion omitted.
+    # Accept either.
+    if "score" not in payload or "verdict" not in payload:
+        return None
+    out = dict(payload)
+    out["resultPath"] = str(result_path)
+    return out
 
 
 def lease_is_valid(task_id: int, lease: Optional[Dict[str, Any]]) -> bool:
@@ -1305,6 +1382,16 @@ def read_tail(path: str, max_bytes: int) -> str:
     except Exception:
         return ""
 
+def read_text(path: str, max_bytes: int = 20000) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes if max_bytes > 0 else None)
+        return raw.decode(errors="ignore")
+    except Exception:
+        return ""
+
 
 def detect_worker_completion(
     task_id: int,
@@ -1318,8 +1405,24 @@ def detect_worker_completion(
     # Codex may keep logging after printing the marker, pushing it out of the tail window.
     if not log_path or not os.path.isfile(log_path):
         return None
+
+    # Only trust completion signals when we can bind them to a specific worker run.
+    # Without started_at_ms, stale log markers can cause WIP <-> Review ping-pong.
+    if started_at_ms is None:
+        return None
+
+    # Defense-in-depth: only trust the log marker if the log file itself was touched
+    # after the worker started (with slack for clock skew / buffered writes).
+    log_mtime_ok = False
+    try:
+        log_mtime_ms = int(os.path.getmtime(log_path) * 1000)
+        slack_ms = 60 * 1000
+        log_mtime_ok = log_mtime_ms + slack_ms >= int(started_at_ms)
+    except Exception:
+        log_mtime_ok = False
+
     tail = read_tail(log_path, WORKER_LOG_TAIL_BYTES)
-    if tail:
+    if tail and log_mtime_ok:
         patch_match = PATCH_MARKER_RE.search(tail)
         if patch_match:
             p = patch_match.group(1)
@@ -1349,6 +1452,49 @@ def detect_worker_completion(
             return None
 
     return {"logPath": log_path, "patchPath": patch_path}
+
+
+def archive_file(path: str, archive_dir: str, *, prefix: str) -> Optional[str]:
+    if not path or not os.path.isfile(path):
+        return None
+    ensure_dir(archive_dir)
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = os.path.basename(path)
+    dest = os.path.join(archive_dir, f"{prefix}-{ts}-{base}")
+    if os.path.exists(dest):
+        dest = f"{dest}-{secrets.token_hex(2)}"
+    try:
+        shutil.move(path, dest)
+        return dest
+    except Exception:
+        return None
+
+
+def reset_worker_state(task_id: int) -> None:
+    """Clear worker artifacts/lease so rework doesn't immediately auto-complete.
+
+    Called when a task is sent back to WIP from Review (rework). Without this,
+    stale patch/comment artifacts and a stale lease can cause instant WIP->Review
+    transitions even though no new worker ran.
+    """
+    # Archive patch + comment artifacts.
+    patch_path = default_worker_patch_path(task_id)
+    comment_path = default_worker_comment_path(task_id)
+    archive_file(patch_path, "/Users/joshwegener/clawd/tmp/worker-patches/archive", prefix=f"task-{task_id}")
+    archive_file(comment_path, "/Users/joshwegener/clawd/tmp/worker-comments/archive", prefix=f"task-{task_id}")
+
+    # Archive the worker log too. Otherwise, a stale "Patch file:" marker can
+    # cause immediate false completion on the next tick.
+    log_path = default_worker_log_path(task_id)
+    archive_file(log_path, "/Users/joshwegener/clawd/memory/worker-logs/archive", prefix=f"task-{task_id}")
+
+    # Archive any active lease so the next WIP tick spawns a fresh worker with a new leaseId/startedAtMs.
+    if WORKER_LEASES_ENABLED:
+        lease = load_lease(task_id)
+        lease_id = None
+        if isinstance(lease, dict):
+            lease_id = str(lease.get("leaseId") or "") or None
+        archive_lease_dir(task_id, lease_id)
 
 
 def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
@@ -1532,25 +1678,50 @@ def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]
         return None
     handle: Optional[str] = None
     log_path: Optional[str] = None
+    run_id: Optional[str] = None
+    run_dir: Optional[str] = None
+    done_path: Optional[str] = None
+    patch_path: Optional[str] = None
+    comment_path: Optional[str] = None
+    started_at_ms: Optional[int] = None
     if raw.startswith("{"):
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 handle = payload.get("execSessionId") or payload.get("handle") or payload.get("sessionId")
                 log_path = payload.get("logPath")
+                run_id = payload.get("runId") or payload.get("run_id")
+                run_dir = payload.get("runDir") or payload.get("run_dir")
+                done_path = payload.get("donePath") or payload.get("done_path")
+                patch_path = payload.get("patchPath") or payload.get("patch_path")
+                comment_path = payload.get("commentPath") or payload.get("comment_path")
+                try:
+                    if payload.get("startedAtMs") is not None:
+                        started_at_ms = int(payload.get("startedAtMs") or 0) or None
+                except Exception:
+                    started_at_ms = None
         except Exception:
             handle = None
     if not handle:
         handle = raw.splitlines()[-1].strip()
     if not log_path:
         log_path = default_worker_log_path(task_id)
+    if not patch_path:
+        patch_path = default_worker_patch_path(task_id)
+    if not comment_path:
+        comment_path = default_worker_comment_path(task_id)
+    if not started_at_ms:
+        started_at_ms = now_ms()
     return {
         "kind": "codex",
         "execSessionId": handle,
         "logPath": log_path,
-        "patchPath": default_worker_patch_path(task_id),
-        "commentPath": default_worker_comment_path(task_id),
-        "startedAtMs": now_ms(),
+        "runId": run_id or "",
+        "runDir": run_dir or "",
+        "donePath": done_path or "",
+        "patchPath": patch_path,
+        "commentPath": comment_path,
+        "startedAtMs": started_at_ms,
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
     }
@@ -1599,29 +1770,44 @@ def spawn_reviewer(
         return None
     handle: Optional[str] = None
     log_path: Optional[str] = None
+    run_id: Optional[str] = None
+    run_dir: Optional[str] = None
+    result_path: Optional[str] = None
+    started_at_ms: Optional[int] = None
     if raw.startswith("{"):
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 handle = payload.get("execSessionId") or payload.get("handle") or payload.get("sessionId")
                 log_path = payload.get("logPath")
+                run_id = payload.get("runId") or payload.get("run_id")
+                run_dir = payload.get("runDir") or payload.get("run_dir")
+                result_path = payload.get("resultPath") or payload.get("result_path")
+                try:
+                    if payload.get("startedAtMs") is not None:
+                        started_at_ms = int(payload.get("startedAtMs") or 0) or None
+                except Exception:
+                    started_at_ms = None
         except Exception:
             handle = None
     if not handle:
         handle = raw.splitlines()[-1].strip()
     if not log_path:
         log_path = default_reviewer_log_path(task_id)
+    if not started_at_ms:
+        started_at_ms = now_ms()
     return {
         "kind": "reviewer",
         "execSessionId": handle,
         "logPath": log_path,
-        "patchPath": default_worker_patch_path(task_id),
-        "commentPath": default_worker_comment_path(task_id),
-        "startedAtMs": now_ms(),
+        "runId": run_id or "",
+        "runDir": run_dir or "",
+        "resultPath": result_path or "",
+        "startedAtMs": started_at_ms,
         "repoKey": safe_repo_key,
         "repoPath": safe_repo_path,
-        "patchPath": safe_patch_path or None,
-        "reviewRevision": safe_review_revision or None,
+        "patchPath": safe_patch_path,
+        "reviewRevision": safe_review_revision,
     }
 
 
@@ -1781,6 +1967,7 @@ def main() -> int:
         auto_blocked: Dict[str, Any] = (state.get("autoBlockedByOrchestrator") or {})
         reviewers_by_task: Dict[str, Any] = (state.get("reviewersByTaskId") or {})
         review_results_by_task: Dict[str, Any] = (state.get("reviewResultsByTaskId") or {})
+        review_rework_history_by_task: Dict[str, Any] = (state.get("reviewReworkHistoryByTaskId") or {})
 
         pid = get_project_id()
         board = get_board(pid)
@@ -2024,15 +2211,40 @@ def main() -> int:
             reconcile_worker = (not is_held(tags)) or is_critical(tags)
             if reconcile_worker:
                 entry = worker_entry_for(tid, workers_by_task)
-                handle = worker_handle(entry)
-                if not handle or not worker_is_alive(handle):
-                    if tid in lease_pending_ids:
-                        continue
-                    # If we recorded a pid-based handle but the process is dead,
-                    # drop it so reconciliation can respawn deterministically.
-                    if handle and not worker_is_alive(handle):
-                        workers_by_task.pop(str(tid), None)
-                        workers_by_task.pop(tid, None)
+
+                # Greenfield rule: treat done.json as the canonical completion signal.
+                # If we have an inflight run (donePath present but missing), do NOT respawn.
+                inflight = False
+                done_path = None
+                started_at_ms = None
+                if isinstance(entry, dict):
+                    done_path = entry.get("donePath") or entry.get("done_path") or ""
+                    try:
+                        started_at_ms = int(entry.get("startedAtMs") or 0) or None
+                    except Exception:
+                        started_at_ms = None
+                    if done_path:
+                        if os.path.isfile(str(done_path)):
+                            inflight = False
+                        else:
+                            inflight = True
+
+                if inflight:
+                    # If the run is taking too long, treat it as stale and allow a respawn.
+                    if started_at_ms and WORKER_RUN_TIMEOUT_MIN > 0:
+                        timeout_ms = WORKER_RUN_TIMEOUT_MIN * 60 * 1000
+                        if now_ms() - started_at_ms > timeout_ms:
+                            workers_by_task.pop(str(tid), None)
+                            workers_by_task.pop(tid, None)
+                            missing_worker_tasks.append((t, sl_id))
+                    continue
+
+                # No inflight run recorded => needs a worker.
+                # A runId without a donePath is treated as missing (incomplete spawn payload).
+                if entry is None or (
+                    isinstance(entry, dict)
+                    and not (entry.get("donePath") or entry.get("done_path"))
+                ):
                     missing_worker_tasks.append((t, sl_id))
 
             try:
@@ -2154,6 +2366,12 @@ def main() -> int:
             repo_path: Optional[str],
         ) -> bool:
             entry = worker_entry_for(task_id, workers_by_task)
+            # Greenfield: a worker entry without a donePath is treated as incomplete/stale.
+            # Clear it so reconciliation can spawn a fresh worker run.
+            if isinstance(entry, dict) and not (entry.get("donePath") or entry.get("done_path")):
+                workers_by_task.pop(str(task_id), None)
+                workers_by_task.pop(task_id, None)
+                entry = None
             handle = worker_handle(entry)
             if handle and worker_is_alive(handle):
                 return True
@@ -2508,32 +2726,14 @@ def main() -> int:
 
         def resolve_patch_path_for_task(task_id: int) -> Optional[str]:
             entry = worker_entry_for(task_id, workers_by_task)
-            if isinstance(entry, dict) and entry.get("patchPath"):
-                return str(entry.get("patchPath"))
-            log_path = None
             if isinstance(entry, dict):
-                log_path = entry.get("logPath")
-            if not log_path:
-                log_path = default_worker_log_path(task_id)
-            started_at_ms = None
-            patch_path = None
-            comment_path = None
-            if isinstance(entry, dict):
-                started_at_ms = entry.get("startedAtMs")
-                patch_path = entry.get("patchPath")
-                comment_path = entry.get("commentPath")
-            completion = detect_worker_completion(
-                task_id,
-                log_path,
-                patch_path=patch_path,
-                comment_path=comment_path,
-                started_at_ms=started_at_ms,
-            )
-            if completion and isinstance(entry, dict):
-                entry["patchPath"] = completion.get("patchPath")
-                return completion.get("patchPath")
-            if completion:
-                return completion.get("patchPath")
+                p = entry.get("patchPath")
+                if p and os.path.isfile(str(p)):
+                    return str(p)
+                done = worker_done_from_entry(entry)
+                if done and done.get("patchPath") and os.path.isfile(str(done.get("patchPath"))):
+                    entry["patchPath"] = str(done.get("patchPath"))
+                    return str(done.get("patchPath"))
             return None
 
         def ensure_reviewer_handle_for_task(
@@ -2544,6 +2744,11 @@ def main() -> int:
             review_revision: Optional[str],
         ) -> bool:
             entry = worker_entry_for(task_id, reviewers_by_task)
+            # Greenfield: a reviewer entry without a resultPath is treated as incomplete/stale.
+            if isinstance(entry, dict) and not (entry.get("resultPath") or entry.get("result_path")):
+                reviewers_by_task.pop(str(task_id), None)
+                reviewers_by_task.pop(task_id, None)
+                entry = None
             handle = worker_handle(entry)
             if handle and reviewer_is_alive(handle):
                 return True
@@ -2722,14 +2927,11 @@ def main() -> int:
                 ):
                     continue
 
-                completion = detect_worker_completion(
-                    bid,
-                    default_worker_log_path(bid),
-                    patch_path=default_worker_patch_path(bid),
-                    comment_path=default_worker_comment_path(bid),
-                    started_at_ms=None,
-                )
-                if not completion:
+                entry = worker_entry_for(bid, workers_by_task)
+                done_payload = worker_done_from_entry(entry)
+                if not done_payload:
+                    continue
+                if not (done_payload.get("ok") and done_payload.get("patchExists") and done_payload.get("commentExists")):
                     continue
 
                 if dry_run:
@@ -2749,6 +2951,10 @@ def main() -> int:
                     )
                     add_tags(bid, [TAG_REVIEW_AUTO, TAG_REVIEW_PENDING])
                     clear_paused_tags(bid)
+                    comment_path = str(done_payload.get("commentPath") or "")
+                    comment_text = read_text(comment_path, 20000).strip() if comment_path else ""
+                    if comment_text:
+                        add_comment(bid, comment_text)
                     if WORKER_LEASES_ENABLED:
                         try:
                             lease = load_lease(bid)
@@ -2757,11 +2963,12 @@ def main() -> int:
                         except Exception:
                             pass
                     actions.append(f"Moved Blocked #{bid} ({btitle}) -> Review (worker output complete)")
+                    tmux_kill_window(f"worker-{bid}")
 
                 completed_blocked_ids.append(bid)
                 budget -= 1
 
-        # Auto-advance WIP tasks when a worker log shows completed output.
+        # Auto-advance WIP tasks when a worker run writes done.json.
         completed_wip_ids: List[int] = []
         if budget > 0 and wip_tasks:
             for wt, wsl_id in sorted(wip_tasks, key=sort_key):
@@ -2769,28 +2976,43 @@ def main() -> int:
                     break
                 wid = int(wt.get("id"))
                 wtitle = task_title(wt)
-                log_path = None
-                patch_path = None
-                comment_path = None
-                started_at_ms = None
                 entry = worker_entry_for(wid, workers_by_task)
-                if isinstance(entry, dict):
-                    log_path = entry.get("logPath")
-                    patch_path = entry.get("patchPath")
-                    comment_path = entry.get("commentPath")
-                    started_at_ms = entry.get("startedAtMs")
-                if not log_path:
-                    # Important: even if the lease/handle bookkeeping is missing,
-                    # still attempt completion detection via artifacts.
-                    log_path = default_worker_log_path(wid)
-                completion = detect_worker_completion(
-                    wid,
-                    log_path,
-                    patch_path=patch_path,
-                    comment_path=comment_path,
-                    started_at_ms=started_at_ms,
-                )
-                if not completion:
+                done_payload = worker_done_from_entry(entry)
+                if not done_payload:
+                    continue
+
+                ok = bool(done_payload.get("ok"))
+                patch_exists = bool(done_payload.get("patchExists"))
+                comment_exists = bool(done_payload.get("commentExists"))
+                try:
+                    patch_bytes = int(done_payload.get("patchBytes") or 0)
+                except Exception:
+                    patch_bytes = 0
+                patch_path = str(done_payload.get("patchPath") or "") if patch_exists else ""
+                comment_path = str(done_payload.get("commentPath") or "") if comment_exists else ""
+
+                if not (ok and patch_exists and comment_exists and patch_bytes > 0 and patch_path and comment_path):
+                    # Worker finished but did not produce usable artifacts; keep it out of Review to avoid thrash.
+                    reason = "worker finished without usable artifacts"
+                    if not ok:
+                        reason = f"worker exited non-zero (see done.json)"
+                    if patch_exists and patch_bytes == 0:
+                        reason = "worker produced empty patch"
+                    if dry_run:
+                        actions.append(f"Would keep WIP #{wid} ({wtitle}) in Backlog; tagged blocked:artifact: {reason}")
+                    else:
+                        tag_blocked_and_keep_in_backlog(
+                            wid,
+                            int(wsl_id),
+                            wtitle,
+                            reason,
+                            TAG_BLOCKED_ARTIFACT,
+                            from_label="WIP",
+                        )
+                        workers_by_task.pop(str(wid), None)
+                        workers_by_task.pop(wid, None)
+                        tmux_kill_window(f"worker-{wid}")
+                    budget -= 1
                     continue
                 if dry_run:
                     actions.append(f"Would move WIP #{wid} ({wtitle}) -> Review (worker output complete)")
@@ -2810,18 +3032,16 @@ def main() -> int:
                     )
                     add_tags(wid, [TAG_REVIEW_AUTO, TAG_REVIEW_PENDING])
                     clear_paused_tags(wid)
+                    # Post the worker-prepared Kanboard comment (best-effort; avoids manual copy/paste).
+                    comment_text = read_text(comment_path, 20000).strip()
+                    if comment_text:
+                        add_comment(wid, comment_text)
                     if isinstance(entry, dict):
                         entry["completedAtMs"] = now_ms()
-                        if completion.get("patchPath"):
-                            entry["patchPath"] = completion.get("patchPath")
-                    if WORKER_LEASES_ENABLED:
-                        try:
-                            lease = load_lease(wid)
-                            if lease:
-                                archive_lease_dir(wid, lease.get("leaseId"))
-                        except Exception:
-                            pass
+                        entry["patchPath"] = patch_path
+                        entry["commentPath"] = comment_path
                     actions.append(f"Moved WIP #{wid} ({wtitle}) -> Review (worker output complete)")
+                    tmux_kill_window(f"worker-{wid}")
                 completed_wip_ids.append(wid)
                 budget -= 1
 
@@ -3076,11 +3296,30 @@ def main() -> int:
             else:
                 log_path = None
                 entry = worker_entry_for(rid, reviewers_by_task)
-                if isinstance(entry, dict):
-                    log_path = entry.get("logPath")
-                if not log_path:
-                    log_path = default_reviewer_log_path(rid)
-                result_payload = detect_review_result(rid, log_path)
+                # Preferred: read structured JSON result emitted by the reviewer run.
+                result_payload = reviewer_result_from_entry(entry)
+
+                # If the reviewer run appears stuck/crashed (no result for too long), clear it so we can respawn.
+                if not result_payload and isinstance(entry, dict) and REVIEW_RUN_TIMEOUT_MIN > 0:
+                    try:
+                        started_at_ms = int(entry.get("startedAtMs") or 0) or None
+                    except Exception:
+                        started_at_ms = None
+                    if started_at_ms:
+                        timeout_ms = REVIEW_RUN_TIMEOUT_MIN * 60 * 1000
+                        if now_ms() - started_at_ms > timeout_ms:
+                            if not dry_run:
+                                reviewers_by_task.pop(str(rid), None)
+                                reviewers_by_task.pop(rid, None)
+                            entry = None
+
+                # Back-compat: fall back to parsing the legacy review log marker.
+                if not result_payload:
+                    if isinstance(entry, dict):
+                        log_path = entry.get("logPath")
+                    if not log_path:
+                        log_path = default_reviewer_log_path(rid)
+                    result_payload = detect_review_result(rid, log_path)
                 if result_payload:
                     result_revision = extract_review_revision(result_payload)
                     if not result_revision:
@@ -3213,7 +3452,64 @@ def main() -> int:
                     else:
                         add_tag(rid, TAG_REVIEW_ERROR)
                         remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP])
+                        tmux_kill_window(f"review-{rid}")
                     continue
+
+                # Certain BLOCKER outcomes are not actionable by "rerun worker" and will just
+                # cause Review <-> WIP ping-pong. Park them in Backlog with a durable blocked tag.
+                if verdict == "BLOCKER":
+                    non_actionable_tag = None
+                    non_actionable_reason = None
+
+                    empty_patch = False
+                    if patch_path and os.path.isfile(patch_path):
+                        try:
+                            empty_patch = os.path.getsize(patch_path) == 0
+                        except Exception:
+                            empty_patch = False
+
+                    notes = str(result_payload.get("notes") or "")
+                    blob = (notes + "\n" + "\n".join([str(x) for x in critical_items])).lower()
+
+                    if empty_patch or "patch file is empty" in blob or "no patch content" in blob:
+                        non_actionable_tag = TAG_BLOCKED_ARTIFACT
+                        non_actionable_reason = "empty/missing patch artifact (no changes to implement/review)"
+                    elif "task context missing" in blob or "missing task context" in blob or "no title or description" in blob:
+                        non_actionable_tag = TAG_BLOCKED_CONTEXT
+                        non_actionable_reason = "task context missing (title/description required)"
+
+                    if non_actionable_tag and non_actionable_reason:
+                        if dry_run:
+                            actions.append(
+                                f"Would keep Review #{rid} ({rtitle}) in Backlog; tagged {non_actionable_tag}: {non_actionable_reason}"
+                            )
+                        else:
+                            remove_tags(
+                                rid,
+                                [
+                                    TAG_REVIEW_INFLIGHT,
+                                    TAG_REVIEW_PENDING,
+                                    TAG_REVIEW_ERROR,
+                                    TAG_REVIEW_PASS,
+                                    TAG_REVIEW_REWORK,
+                                    TAG_NEEDS_REWORK,
+                                    TAG_REVIEW_BLOCKED_WIP,
+                                    TAG_REVIEW_RERUN,
+                                    TAG_REVIEW_RETRY,
+                                ],
+                            )
+                            tag_blocked_and_keep_in_backlog(
+                                rid,
+                                int(rsl_id),
+                                rtitle,
+                                non_actionable_reason,
+                                non_actionable_tag,
+                                from_label="Review",
+                            )
+                            # Drop any cached result/handle; the card is no longer in Review.
+                            review_results_by_task.pop(str(rid), None)
+                            reviewers_by_task.pop(str(rid), None)
+                        continue
 
                 if needs_rework:
                     if dry_run:
@@ -3224,6 +3520,7 @@ def main() -> int:
                         add_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK])
                         remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_BLOCKED_WIP])
                     review_rework_queue.append((rt, rsl_id))
+                    tmux_kill_window(f"review-{rid}")
                 else:
                     if dry_run:
                         actions.append(f"Would tag Review #{rid} ({rtitle}) as review:pass")
@@ -3240,6 +3537,7 @@ def main() -> int:
                             record_action(rid)
                             actions.append(f"Moved Review #{rid} ({rtitle}) -> Done (review pass)")
                         budget -= 1
+                    tmux_kill_window(f"review-{rid}")
 
         # Move rework items back to WIP before pulling new Ready work.
         if review_rework_queue and budget > 0:
@@ -3267,9 +3565,84 @@ def main() -> int:
                 rtitle = task_title(rt)
                 if is_held(rtags):
                     continue
+
+                # Thrash guard: if the same patch revision keeps re-failing review, stop looping.
+                patch_path = resolve_patch_path_for_task(rid)
+                current_revision = compute_patch_revision(patch_path) or ""
+                hist = review_rework_history_by_task.get(str(rid))
+                if not isinstance(hist, list):
+                    hist = []
+                window_ms = THRASH_WINDOW_MIN * 60 * 1000
+                nowm = now_ms()
+                pruned: list[dict[str, Any]] = []
+                for e in hist:
+                    if not isinstance(e, dict):
+                        continue
+                    try:
+                        at = int(e.get("atMs") or 0)
+                    except Exception:
+                        at = 0
+                    if at and (nowm - at) <= window_ms:
+                        pruned.append(e)
+                hist = pruned
+                same_rev = 0
+                for e in hist:
+                    if not isinstance(e, dict):
+                        continue
+                    if str(e.get("reviewRevision") or "") == current_revision:
+                        same_rev += 1
+                if THRASH_MAX_RESPAWNS > 0 and same_rev >= THRASH_MAX_RESPAWNS:
+                    if dry_run:
+                        actions.append(
+                            f"Would keep Review #{rid} ({rtitle}) in Backlog; tagged {TAG_BLOCKED_THRASH} (review thrash guard)"
+                        )
+                    else:
+                        remove_tags(
+                            rid,
+                            [
+                                TAG_REVIEW_INFLIGHT,
+                                TAG_REVIEW_PENDING,
+                                TAG_REVIEW_ERROR,
+                                TAG_REVIEW_PASS,
+                                TAG_REVIEW_REWORK,
+                                TAG_NEEDS_REWORK,
+                                TAG_REVIEW_BLOCKED_WIP,
+                                TAG_REVIEW_RERUN,
+                                TAG_REVIEW_RETRY,
+                            ],
+                        )
+                        tag_blocked_and_keep_in_backlog(
+                            rid,
+                            int(rsl_id),
+                            rtitle,
+                            "review thrash guard: same patch keeps failing review",
+                            TAG_BLOCKED_THRASH,
+                            from_label="Review",
+                        )
+                        review_results_by_task.pop(str(rid), None)
+                        reviewers_by_task.pop(str(rid), None)
+                        review_rework_history_by_task[str(rid)] = hist
+                        record_action(rid)
+                    budget -= 1
+                    continue
+
                 if dry_run:
                     actions.append(f"Would move Review #{rid} ({rtitle}) -> WIP (rework)")
                 else:
+                    reset_worker_state(rid)
+                    # Record this rework attempt (for thrash guard + debugging).
+                    last_result = review_results_by_task.get(str(rid)) if isinstance(review_results_by_task, dict) else None
+                    entry: Dict[str, Any] = {"atMs": now_ms(), "reviewRevision": current_revision}
+                    if isinstance(last_result, dict):
+                        try:
+                            entry["score"] = int(last_result.get("score") or 0)
+                        except Exception:
+                            pass
+                        if last_result.get("verdict"):
+                            entry["verdict"] = str(last_result.get("verdict"))
+                    hist.append(entry)
+                    review_rework_history_by_task[str(rid)] = hist
+
                     move_task(pid, rid, int(col_wip["id"]), 1, int(rsl_id))
                     record_action(rid)
                     remove_tags(rid, [TAG_REVIEW_BLOCKED_WIP, TAG_REVIEW_PASS, TAG_REVIEW_PENDING, TAG_REVIEW_INFLIGHT])
@@ -3281,6 +3654,8 @@ def main() -> int:
                 invalidate_wip_active_count()
                 review_results_by_task.pop(str(rid), None)
                 reviewers_by_task.pop(str(rid), None)
+                workers_by_task.pop(str(rid), None)
+                workers_by_task.pop(rid, None)
                 budget -= 1
 
         # Resume tasks paused by a prior critical whenever no critical is actively in WIP.
@@ -3526,6 +3901,7 @@ def main() -> int:
                 state["autoBlockedByOrchestrator"] = auto_blocked
                 state["reviewersByTaskId"] = reviewers_by_task
                 state["reviewResultsByTaskId"] = review_results_by_task
+                state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
                 save_state(state)
 
                 emit_json(
@@ -3552,6 +3928,7 @@ def main() -> int:
             state["autoBlockedByOrchestrator"] = auto_blocked
             state["reviewersByTaskId"] = reviewers_by_task
             state["reviewResultsByTaskId"] = review_results_by_task
+            state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
             save_state(state)
             emit_json(
                 mode=mode,
@@ -3928,6 +4305,7 @@ def main() -> int:
         state["autoBlockedByOrchestrator"] = auto_blocked
         state["reviewersByTaskId"] = reviewers_by_task
         state["reviewResultsByTaskId"] = review_results_by_task
+        state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
         if dry_run:
             if dry_runs_remaining > 0:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1

@@ -1,326 +1,311 @@
-# RecallDeck Kanban Orchestration North Star (clawd)
+# RecallDeck Board Automation NorthStar (clawd)
 
-This document is the end-to-end North Star for how the RecallDeck Kanban board, orchestrator, workers, reviewers, and monitors are supposed to work together.
+This document is the end-to-end contract for how RecallDeck’s Kanboard, the orchestrator, Codex workers, and Claude reviewers work together.
 
-This repo (`/Users/joshwegener/clawd`) is the local “ops brain” for the board automation.
+Repo (“ops brain”):
+- `/Users/joshwegener/clawd`
 
-It is written as a contract: the code and cron jobs should converge to match this.
+This NorthStar reflects the **run-id + file-signaled** design:
+- Workers/reviewers run in **tmux windows** you can watch.
+- Completion is **file-based** (`done.json`, `review.json`) instead of log scraping.
+- The orchestrator behaves like a deterministic state machine (no WIP ↔ Review ping-pong).
 
 ---
 
-## 0) Scope and principles
+## Scope And Principles
 
-### 0.1 Scope
-This North Star covers:
-- Kanboard project `RecallDeck` and its columns/swimlanes/tags conventions
-- Orchestrator behavior (`scripts/board_orchestrator.py`)
-- Worker spawn contract (Codex) (`scripts/spawn_worker_codex.sh`)
-- Critical-mode invariants (`scripts/critical_monitor.py`)
-- Safety checks (`scripts/overnight_safety_check.py`)
-- Review lane automation (reviewer spawn + score + verdict + rework loop)
-
-Out of scope (but referenced where it interacts):
-- The actual RecallDeck product repos (`/Users/joshwegener/Projects/RecallDeck/*`)
-- The Gateway cron definitions (they live in Clawdbot config, not in this repo)
-
-### 0.2 Principles
+Principles:
 - The board is the source of truth; the orchestrator is a deterministic synchronizer.
-- No silent states: WIP implies active execution, Review implies active review.
-- Deterministic over clever: when unsure, tag + comment + stop.
-- Tag-based “pause” is preferred to moving columns; keep card position intact.
+- No “silent” WIP or Review: if a card is active, there is an active run or a clear reason tag.
+- File signals > log scraping. Logs are for humans, not control flow.
+- When unsure: tag + comment + stop (avoid thrash).
 - Critical work supersedes throughput.
 
+Out of scope:
+- RecallDeck product repos (examples under `/Users/joshwegener/Projects/RecallDeck/*`)
+- Gateway plumbing (OpenClaw/Telegram). This repo assumes Kanboard is reachable.
+
 ---
 
-## 1) Board model (canonical)
+## Configuration (Secrets Live Outside Git)
 
-### 1.1 Project
+Secrets/config file (not committed):
+- `/Users/joshwegener/.config/clawd/orchestrator.env`
+
+Key invariants:
+- The orchestrator process MUST have `KANBOARD_BASE`, `KANBOARD_USER`, `KANBOARD_TOKEN` in its environment.
+- tmux/launchd often do not propagate `HOME`. We treat the env file path as explicit:
+  - `CLAWD_ORCHESTRATOR_ENV_FILE` (preferred)
+  - `CLAWD_ENV_FILE` (legacy alias)
+
+Pass threshold:
+- `BOARD_ORCHESTRATOR_REVIEW_THRESHOLD` (default `91`)
+
+Leases:
+- `BOARD_ORCHESTRATOR_USE_LEASES` is **off by default** (`0`) in the run-id world.
+
+---
+
+## Board Model (Canonical)
+
+Project:
 - Kanboard project name: `RecallDeck`
 
-### 1.2 Columns (canonical titles)
-The orchestrator keys off exact column titles. Canonical titles:
+Columns (titles must match):
 - `Backlog`
 - `Ready`
-- `Work in progress` (WIP)
+- `Work in progress`
 - `Review`
 - `Blocked`
 - `Done`
 
-Notes:
-- A `Paused` column is **legacy/optional**. The North Star is tag-based pause.
-
-### 1.3 Swimlanes
-- Primary swimlane: `MVP`
-- Other swimlanes: `Ops`, `Later`, plus Kanboard’s default.
-- Orchestrator uses a `swimlanePriority` list in state for stable ordering.
+Swimlanes:
+- Orchestrator uses a stable `swimlanePriority` list in state for ordering.
 
 ---
 
-## 2) Tag model (canonical)
+## Tags (Control Surface)
 
-Tags are the control surface. Keep them stable and few.
+Never override:
+- `hold` / `no-auto` / `review:skip` (the orchestrator must not move/start these)
 
-### 2.1 Escape hatches (never override)
-- `hold` or `no-auto`: orchestrator must not move/start the card.
-
-### 2.2 Repo mapping
-To start execution, a task must map to a local repo (unless explicitly exempted).
-
-Accepted repo hints (first match wins):
+Repo mapping (first match wins):
 1) Tag: `repo:<key>`
 2) Description line: `Repo: /absolute/path` or `Repo: <key>`
-3) (Legacy, optional) Title prefix: `<key>:` (behind `BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT`)
+3) (Optional/legacy) Title hint behind `BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT`
 
 Exemptions:
-- `no-repo`: task does not require a repo (planning/meta). Still can be reviewed.
+- `no-repo`: meta/planning tasks; may still be reviewed
 
-### 2.3 Dependencies
+Dependencies:
 - Description line: `Depends on: #31, #32` (also accepts `Dependencies:` / `Dependency:`)
 
-### 2.4 Exclusivity
+Exclusivity:
 - Tag: `exclusive:<key>` and/or description line `Exclusive: key1, key2`
 
-### 2.5 Critical + pause semantics
-- `critical`: this task supersedes everything.
+Critical:
+- `critical`
 
-Pause tags:
-- `paused` (generic/manual fallback)
-- Always prefer a reason tag when the system applies a pause:
-  - `paused:critical`
+Pause semantics:
+- `paused` (generic)
+- Reason tags (preferred when automation pauses):
   - `paused:missing-worker`
-  - `paused:deps`
-  - `paused:exclusive`
-  - (future) `paused:review-rework`
+  - `paused:critical`
+  - `paused:thrash`
 
-Key rule:
-- A paused card stays in its column and keeps its position.
+Blocked reason tags (automation uses these; they should not accumulate in the Blocked column):
+- `blocked:repo`
+- `blocked:deps`
+- `blocked:exclusive`
+- `blocked:thrash`
+- `blocked:artifact`
 
-### 2.6 Review tags (North Star)
-- `review:auto`: orchestrator is allowed to auto-review this card
-- `review:pending`: needs reviewer spawned
-- `review:inflight`: reviewer is running
-- `review:pass`: last review passed threshold
-- `review:rework`: last review failed threshold / verdict != PASS
-- `review:blocked:wip`: review says rework but WIP is currently full
-- `review:error`: reviewer failed / result parse failed
-- `review:skip`: never auto-review this card
-- `review:rerun`: force a rerun even if unchanged
-
----
-
-## 3) Automation loops (cron “actors”)
-
-### 3.1 Board orchestrator (15m)
-Script: `scripts/board_orchestrator.py`
-
-Contract:
-- Emits `NO_REPLY` when no action is needed.
-- Otherwise emits a single JSON object with actions and errors.
-
-Safety valves:
-- Lock file (OS-level lock): `/tmp/board-orchestrator.lock` (`flock` by default).
-- Action budget per run (prevents thrash)
-- Cooldown per task via `lastActionsByTaskId`
-
-### 3.2 Critical monitor (every ~2m)
-Script: `scripts/critical_monitor.py`
-
-Contract:
-- `NO_REPLY` when healthy.
-- `ALERT: ...` when invariants are violated.
-
-### 3.3 Overnight safety check (hourly)
-Script: `scripts/overnight_safety_check.py`
-
-Contract:
-- `NO_REPLY` when healthy.
-- `ALERT: ...` summarizing stalls/drift.
-
-### 3.4 Quota guardrails (every ~10m)
-Not implemented as code in this repo; state lives at:
-- `memory/quota-guardrail-state.json`
-
-North Star requirement:
-- Alerts include reset weekday + time remaining (ticket #61).
+Review tags:
+- `review:auto` (orchestrator is allowed to auto-review)
+- `review:pending` (needs reviewer spawned)
+- `review:inflight` (reviewer running)
+- `review:pass` (last review passed threshold)
+- `review:rework` + `needs-rework` (last review failed)
+- `review:blocked:wip` (rework is waiting for WIP capacity)
+- `review:error` (review runner/auth/quota failed)
+- `review:rerun` / `review:retry` (explicit human request to rerun review)
 
 ---
 
-## 4) Task lifecycle (end-to-end)
+## Run Model (The Core Design)
 
-### 4.1 Backlog → Ready
-Orchestrator keeps Ready stocked.
+Everything active is a **run** with a unique `runId` and a dedicated directory.
+
+Run roots:
+- Workers: `/Users/joshwegener/clawd/runs/worker/task-<id>/<runId>/`
+- Reviewers: `/Users/joshwegener/clawd/runs/review/task-<id>/<runId>/`
+
+Worker run files:
+- `worker.log` (human debug only)
+- `patch.patch` (the patch to review/apply)
+- `kanboard-comment.md` (ready-to-post comment text)
+- `meta.json` (spawn metadata)
+- `done.json` (canonical completion signal)
+
+Reviewer run files:
+- `review.log` (human debug only)
+- `meta.json` (spawn metadata)
+- `review.json` (canonical completion signal)
+
+Control flow rule:
+- The orchestrator must never infer completion from a stale file in a previous run directory.
+- The orchestrator must only accept completion via the current run’s `done.json` / `review.json`.
+
+---
+
+## Task Lifecycle (State Machine)
+
+### Backlog → Ready
+The orchestrator keeps `Ready` stocked.
 
 Selection rules:
-- Skip `hold` / `no-auto` / `paused:*`.
-- Skip epic containers.
-- Enforce dependencies: don’t start until deps are Done.
-- Enforce exclusivity: don’t start if the key already exists in WIP.
+- Skip held/no-auto.
+- Enforce deps/exclusive.
 - Enforce repo mapping (unless `no-repo`).
 
-If a task is deterministically blocked:
-- Move it to `Blocked`.
-- Tag it `auto-blocked` plus one of:
-  - `blocked:deps`
-  - `blocked:exclusive`
-  - `blocked:repo`
+If deterministically blocked:
+- Keep it in `Backlog` and add a durable tag (do not fill the Blocked column):
+  - `blocked:repo` / `blocked:deps` / `blocked:exclusive` / `blocked:thrash`
 
-### 4.2 Ready → WIP (worker spawning)
-Invariant: **No silent WIP**.
+### Ready → WIP (Spawn Worker)
+Invariant: no task enters WIP unless a worker handle is recorded.
 
-Rule:
-- A task is only moved Ready → WIP if a worker handle can be recorded immediately.
+Spawn command:
+- `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD` → `scripts/spawn_worker_tmux.sh`
 
-Worker spawn contract:
-- Orchestrator uses `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD`.
-- The spawn command must output JSON to stdout:
-  - `{"execSessionId":"...","logPath":"..."}`
+Spawn stdout contract (single JSON object):
+```json
+{
+  "execSessionId": "tmux:clawd:worker-42",
+  "runId": "20260203T103000Z-acde12",
+  "runDir": "/Users/joshwegener/clawd/runs/worker/task-42/20260203T103000Z-acde12",
+  "logPath": ".../worker.log",
+  "patchPath": ".../patch.patch",
+  "commentPath": ".../kanboard-comment.md",
+  "donePath": ".../done.json",
+  "startedAtMs": 1738589000000
+}
+```
 
-Default implementation in this repo:
-- `scripts/spawn_worker_codex.sh {task_id} {repo_key} {repo_path}`
-- It backgrounds `codex exec` and logs to `memory/worker-logs/task-<id>.log`.
+Worker completion contract:
+- Worker writes `done.json` at end (always), and must produce:
+  - a non-empty patch file
+  - a non-empty Kanboard comment file
 
-Failure:
-- If a worker cannot be started, the task stays in Ready and is tagged:
-  - `paused` + `paused:missing-worker`
+If the worker cannot be started:
+- Tag `paused` + `paused:missing-worker`
+- Move the card to `Blocked` (temporary policy to keep Ready/WIP clean)
 
-### 4.3 WIP steady-state (reconciliation)
-A task in WIP must have:
-- a repo mapping (unless `no-repo`), and
-- an active worker lease (`task-<id>/lease/lease.json`) when leases are enabled.
+### WIP → Review (Worker Completion)
+The orchestrator moves WIP → Review only when the current run’s `done.json` is present and valid:
+- `ok == true`
+- `patchExists == true`
+- `commentExists == true`
+- `patchBytes > 0`
 
-`workersByTaskId` is treated as a cache rebuilt from leases each run (when enabled).
+When moving WIP → Review:
+- Add `review:auto` + `review:pending`
+- Post `kanboard-comment.md` as a Kanboard comment (best-effort)
+- Kill the worker tmux window `worker-<id>` (cleanup)
 
-If a WIP task is missing a worker lease or the lease is dead:
-- Attempt a respawn (subject to thrash guard).
-- Otherwise tag `paused` + `paused:missing-worker` and alert.
+If `done.json` exists but artifacts are unusable (empty/missing/non-zero exit):
+- Keep it out of Review and prevent thrash:
+  - move to `Backlog` and tag `blocked:artifact`
 
-### 4.4 WIP → Review (completion detection)
-Contract:
-- Worker completion is detected conservatively by scanning the worker log tail.
-- The worker must emit a patch marker, and the patch file must exist on disk.
+### Review (Spawn Reviewer, Read review.json)
+Spawn command:
+- `BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD` → `scripts/spawn_reviewer_tmux.sh`
 
-When completion is detected:
-- Orchestrator moves WIP → Review.
-- It records `completedAtMs` and `patchPath` into the worker entry.
+Spawn stdout contract:
+```json
+{
+  "execSessionId": "tmux:clawd:review-42",
+  "runId": "20260203T104500Z-acde12",
+  "runDir": "/Users/joshwegener/clawd/runs/review/task-42/20260203T104500Z-acde12",
+  "logPath": ".../review.log",
+  "resultPath": ".../review.json",
+  "startedAtMs": 1738589100000
+}
+```
 
-### 4.5 Review automation (Claude scoring + rework loop)
-North Star behavior:
+Reviewer output contract:
+- Reviewer writes strict JSON to `review.json`:
+```json
+{
+  "score": 91,
+  "verdict": "PASS",
+  "critical_items": [],
+  "notes": "short summary",
+  "reviewRevision": "abcd1234..."
+}
+```
 
-Reviewer spawn contract:
-- Orchestrator uses `BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD`.
-- The spawn command must output JSON to stdout:
-  - `{"execSessionId":"pid:<pid>","logPath":"..."}`
-- Default implementation in this repo:
-  - `scripts/spawn_reviewer_claude.sh {task_id} {repo_key} {repo_path} {patch_path} {log_path} {review_revision}`
+Decision policy:
+- PASS requires: `score >= BOARD_ORCHESTRATOR_REVIEW_THRESHOLD` and `verdict == "PASS"` and `critical_items` empty.
+- Otherwise REWORK/BLOCKER.
 
-1) When a task enters Review (and has `review:auto`, or is auto-moved there by the orchestrator):
-- Add `review:pending`.
-- Spawn a reviewer (Claude/opus) and add `review:inflight`.
+On PASS:
+- Tag `review:pass`
+- Optionally auto-move Review → Done (config `REVIEW_AUTO_DONE`)
+- Kill tmux window `review-<id>`
 
-2) Reviewer output contract:
-- Reviewer writes a single machine-parseable result line near the end:
-  - `review_result: {"score":87,"verdict":"PASS",...}`
-- Or it outputs strict JSON that includes `score` + `verdict`.
+On REWORK/BLOCKER:
+- Tag `review:rework` + `needs-rework`
+- Move Review → WIP if capacity allows (or tag `review:blocked:wip` until capacity frees)
+- Ensure a new worker run will be spawned (new `runId` means no stale completion)
+- Kill tmux window `review-<id>`
 
-3) Decision policy:
-- Score threshold default: 85.
-- PASS: `score >= threshold` and verdict PASS.
-- Otherwise: REWORK.
+Reviewer errors:
+- If `review:error` is present and there is no stored result, do not respawn automatically.
+- Only rerun review on explicit human tags: `review:rerun` or `review:retry`.
 
-4) Posting results:
-- Orchestrator posts a comment back to the Kanboard card containing the review JSON block.
-
-5) Rework loop:
-- If REWORK:
-  - Tag `review:rework`.
-  - If WIP capacity allows, move Review → WIP and spawn a fixer worker.
-  - If WIP is full, tag `review:blocked:wip` and retry next tick.
-
-6) Priority rule:
-- Before pulling from Ready, orchestrator must first service Review rework (Review → WIP) when WIP has capacity.
-
-### 4.6 Blocked auto-heal
-Auto-heal rule:
-- When Ready is empty (anti-thrash) and a previously auto-blocked task’s constraint clears:
-  - move Blocked → Ready
-  - remove `auto-blocked` + reason tags
-
----
-
-## 5) Critical mode (supersedes everything)
-
-### 5.1 When critical mode is active
-If any non-held `critical` task is not Done:
-- The orchestrator must prioritize moving that critical task forward.
-
-### 5.2 Preemption behavior
-- When a critical is in WIP or Review:
-  - Tag all non-critical WIP tasks: `paused` + `paused:critical`
-  - Do not pull any new non-critical work from Ready.
-
-### 5.3 Capacity rules during critical
-- Critical can enter WIP even if WIP is “full”.
-- This is implemented by pausing non-critical WIP (tag-based), freeing “active WIP” capacity.
-
-### 5.4 Exiting critical
-When no critical tasks remain:
-- Remove `paused:critical` from tasks that were auto-paused.
-- Remove `paused` only if it was added solely for critical preemption.
+Thrash guard:
+- If the same patch revision fails review too many times within the window, stop looping:
+  - move to `Backlog` tagged `blocked:thrash`
 
 ---
 
-## 6) State file contract
+## Critical Mode
 
-Path:
-- `memory/board-orchestrator-state.json`
+When a non-held `critical` task exists:
+- Prioritize starting/advancing that card.
+- When a critical is actively in WIP:
+  - tag non-critical WIP cards `paused` + `paused:critical` (tag-based; do not move columns)
+  - do not pull new non-critical work
+- Critical tasks can exceed the normal WIP limit.
 
-Treat this file as an API: keys are stable and backwards-compatible.
+When no critical remains:
+- Clear `paused:critical` (and `paused` only if it was added solely for critical preemption).
 
-Core keys:
+---
+
+## Operations (tmux)
+
+Bring up tmux + orchestrator loop:
+- `/Users/joshwegener/clawd/scripts/clawd_up.sh`
+
+Stop automation:
+- `/Users/joshwegener/clawd/scripts/clawd_down.sh`
+
+Attach:
+- `tmux attach -t clawd`
+
+Useful windows:
+- `orchestrator` (the loop)
+- `orchestrator-logs` (tails `/Users/joshwegener/clawd/memory/orchestrator.log`)
+- `worker-logs` (tails latest worker run logs under `runs/worker/`)
+- `review-logs` (tails latest reviewer run logs under `runs/review/`)
+
+Cleanup behavior:
+- After a run completes, the orchestrator kills `worker-<id>` / `review-<id>` windows (configurable).
+
+---
+
+## State File Contract
+
+State path:
+- `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
+
+Treat as an API; important keys:
 - `lastActionsByTaskId` (cooldown)
-- `swimlanePriority`
-- `repoMap` (discovered + persisted)
-- `repoByTaskId`
-- `workersByTaskId`
+- `repoByTaskId`, `repoMap`
+- `workersByTaskId` (stores the current worker run entry per task, including `donePath`)
+- `reviewersByTaskId` (stores the current reviewer run entry per task, including `resultPath`)
+- `reviewResultsByTaskId` (stored parsed results)
 - `pausedByCritical` (who we paused and why)
-- `autoBlockedByOrchestrator`
-
-Review keys (North Star):
-- `reviewersByTaskId`
-- `reviewResultsByTaskId`
+- `reviewReworkHistoryByTaskId` (thrash guard history)
 
 ---
 
-## 7) Acceptance criteria (what “working” means)
+## “Working” Acceptance Criteria
 
-1) If WIP contains a non-paused task, it has a live worker handle.
-2) Ready → WIP never happens unless a worker handle is recorded immediately.
-3) Worker completion reliably advances WIP → Review.
-4) Review is actively serviced:
-   - reviewer spawned automatically for Review cards
-   - results posted back to Kanboard
-   - rework loop feeds back into WIP before pulling from Ready
-5) Critical always preempts, without deadlocking:
-   - critical does not get stuck behind held/unstartable prerequisites
-   - non-critical WIP is paused via tags (not moved) and resumes after
-6) No infinite thrash loops (budget + cooldown + tag-based locks).
-7) Monitoring is actionable:
-   - critical_monitor only alerts on true invariant violations
-   - safety check alerts correlate to real stalls and include next actions
-
----
-
-## 8) Known gaps / follow-ups (as of now)
-
-- Quota guardrail messages should include reset weekday + time remaining (ticket #61).
-- Ensure repoMap always includes `clawd` (or derive it deterministically) so `repo:clawd` works.
-- Ensure the Kanboard comment API is consistently used for worker/reviewer outputs.
-- Verify the exact Kanboard column titles match code constants (avoid “Doing” drift).
-
----
-
-## 9) Next step (audit ticket)
-After this North Star stabilizes, create a CRITICAL audit ticket that:
-- walks every cron + script + tag/column behavior
-- confirms each acceptance criterion is enforced
-- documents any remaining mismatch as follow-up tasks
+1) WIP → Review can only happen after a valid `done.json` from the current run.
+2) Review decisions come only from `review.json` (current run), and are idempotent.
+3) No WIP ↔ Review ping-pong without new worker output (new runId) or explicit human tags.
+4) Review errors do not thrash (require `review:rerun` / `review:retry`).
+5) tmux windows are observable and cleaned up on completion (no hundreds of orphan panes).

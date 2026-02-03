@@ -14,7 +14,10 @@ class TestWorkerOutputDetection(unittest.TestCase):
             # Log contains a patch marker pointing at an existing file.
             log_path.write_text(f"Patch file: `{patch_path}`")
 
-            result = bo.detect_worker_completion(30, str(log_path))
+            # New behavior: log marker detection is only trusted when startedAtMs is known
+            # and the log is recent relative to that start time.
+            started_at_ms = int(log_path.stat().st_mtime * 1000) - 1000
+            result = bo.detect_worker_completion(30, str(log_path), started_at_ms=started_at_ms)
 
             self.assertIsNotNone(result)
             self.assertEqual(result.get("patchPath"), str(patch_path))

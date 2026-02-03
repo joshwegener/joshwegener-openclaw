@@ -5,14 +5,16 @@ set -euo pipefail
 #
 # Orchestrator spawn contract:
 # - MUST print one JSON object to stdout:
-#   {"execSessionId":"...","logPath":"..."}
+#   {"execSessionId":"...","logPath":"...","runId":"...","runDir":"...","donePath":"...","patchPath":"...","commentPath":"...","startedAtMs":<int>}
 #
-# We return a pid-based handle (pid:<pid>) so board_orchestrator can do
-# best-effort liveness checks, plus a tmux hint for humans.
+# Design notes:
+# - Each spawn creates a NEW per-run directory containing log/patch/comment/done.json.
+# - The orchestrator should treat done.json as the canonical completion signal.
 
 TASK_ID="${1:?task_id}"
 REPO_KEY="${2:-}"       # already shell-escaped by caller
 REPO_PATH="${3:-}"      # already shell-escaped by caller
+
 CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
 if [[ -z "$CODEX_BIN" && -x "/Users/joshwegener/Library/Application Support/Herd/config/nvm/versions/node/v22.11.0/bin/codex" ]]; then
   CODEX_BIN="/Users/joshwegener/Library/Application Support/Herd/config/nvm/versions/node/v22.11.0/bin/codex"
@@ -35,54 +37,109 @@ fi
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
 TMUX_WINDOW="worker-${TASK_ID}"
 
-LOG_DIR="/Users/joshwegener/clawd/memory/worker-logs"
-mkdir -p "$LOG_DIR"
-LOG_PATH="$LOG_DIR/task-${TASK_ID}.log"
+# Prefer a stable env file path over $HOME because tmux may not propagate HOME.
+DEFAULT_ENV_FILE=""
+if [[ -f "/Users/joshwegener/.config/clawd/orchestrator.env" ]]; then
+  DEFAULT_ENV_FILE="/Users/joshwegener/.config/clawd/orchestrator.env"
+elif [[ -f "${HOME:-}/.config/clawd/orchestrator.env" ]]; then
+  DEFAULT_ENV_FILE="${HOME:-}/.config/clawd/orchestrator.env"
+fi
+ORCHESTRATOR_ENV_FILE="${CLAWD_ORCHESTRATOR_ENV_FILE:-${CLAWD_ENV_FILE:-$DEFAULT_ENV_FILE}}"
 
-PATCH_DIR="/Users/joshwegener/clawd/tmp/worker-patches"
-mkdir -p "$PATCH_DIR"
-PATCH_PATH="$PATCH_DIR/task-${TASK_ID}.patch"
+RUN_ROOT="${CLAWD_RUNS_ROOT:-/Users/joshwegener/clawd/runs}"
+WORKER_RUN_ROOT="${CLAWD_WORKER_RUN_ROOT:-$RUN_ROOT/worker}"
 
-RUN_DIR="/Users/joshwegener/clawd/tmp/worker-runs"
+RUN_ID="$(python3 - <<'PY'
+import secrets, time
+print(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
+PY
+)"
+RUN_DIR="${WORKER_RUN_ROOT}/task-${TASK_ID}/${RUN_ID}"
 mkdir -p "$RUN_DIR"
-RUN_PATH="$RUN_DIR/task-${TASK_ID}.sh"
 
-PID_DIR="/Users/joshwegener/clawd/tmp/worker-pids"
-mkdir -p "$PID_DIR"
-PID_PATH="$PID_DIR/task-${TASK_ID}.pid"
+LOG_PATH="${RUN_DIR}/worker.log"
+PATCH_PATH="${RUN_DIR}/patch.patch"
+COMMENT_PATH="${RUN_DIR}/kanboard-comment.md"
+META_PATH="${RUN_DIR}/meta.json"
+DONE_PATH="${RUN_DIR}/done.json"
+RUN_SCRIPT="${RUN_DIR}/run.sh"
 
-COMMENT_PATH="/Users/joshwegener/clawd/tmp/kanboard-task-${TASK_ID}-comment.md"
-
-cat >"$RUN_PATH" <<'EOF'
+cat >"$RUN_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 TASK_ID="${1:?task_id}"
 REPO_KEY="${2:?repo_key}"
 REPO_PATH="${3:?repo_path}"
-LOG_PATH="${4:?log_path}"
-PID_PATH="${5:?pid_path}"
-PATCH_PATH="${6:?patch_path}"
-COMMENT_PATH="${7:?comment_path}"
-CODEX_BIN="${8:?codex_bin}"
+CODEX_BIN="${4:?codex_bin}"
+RUN_ID="${5:?run_id}"
+RUN_DIR="${6:?run_dir}"
+LOG_PATH="${7:?log_path}"
+PATCH_PATH="${8:?patch_path}"
+COMMENT_PATH="${9:?comment_path}"
+META_PATH="${10:?meta_path}"
+DONE_PATH="${11:?done_path}"
 
-mkdir -p "$(dirname "$LOG_PATH")" "$(dirname "$PID_PATH")"
+mkdir -p "$(dirname "$LOG_PATH")"
+
+started_at_ms="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+
+export TASK_ID REPO_KEY REPO_PATH RUN_ID RUN_DIR LOG_PATH PATCH_PATH COMMENT_PATH META_PATH DONE_PATH STARTED_AT_MS="$started_at_ms"
+
+python3 - <<'PY'
+import json, os
+payload = {
+  "schemaVersion": 1,
+  "taskId": int(os.environ.get("TASK_ID") or 0),
+  "runId": os.environ.get("RUN_ID") or "",
+  "repoKey": os.environ.get("REPO_KEY") or "",
+  "repoPath": os.environ.get("REPO_PATH") or "",
+  "runDir": os.environ.get("RUN_DIR") or "",
+  "logPath": os.environ.get("LOG_PATH") or "",
+  "patchPath": os.environ.get("PATCH_PATH") or "",
+  "commentPath": os.environ.get("COMMENT_PATH") or "",
+  "donePath": os.environ.get("DONE_PATH") or "",
+  "startedAtMs": int(os.environ.get("STARTED_AT_MS") or 0),
+}
+with open(os.environ["META_PATH"], "w") as f:
+  json.dump(payload, f, indent=2, sort_keys=True)
+PY
 
 # Ensure Kanboard env is present even when spawned from launchd/tmux without a full shell env.
-# Important: tmux sessions often retain partial env (e.g. KANBOARD_BASE) without creds.
-if [[ -f "${HOME}/.config/clawd/orchestrator.env" ]]; then
-  if [[ -z "${KANBOARD_BASE:-}" || -z "${KANBOARD_USER:-}" || -z "${KANBOARD_TOKEN:-}" ]]; then
-    # shellcheck disable=SC1090
-    source "${HOME}/.config/clawd/orchestrator.env" >/dev/null 2>&1 || true
-  fi
+env_loaded_from=""
+if [[ -z "${KANBOARD_BASE:-}" || -z "${KANBOARD_USER:-}" || -z "${KANBOARD_TOKEN:-}" ]]; then
+  for cand in "${CLAWD_ORCHESTRATOR_ENV_FILE:-}" "${CLAWD_ENV_FILE:-}" "${HOME:-}/.config/clawd/orchestrator.env" "/Users/joshwegener/.config/clawd/orchestrator.env"; do
+    [[ -n "$cand" ]] || continue
+    if [[ -f "$cand" ]]; then
+      # shellcheck disable=SC1090
+      set +u
+      source "$cand" >>"$LOG_PATH" 2>&1 || true
+      set -u
+      env_loaded_from="$cand"
+      break
+    fi
+  done
 fi
 
-# Best-effort task context fetch; do not fail worker spawn if Kanboard is down.
+{
+  echo "[kanboard-env] HOME=${HOME:-}"
+  echo "[kanboard-env] loaded_from=${env_loaded_from:-}"
+  echo "[kanboard-env] CLAWD_ORCHESTRATOR_ENV_FILE=${CLAWD_ORCHESTRATOR_ENV_FILE:-}"
+  echo "[kanboard-env] KANBOARD_BASE=${KANBOARD_BASE:-}"
+  echo "[kanboard-env] KANBOARD_USER=${KANBOARD_USER:-}"
+  echo "[kanboard-env] KANBOARD_TOKEN_set=$([[ -n \"${KANBOARD_TOKEN:-}\" ]] && echo yes || echo no)"
+} >>"$LOG_PATH" 2>&1 || true
+
+# Best-effort task context fetch; do not fail worker run if Kanboard is down.
 KB_TITLE=""
 KB_DESC=""
 if [[ -n "${KANBOARD_BASE:-}" && -n "${KANBOARD_USER:-}" && -n "${KANBOARD_TOKEN:-}" ]]; then
   kb_json="$(python3 - <<'PY' "$TASK_ID" 2>>"$LOG_PATH" || true
-import base64, json, os, sys, urllib.request
+import base64, json, os, sys, urllib.error, urllib.request
 
 task_id = int(sys.argv[1])
 base = os.environ.get("KANBOARD_BASE") or ""
@@ -91,15 +148,39 @@ token = os.environ.get("KANBOARD_TOKEN") or ""
 if not base or not user or not token:
     raise SystemExit(0)
 
-payload = {"jsonrpc": "2.0", "method": "getTask", "id": 1, "params": {"task_id": task_id}}
+payload = {"jsonrpc": "2.0", "method": "getTask", "id": 1, "params": [task_id]}
 auth = base64.b64encode(f"{user}:{token}".encode()).decode()
 req = urllib.request.Request(
     base,
     data=json.dumps(payload).encode(),
     headers={"Content-Type": "application/json", "Authorization": f"Basic {auth}"},
 )
-with urllib.request.urlopen(req, timeout=10) as resp:
-    out = json.loads(resp.read().decode())
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode()
+except urllib.error.HTTPError as e:
+    body = ""
+    try:
+        body = e.read().decode(errors="replace")
+    except Exception:
+        body = ""
+    snippet = body[:200].replace("\n", "\\n") if body else ""
+    print(json.dumps({"title": "", "description": "", "error": f"HTTP {e.code}: {e.reason}; body={snippet!r}"}))
+    raise SystemExit(0)
+except Exception as e:
+    print(json.dumps({"title": "", "description": "", "error": f"{type(e).__name__}: {e}"}))
+    raise SystemExit(0)
+
+try:
+    out = json.loads(raw)
+except Exception:
+    print(json.dumps({"title": "", "description": "", "error": f"Non-JSON response: {raw[:200]!r}"}))
+    raise SystemExit(0)
+
+if out.get("error"):
+    print(json.dumps({"title": "", "description": "", "error": out.get("error")}))
+    raise SystemExit(0)
+
 res = out.get("result") or {}
 print(json.dumps({"title": res.get("title") or "", "description": res.get("description") or ""}))
 PY
@@ -107,13 +188,19 @@ PY
   if [[ -n "$kb_json" ]]; then
     KB_TITLE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"title\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
     KB_DESC="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"description\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
+    KB_ERR="$(python3 -c 'import json,sys; v=json.loads(sys.stdin.read()).get(\"error\"); import json as _j; print(\"\" if v in (None, \"\") else (v if isinstance(v,str) else _j.dumps(v)))' <<<"$kb_json" 2>/dev/null || true)"
+    if [[ -z "$KB_TITLE" && -z "$KB_DESC" && -n "$KB_ERR" ]]; then
+      KB_TITLE="(Kanboard task context unavailable)"
+      KB_DESC="$(printf 'Error fetching task #%s from Kanboard JSON-RPC (getTask):\n%s\n' "$TASK_ID" "$KB_ERR")"
+      echo "[kanboard-task] fetch_error=$KB_ERR" >>"$LOG_PATH" 2>&1 || true
+    fi
   fi
 fi
 
 KB_TITLE_B64="$(printf '%s' "$KB_TITLE" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
 KB_DESC_B64="$(printf '%s' "$KB_DESC" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
 
-export TASK_ID REPO_KEY REPO_PATH LOG_PATH PID_PATH PATCH_PATH COMMENT_PATH KB_TITLE_B64 KB_DESC_B64
+export KB_TITLE_B64 KB_DESC_B64
 
 PROMPT="$(python3 - <<'PY'
 import base64
@@ -132,6 +219,8 @@ repo_key = os.environ.get("REPO_KEY", "")
 repo_path = os.environ.get("REPO_PATH", "")
 patch_path = os.environ.get("PATCH_PATH", "")
 comment_path = os.environ.get("COMMENT_PATH", "")
+run_id = os.environ.get("RUN_ID", "")
+run_dir = os.environ.get("RUN_DIR", "")
 title = b64(os.environ.get("KB_TITLE_B64", ""))
 desc = b64(os.environ.get("KB_DESC_B64", ""))
 
@@ -142,24 +231,19 @@ Title: {title}
 Description:
 {desc}
 
-HARD SAFETY RULES (must follow):
-- NEVER read, open, or print any of these assistant/user context files:
-  - /Users/joshwegener/clawd/MEMORY.md
-  - /Users/joshwegener/clawd/USER.md
-  - /Users/joshwegener/clawd/SOUL.md
-  - /Users/joshwegener/clawd/AGENTS.md
-  - /Users/joshwegener/clawd/TOOLS.md
-  - /Users/joshwegener/clawd/HEARTBEAT.md
-  - /Users/joshwegener/clawd/IDENTITY.md
-  - anything under /Users/joshwegener/clawd/memory/
-- Do not search for secrets/keys/tokens or paste private content into logs/comments.
-- Only read/edit code relevant to the task inside the repo (typically scripts/, tests/, src/).
-
 Work in the repo at: {repo_path}
 Repo key: {repo_key}
 
+Run metadata:
+- run_id: {run_id}
+- run_dir: {run_dir}
+
+HARD SAFETY RULES (must follow):
+- Do not search for secrets/keys/tokens or paste private content into logs/comments.
+- Only read/edit code relevant to the task inside the repo.
+
 Steps:
-1) Use the task context above (title/description). Do NOT try to log into Kanboard.
+1) Use the task context above (title/description). Do NOT try to log into Kanboard UI.
 2) Implement the work in this repo clone.
 3) Commit changes with a clear message and push if origin is configured.
 
@@ -170,58 +254,97 @@ Steps:
    - Otherwise:
      git diff > {patch_path}
 
-   Then print EXACTLY this line (so automation can detect completion):
-   Patch file: `{patch_path}`
-
-5) Write a ready-to-paste Kanboard comment to:
+5) Write a ready-to-paste Kanboard comment to this exact path:
    {comment_path}
-   Mention that file path in your output.
-   Then STOP (no extra chatter).
 
-6) If you cannot commit/push in this environment, still produce the patch + comment file.
+6) At the end, print EXACTLY these two lines (for human debugging):
+   Patch file: `{patch_path}`
+   Kanboard comment file: `{comment_path}`
 """
 
 print(prompt)
 PY
 )"
 
-rm -f "$PID_PATH"
+echo "### WORKER START $(date -u '+%Y-%m-%dT%H:%M:%SZ')" | tee -a "$LOG_PATH"
+echo "run_id=$RUN_ID" | tee -a "$LOG_PATH"
+echo "repo_path=$REPO_PATH" | tee -a "$LOG_PATH"
 
-nohup "$CODEX_BIN" exec \
+set +e
+"$CODEX_BIN" exec \
   --dangerously-bypass-approvals-and-sandbox \
   --skip-git-repo-check \
   --profile "${CODEX_PROFILE:-chigh}" \
   -C "$REPO_PATH" \
-  "$PROMPT" \
-  >>"$LOG_PATH" 2>&1 &
+  "$PROMPT" 2>&1 | tee -a "$LOG_PATH"
+CODEX_EXIT="${PIPESTATUS[0]}"
+set -e
 
-PID=$!
-echo "$PID" >"$PID_PATH"
-# Stream logs to the tmux pane so the window isn't "empty".
-tail -n 80 -f "$LOG_PATH" &
-TAIL_PID=$!
-wait "$PID" || true
-kill "$TAIL_PID" 2>/dev/null || true
-wait "$TAIL_PID" 2>/dev/null || true
-echo "[worker $TASK_ID] done" >>"$LOG_PATH" 2>&1 || true
+patch_exists="false"
+comment_exists="false"
+patch_bytes=0
+comment_bytes=0
+if [[ -f "$PATCH_PATH" ]]; then
+  patch_exists="true"
+  patch_bytes="$(wc -c <"$PATCH_PATH" | tr -d ' ')"
+fi
+if [[ -f "$COMMENT_PATH" ]]; then
+  comment_exists="true"
+  comment_bytes="$(wc -c <"$COMMENT_PATH" | tr -d ' ')"
+fi
 
-# Close by default; keep open only when requested.
+finished_at_ms="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+
+export FINISHED_AT_MS="$finished_at_ms" CODEX_EXIT="$CODEX_EXIT" PATCH_EXISTS="$patch_exists" COMMENT_EXISTS="$comment_exists" PATCH_BYTES="$patch_bytes" COMMENT_BYTES="$comment_bytes"
+
+python3 - <<'PY'
+import json, os
+payload = {
+  "schemaVersion": 1,
+  "taskId": int(os.environ.get("TASK_ID") or 0),
+  "runId": os.environ.get("RUN_ID") or "",
+  "repoKey": os.environ.get("REPO_KEY") or "",
+  "repoPath": os.environ.get("REPO_PATH") or "",
+  "runDir": os.environ.get("RUN_DIR") or "",
+  "startedAtMs": int(os.environ.get("STARTED_AT_MS") or 0),
+  "finishedAtMs": int(os.environ.get("FINISHED_AT_MS") or 0),
+  "exitCode": int(os.environ.get("CODEX_EXIT") or 0),
+  "ok": (int(os.environ.get("CODEX_EXIT") or 0) == 0),
+  "patchPath": os.environ.get("PATCH_PATH") or "",
+  "commentPath": os.environ.get("COMMENT_PATH") or "",
+  "patchExists": (os.environ.get("PATCH_EXISTS") == "true"),
+  "commentExists": (os.environ.get("COMMENT_EXISTS") == "true"),
+  "patchBytes": int(os.environ.get("PATCH_BYTES") or 0),
+  "commentBytes": int(os.environ.get("COMMENT_BYTES") or 0),
+}
+with open(os.environ["DONE_PATH"], "w") as f:
+  json.dump(payload, f, indent=2, sort_keys=True)
+PY
+
+echo "[worker $TASK_ID] done exit=$CODEX_EXIT patch=$PATCH_PATH comment=$COMMENT_PATH" | tee -a "$LOG_PATH"
+
 if [[ "${CLAWD_KEEP_WORKER_WINDOW_OPEN:-0}" == "1" ]]; then
   exec bash
 fi
 exit 0
 EOF
 
-chmod +x "$RUN_PATH"
+chmod +x "$RUN_SCRIPT"
 
 if ! "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
   "$TMUX_BIN" new-session -d -s "$TMUX_SESSION" -n orchestrator "bash"
 fi
 
-# Prevent stale PID reads before the new tmux window has a chance to overwrite it.
-rm -f "$PID_PATH" 2>/dev/null || true
+# Ensure the tmux server environment has a stable pointer to the orchestrator env file.
+if [[ -n "${ORCHESTRATOR_ENV_FILE:-}" ]]; then
+  "$TMUX_BIN" set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_ENV_FILE" "$ORCHESTRATOR_ENV_FILE" 2>/dev/null || true
+fi
 
-# Deduplicate by name (tmux allows duplicate window names).
+# Deduplicate by name: keep one active worker window per task.
 "$TMUX_BIN" list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
   | awk -F: -v n="$TMUX_WINDOW" '$2 == n { print $1 }' \
   | while IFS= read -r wid; do
@@ -229,25 +352,15 @@ rm -f "$PID_PATH" 2>/dev/null || true
       "$TMUX_BIN" kill-window -t "$wid" 2>/dev/null || true
     done
 
-cmd="$(printf '%q ' "$RUN_PATH" "$TASK_ID" "$REPO_KEY" "$REPO_PATH" "$LOG_PATH" "$PID_PATH" "$PATCH_PATH" "$COMMENT_PATH" "$CODEX_BIN")"
+cmd="$(printf '%q ' "$RUN_SCRIPT" "$TASK_ID" "$REPO_KEY" "$REPO_PATH" "$CODEX_BIN" "$RUN_ID" "$RUN_DIR" "$LOG_PATH" "$PATCH_PATH" "$COMMENT_PATH" "$META_PATH" "$DONE_PATH")"
 "$TMUX_BIN" new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$cmd"
 
-handle="tmux:${TMUX_SESSION}:${TMUX_WINDOW}"
-pid=""
-# The lease system needs a pid at spawn-time; wait briefly for the tmux window to write it.
-wait_ms="${CLAWD_WORKER_PID_WAIT_MS:-1200}"
-step_ms=25
-elapsed=0
-while [[ $elapsed -lt $wait_ms ]]; do
-  if [[ -f "$PID_PATH" ]]; then
-    pid="$(cat "$PID_PATH" 2>/dev/null || true)"
-    break
-  fi
-  sleep 0.025
-  elapsed=$((elapsed + step_ms))
-done
-if [[ "$pid" =~ ^[0-9]+$ ]]; then
-  handle="pid:${pid} ${handle}"
-fi
+started_at_ms="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
 
-printf '{"execSessionId":"%s","logPath":"%s"}\n' "$handle" "$LOG_PATH"
+handle="tmux:${TMUX_SESSION}:${TMUX_WINDOW}"
+printf '{"execSessionId":"%s","logPath":"%s","runId":"%s","runDir":"%s","donePath":"%s","patchPath":"%s","commentPath":"%s","startedAtMs":%s}\n' \
+  "$handle" "$LOG_PATH" "$RUN_ID" "$RUN_DIR" "$DONE_PATH" "$PATCH_PATH" "$COMMENT_PATH" "$started_at_ms"

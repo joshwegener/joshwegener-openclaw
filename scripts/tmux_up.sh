@@ -6,6 +6,14 @@ set -euo pipefail
 
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
 
+DEFAULT_ENV_FILE=""
+if [[ -f "/Users/joshwegener/.config/clawd/orchestrator.env" ]]; then
+  DEFAULT_ENV_FILE="/Users/joshwegener/.config/clawd/orchestrator.env"
+elif [[ -f "${HOME:-}/.config/clawd/orchestrator.env" ]]; then
+  DEFAULT_ENV_FILE="${HOME:-}/.config/clawd/orchestrator.env"
+fi
+ENV_FILE="${CLAWD_ORCHESTRATOR_ENV_FILE:-${CLAWD_ENV_FILE:-$DEFAULT_ENV_FILE}}"
+
 ensure_session() {
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     return 0
@@ -54,16 +62,22 @@ ensure_window_cmd() {
 
 ensure_session
 
+# Ensure a stable pointer to the orchestrator env file is available inside tmux.
+if [[ -n "${ENV_FILE:-}" ]]; then
+  tmux set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_ENV_FILE" "$ENV_FILE" 2>/dev/null || true
+fi
+
 chmod +x /Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_worker_tmux.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_reviewer_tmux.sh
+chmod +x /Users/joshwegener/clawd/scripts/tail_latest_logs.sh
 
 ensure_window_cmd "orchestrator" "/Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh"
 
 # Convenience: quick tails (optional, but helpful).
-mkdir -p /Users/joshwegener/clawd/memory/worker-logs /Users/joshwegener/clawd/memory/review-logs
-ensure_window_cmd "worker-logs" "tail -n 200 -F /Users/joshwegener/clawd/memory/worker-logs/*.log 2>/dev/null || bash"
-ensure_window_cmd "review-logs" "tail -n 200 -F /Users/joshwegener/clawd/memory/review-logs/*.log 2>/dev/null || bash"
+ensure_window_cmd "worker-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/worker worker.log 20 200"
+ensure_window_cmd "review-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/review review.log 20 200"
+ensure_window_cmd "orchestrator-logs" "tail -n 300 -F /Users/joshwegener/clawd/memory/orchestrator.log 2>/dev/null || bash"
 
 echo "tmux session ready: ${TMUX_SESSION}"
 echo "attach: tmux attach -t ${TMUX_SESSION}"
