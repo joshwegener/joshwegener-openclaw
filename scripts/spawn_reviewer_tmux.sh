@@ -20,6 +20,20 @@ REVIEW_REVISION="${6:-}"
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
 TMUX_WINDOW="review-${TASK_ID}"
 
+TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
+if [[ -z "$TMUX_BIN" ]]; then
+  for cand in /opt/homebrew/bin/tmux /usr/local/bin/tmux; do
+    if [[ -x "$cand" ]]; then
+      TMUX_BIN="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "$TMUX_BIN" ]]; then
+  echo "tmux not found in PATH and no fallback tmux binary found" >&2
+  exit 1
+fi
+
 mkdir -p "$(dirname "$LOG_PATH")"
 
 RUN_DIR="/Users/joshwegener/clawd/tmp/reviewer-runs"
@@ -98,8 +112,8 @@ EOF
 
 chmod +x "$RUN_PATH"
 
-if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  tmux new-session -d -s "$TMUX_SESSION" -n orchestrator "bash"
+if ! "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  "$TMUX_BIN" new-session -d -s "$TMUX_SESSION" -n orchestrator "bash"
 fi
 
 # Prevent stale PID reads before the new tmux window has a chance to overwrite it.
@@ -107,14 +121,14 @@ rm -f "$PID_PATH" 2>/dev/null || true
 start_epoch="$(date +%s)"
 
 # Deduplicate by name (tmux allows duplicate window names).
-tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
+"$TMUX_BIN" list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
   | awk -F: -v n="$TMUX_WINDOW" '$2 == n { print $1 }' \
   | while IFS= read -r wid; do
       [[ -n "$wid" ]] || continue
-      tmux kill-window -t "$wid" 2>/dev/null || true
+      "$TMUX_BIN" kill-window -t "$wid" 2>/dev/null || true
     done
 
-tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$RUN_PATH"
+"$TMUX_BIN" new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$RUN_PATH"
 
 pid=""
 for _ in $(seq 1 50); do
