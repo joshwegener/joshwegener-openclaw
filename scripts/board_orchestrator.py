@@ -746,6 +746,18 @@ def worker_is_alive(handle: Optional[str]) -> bool:
         return True
     return pid_alive(pid)
 
+def reviewer_is_alive(handle: Optional[str]) -> bool:
+    """Best-effort liveness check for reviewers.
+
+    Reviewers spawned by spawn_reviewer_tmux.sh emit pid-based handles, so we can
+    safely treat dead PIDs as stale and respawn. For non-pid handles, treat as
+    alive (unknown).
+    """
+    pid = extract_pid(handle)
+    if pid is None:
+        return True
+    return pid_alive(pid)
+
 
 # -----------------------------------------------------------------------------
 # Worker leases + thrash guard
@@ -2532,8 +2544,13 @@ def main() -> int:
             review_revision: Optional[str],
         ) -> bool:
             entry = worker_entry_for(task_id, reviewers_by_task)
-            if worker_handle(entry):
+            handle = worker_handle(entry)
+            if handle and reviewer_is_alive(handle):
                 return True
+            if handle and not reviewer_is_alive(handle):
+                # Drop stale reviewer bookkeeping so we can respawn deterministically.
+                reviewers_by_task.pop(str(task_id), None)
+                reviewers_by_task.pop(task_id, None)
             if REVIEWER_SPAWN_CMD:
                 spawned = spawn_reviewer(task_id, repo_key, repo_path, patch_path, review_revision)
                 if spawned:
@@ -3013,6 +3030,18 @@ def main() -> int:
                 else:
                     reviewers_by_task.pop(str(rid), None)
                 entry = None
+
+            # If we have a pid-based reviewer handle but the process is dead and we
+            # don't have a stored result yet, reset so we can respawn.
+            if entry is not None and not stored_result:
+                h = worker_handle(entry)
+                if h and not reviewer_is_alive(h):
+                    if dry_run:
+                        actions.append(f"Would reset dead reviewer handle for Review #{rid} ({rtitle})")
+                    else:
+                        reviewers_by_task.pop(str(rid), None)
+                        reviewers_by_task.pop(rid, None)
+                    entry = None
 
             if rerun_requested or stale_result:
                 if dry_run:
