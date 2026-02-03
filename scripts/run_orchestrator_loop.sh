@@ -23,11 +23,10 @@ LOG_PATH="${CLAWD_ORCHESTRATOR_LOG:-/Users/joshwegener/clawd/memory/orchestrator
 
 while true; do
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  {
-    echo "=== orchestrator tick $ts ==="
-    python3 /Users/joshwegener/clawd/scripts/board_orchestrator.py || true
-    echo
-  } 2>&1 | tee -a "$LOG_PATH"
+  echo "=== orchestrator tick $ts ===" | tee -a "$LOG_PATH"
+  # Avoid running the whole loop body inside a pipeline subshell; keeps ticks from duplicating.
+  python3 /Users/joshwegener/clawd/scripts/board_orchestrator.py 2>&1 | tee -a "$LOG_PATH" || true
+  echo | tee -a "$LOG_PATH"
 
   sleep "$TICK_SECONDS"
 done
