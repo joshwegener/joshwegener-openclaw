@@ -17,6 +17,21 @@ PATCH_PATH="${4:-}"
 LOG_PATH="${5:-/Users/joshwegener/clawd/memory/review-logs/review-task-${TASK_ID}.log}"
 REVIEW_REVISION="${6:-}"
 
+# Defensively strip accidental wrapping quotes if the caller already shell-escaped args.
+# (We want actual filesystem paths, not strings that begin/end with a literal quote.)
+for v in REPO_PATH PATCH_PATH LOG_PATH; do
+  val="${!v}"
+  if [[ "$val" == \"*\" && "$val" == *\" ]]; then
+    val="${val#\"}"
+    val="${val%\"}"
+  fi
+  if [[ "$val" == \'*\' && "$val" == *\' ]]; then
+    val="${val#\'}"
+    val="${val%\'}"
+  fi
+  printf -v "$v" '%s' "$val"
+done
+
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
 TMUX_WINDOW="review-${TASK_ID}"
 
@@ -105,7 +120,7 @@ fi
 PID=\$!
 echo "\$PID" >"\$PID_PATH"
 wait "\$PID" || true
-echo \"[review \$TASK_ID] done\" >>\"\$LOG_PATH\" 2>&1 || true
+echo "[review \$TASK_ID] done" >>"\$LOG_PATH" 2>&1 || true
 
 exec bash
 EOF
