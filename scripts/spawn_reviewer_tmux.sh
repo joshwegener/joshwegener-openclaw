@@ -102,6 +102,10 @@ if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   tmux new-session -d -s "$TMUX_SESSION" -n orchestrator "bash"
 fi
 
+# Prevent stale PID reads before the new tmux window has a chance to overwrite it.
+rm -f "$PID_PATH" 2>/dev/null || true
+start_epoch="$(date +%s)"
+
 # Deduplicate by name (tmux allows duplicate window names).
 tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \
   | awk -F: -v n="$TMUX_WINDOW" '$2 == n { print $1 }' \
@@ -115,8 +119,11 @@ tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" "$RUN_PATH"
 pid=""
 for _ in $(seq 1 50); do
   if [[ -f "$PID_PATH" ]]; then
-    pid="$(cat "$PID_PATH" 2>/dev/null || true)"
-    break
+    mtime="$(stat -f %m "$PID_PATH" 2>/dev/null || echo 0)"
+    if [[ "$mtime" =~ ^[0-9]+$ ]] && (( mtime >= start_epoch )); then
+      pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+      break
+    fi
   fi
   sleep 0.05
 done
