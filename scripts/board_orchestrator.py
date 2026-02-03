@@ -646,9 +646,13 @@ def parse_repo_hint_with_source(
         if m:
             return m.group(1).strip(), "description"
     if allow_title_prefix and title:
-        m = re.match(r"^\s*([A-Za-z0-9_-]+)\s*:\s*", title)
+        # Accept multi-segment prefixes like "Web/Playground:" by taking the
+        # first segment as the repo hint.
+        m = re.match(r"^\s*([A-Za-z0-9_/-]+)\s*:\s*", title)
         if m:
-            return m.group(1).strip(), "title"
+            raw = m.group(1).strip()
+            hint = raw.split("/", 1)[0].strip()
+            return hint, "title"
     return None, None
 
 
