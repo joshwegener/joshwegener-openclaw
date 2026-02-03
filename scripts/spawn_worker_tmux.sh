@@ -197,11 +197,19 @@ nohup "$CODEX_BIN" exec \
 
 PID=$!
 echo "$PID" >"$PID_PATH"
+# Stream logs to the tmux pane so the window isn't "empty".
+tail -n 0 -f "$LOG_PATH" &
+TAIL_PID=$!
 wait "$PID" || true
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
 echo "[worker $TASK_ID] done" >>"$LOG_PATH" 2>&1 || true
 
-# Keep the tmux window open for inspection.
-exec bash
+# Close by default; keep open only when requested.
+if [[ "${CLAWD_KEEP_WORKER_WINDOW_OPEN:-0}" == "1" ]]; then
+  exec bash
+fi
+exit 0
 EOF
 
 chmod +x "$RUN_PATH"
