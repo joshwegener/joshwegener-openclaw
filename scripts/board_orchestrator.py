@@ -126,7 +126,8 @@ REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TA
 REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
 # Cron tick safety: reviewer spawns should return quickly (reviewer runs in the background).
 REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "2"))
-REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "85"))
+# "90+" means >= 91 (strictly higher than 90).
+REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "91"))
 REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
     "0",
     "false",
@@ -1682,6 +1683,9 @@ def is_held(tags: List[str]) -> bool:
         return True
     if any(t.startswith("paused:") for t in lower):
         return True
+    # Treat "blocked:*" tags as non-actionable until manually cleared or auto-healed.
+    if any(t.startswith("blocked:") for t in lower):
+        return True
     return False
 
 
@@ -2099,6 +2103,28 @@ def main() -> int:
                     set_task_tags(pid, task_id, new_tags)
             except Exception:
                 pass
+
+        def clear_paused_tags(task_id: int) -> None:
+            """Remove paused tags that prevent automation from advancing cards.
+
+            We treat any of:
+            - paused
+            - paused:*
+            as "runtime holds" rather than durable metadata.
+            """
+            try:
+                existing = get_task_tags(task_id)
+            except Exception:
+                return
+            if not existing:
+                return
+            new_tags = [t for t in existing if not (t.strip().lower() == TAG_PAUSED or t.strip().lower().startswith("paused:"))]
+            # Kanboard expects the full tag list on set; only write when changed.
+            if new_tags != existing:
+                try:
+                    set_task_tags(pid, task_id, new_tags)
+                except Exception:
+                    pass
 
         def add_comment(task_id: int, comment: str) -> None:
             if not comment:
@@ -2539,6 +2565,32 @@ def main() -> int:
                     pass
             return True
 
+        def tag_blocked_and_keep_in_backlog(
+            task_id: int,
+            sl_id: int,
+            title: str,
+            reason: str,
+            reason_tag: str,
+            *,
+            from_label: str,
+        ) -> None:
+            """Backlog+tag policy for non-actionable cards.
+
+            We avoid filling the Blocked column with "missing repo"/deps/exclusive.
+            Instead we keep the card in Backlog and attach a durable tag so a human
+            can fix/triage without automation thrashing.
+            """
+            record_action(task_id)
+            tags_to_add = [reason_tag]
+            if reason_tag == TAG_BLOCKED_REPO:
+                tags_to_add.append(TAG_NO_REPO)
+            add_tags(task_id, tags_to_add)
+            try:
+                move_task(pid, task_id, int(col_backlog["id"]), 1, int(sl_id))
+            except Exception:
+                pass
+            actions.append(f"Kept {from_label} #{task_id} ({title}) in Backlog; tagged {reason_tag}: {reason}")
+
         def record_repo(task_id: int, repo_key: Optional[str], repo_path: Optional[str], source: Optional[str]) -> None:
             if not repo_key or not repo_path:
                 return
@@ -2630,6 +2682,67 @@ def main() -> int:
 
         budget = ACTION_BUDGET
 
+        # If a worker finished and produced artifacts but the card was moved to Blocked
+        # (e.g. missing-worker/thrash), promote it to Review so the pipeline can continue.
+        completed_blocked_ids: List[int] = []
+        if budget > 0 and blocked_tasks:
+            for bt, bsl_id in sorted(blocked_tasks, key=sort_key):
+                if budget <= 0:
+                    break
+                bid = int(bt.get("id"))
+                btitle = task_title(bt)
+                try:
+                    btags = get_task_tags(bid)
+                except Exception:
+                    btags = []
+
+                lower = {t.lower() for t in (btags or [])}
+                if not (
+                    TAG_PAUSED_MISSING_WORKER in lower
+                    or THRASH_PAUSE_TAG in lower
+                    or TAG_PAUSED_STALE_WORKER in lower
+                ):
+                    continue
+
+                completion = detect_worker_completion(
+                    bid,
+                    default_worker_log_path(bid),
+                    patch_path=default_worker_patch_path(bid),
+                    comment_path=default_worker_comment_path(bid),
+                    started_at_ms=None,
+                )
+                if not completion:
+                    continue
+
+                if dry_run:
+                    actions.append(f"Would move Blocked #{bid} ({btitle}) -> Review (worker output complete)")
+                else:
+                    move_task(pid, bid, int(col_review["id"]), 1, int(bsl_id))
+                    record_action(bid)
+                    remove_tags(
+                        bid,
+                        [
+                            TAG_REVIEW_PASS,
+                            TAG_REVIEW_REWORK,
+                            TAG_REVIEW_BLOCKED_WIP,
+                            TAG_REVIEW_ERROR,
+                            TAG_REVIEW_INFLIGHT,
+                        ],
+                    )
+                    add_tags(bid, [TAG_REVIEW_AUTO, TAG_REVIEW_PENDING])
+                    clear_paused_tags(bid)
+                    if WORKER_LEASES_ENABLED:
+                        try:
+                            lease = load_lease(bid)
+                            if lease:
+                                archive_lease_dir(bid, lease.get("leaseId"))
+                        except Exception:
+                            pass
+                    actions.append(f"Moved Blocked #{bid} ({btitle}) -> Review (worker output complete)")
+
+                completed_blocked_ids.append(bid)
+                budget -= 1
+
         # Auto-advance WIP tasks when a worker log shows completed output.
         completed_wip_ids: List[int] = []
         if budget > 0 and wip_tasks:
@@ -2638,21 +2751,20 @@ def main() -> int:
                     break
                 wid = int(wt.get("id"))
                 wtitle = task_title(wt)
-                entry = worker_entry_for(wid, workers_by_task)
-                if not entry:
-                    continue
                 log_path = None
-                if isinstance(entry, dict):
-                    log_path = entry.get("logPath")
-                if not log_path:
-                    log_path = default_worker_log_path(wid)
                 patch_path = None
                 comment_path = None
                 started_at_ms = None
+                entry = worker_entry_for(wid, workers_by_task)
                 if isinstance(entry, dict):
+                    log_path = entry.get("logPath")
                     patch_path = entry.get("patchPath")
                     comment_path = entry.get("commentPath")
                     started_at_ms = entry.get("startedAtMs")
+                if not log_path:
+                    # Important: even if the lease/handle bookkeeping is missing,
+                    # still attempt completion detection via artifacts.
+                    log_path = default_worker_log_path(wid)
                 completion = detect_worker_completion(
                     wid,
                     log_path,
@@ -2679,6 +2791,7 @@ def main() -> int:
                         ],
                     )
                     add_tags(wid, [TAG_REVIEW_AUTO, TAG_REVIEW_PENDING])
+                    clear_paused_tags(wid)
                     if isinstance(entry, dict):
                         entry["completedAtMs"] = now_ms()
                         if completion.get("patchPath"):
@@ -2918,6 +3031,14 @@ def main() -> int:
                     )
                     add_tag(rid, TAG_REVIEW_PENDING)
 
+            # If the reviewer is broken (auth/quota) we mark review:error and only retry
+            # when a human explicitly asks (review:rerun) to avoid infinite loops.
+            if has_tag(rtags, TAG_REVIEW_ERROR) and not rerun_requested and not stored_result:
+                # ensure we don't leave it stuck "inflight"
+                if not dry_run:
+                    remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+                continue
+
             if not worker_handle(entry) and not stored_result:
                 if dry_run:
                     actions.append(f"Would spawn reviewer for Review #{rid} ({rtitle})")
@@ -3028,11 +3149,39 @@ def main() -> int:
                 if REVIEW_FAIL_ON_CRITICAL_ITEMS and critical_items:
                     needs_rework = True
 
+                # If the reviewer itself is broken (auth/quota), don't thrash the card back into WIP.
+                # Keep it in Review with review:error so a human can fix the reviewer environment.
+                manual_review_blocker = False
+                if verdict == "BLOCKER":
+                    notes = str(result_payload.get("notes") or "")
+                    blob = (notes + "\n" + "\n".join([str(x) for x in critical_items])).lower()
+                    if any(
+                        needle in blob
+                        for needle in (
+                            "invalid api key",
+                            "please run /login",
+                            "unauthorized",
+                            "forbidden",
+                            "authentication",
+                            "quota",
+                            "rate limit",
+                        )
+                    ):
+                        manual_review_blocker = True
+
                 # Clear inflight/pending once we have a result.
                 if dry_run:
                     actions.append(f"Would clear review:inflight/review:pending for Review #{rid} ({rtitle})")
                 else:
                     remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+
+                if manual_review_blocker:
+                    if dry_run:
+                        actions.append(f"Would tag Review #{rid} ({rtitle}) as review:error (reviewer auth/quota)")
+                    else:
+                        add_tag(rid, TAG_REVIEW_ERROR)
+                        remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP])
+                    continue
 
                 if needs_rework:
                     if dry_run:
@@ -3257,18 +3406,17 @@ def main() -> int:
                     if not repo_ok:
                         if dry_run:
                             actions.append(
-                                f"Would move critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping"
+                                f"Would keep critical #{cid} ({ctitle}) in Backlog; tag {TAG_BLOCKED_REPO}: No repo mapping"
                             )
                         else:
-                            move_task(pid, cid, int(col_blocked["id"]), 1, int(csl_id))
-                            record_action(cid)
-                            add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_REPO])
-                            auto_blocked[str(cid)] = {
-                                "reason": "repo",
-                                "blockedAtMs": now_ms(),
-                                "from": "critical",
-                            }
-                            actions.append(f"Moved critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
+                            tag_blocked_and_keep_in_backlog(
+                                cid,
+                                int(csl_id),
+                                ctitle,
+                                "No repo mapping",
+                                TAG_BLOCKED_REPO,
+                                from_label="critical",
+                            )
                         budget -= 1
                     else:
                         critical_wip_exclusive_keys: set[str] = set()
@@ -3548,18 +3696,18 @@ def main() -> int:
                         reason_tag = TAG_BLOCKED_EXCLUSIVE
 
                     if dry_run:
-                        actions.append(f"Would move Backlog #{bid} ({btitle}) -> Blocked (auto): {reason}")
+                        actions.append(
+                            f"Would keep Backlog #{bid} ({btitle}) in Backlog; tag {reason_tag}: {reason}"
+                        )
                     else:
-                        move_task(pid, bid, int(col_blocked["id"]), 1, bsl_id)
-                        record_action(bid)
-                        add_tags(bid, [TAG_AUTO_BLOCKED, reason_tag])
-                        auto_blocked[str(bid)] = {
-                            "reason": reason_tag,
-                            "detail": reason,
-                            "blockedAtMs": now_ms(),
-                            "fromColumn": COL_BACKLOG,
-                        }
-                        actions.append(f"Moved Backlog #{bid} ({btitle}) -> Blocked (auto): {reason}")
+                        tag_blocked_and_keep_in_backlog(
+                            bid,
+                            int(bsl_id),
+                            btitle,
+                            reason,
+                            reason_tag,
+                            from_label="Backlog",
+                        )
                     budget -= 1
                     did_something = True
                     # simulate state / refresh sorted lists next loop
@@ -3640,7 +3788,7 @@ def main() -> int:
                 if unmet:
                     if not cooled(cid):
                         actions.append(
-                            f"Skipped Ready #{cid} ({ctitle}) -> Blocked due to cooldown; leaving in Ready"
+                            f"Skipped Ready #{cid} ({ctitle}) -> Backlog due to cooldown; leaving in Ready"
                         )
                         ready_tasks_sorted = ready_tasks_sorted[1:] + [(candidate, sl_id)]
                         budget -= 1
@@ -3648,18 +3796,16 @@ def main() -> int:
                         continue
                     reason = "Depends on " + ", ".join("#" + str(x) for x in unmet)
                     if dry_run:
-                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): {reason}")
+                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Backlog; tag {TAG_BLOCKED_DEPS}: {reason}")
                     else:
-                        move_task(pid, cid, int(col_blocked["id"]), 1, sl_id)
-                        record_action(cid)
-                        add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS])
-                        auto_blocked[str(cid)] = {
-                            "reason": TAG_BLOCKED_DEPS,
-                            "detail": reason,
-                            "blockedAtMs": now_ms(),
-                            "fromColumn": COL_READY,
-                        }
-                        actions.append(f"Moved Ready #{cid} ({ctitle}) -> Blocked (auto): {reason}")
+                        tag_blocked_and_keep_in_backlog(
+                            cid,
+                            int(sl_id),
+                            ctitle,
+                            reason,
+                            TAG_BLOCKED_DEPS,
+                            from_label="Ready",
+                        )
                     budget -= 1
                     did_something = True
                     # simulate / refresh lists
@@ -3682,25 +3828,23 @@ def main() -> int:
                 if not repo_ok:
                     if not cooled(cid):
                         actions.append(
-                            f"Skipped Ready #{cid} ({ctitle}) -> Blocked due to cooldown; leaving in Ready"
+                            f"Skipped Ready #{cid} ({ctitle}) -> Backlog due to cooldown; leaving in Ready"
                         )
                         ready_tasks_sorted = ready_tasks_sorted[1:] + [(candidate, sl_id)]
                         budget -= 1
                         did_something = True
                         continue
                     if dry_run:
-                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
+                        actions.append(f"Would move Ready #{cid} ({ctitle}) -> Backlog; tag {TAG_BLOCKED_REPO}: No repo mapping")
                     else:
-                        move_task(pid, cid, int(col_blocked["id"]), 1, sl_id)
-                        record_action(cid)
-                        add_tags(cid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_REPO])
-                        auto_blocked[str(cid)] = {
-                            "reason": TAG_BLOCKED_REPO,
-                            "detail": "No repo mapping",
-                            "blockedAtMs": now_ms(),
-                            "fromColumn": COL_READY,
-                        }
-                        actions.append(f"Moved Ready #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
+                        tag_blocked_and_keep_in_backlog(
+                            cid,
+                            int(sl_id),
+                            ctitle,
+                            "No repo mapping",
+                            TAG_BLOCKED_REPO,
+                            from_label="Ready",
+                        )
                     budget -= 1
                     did_something = True
                     ready_tasks_sorted = ready_tasks_sorted[1:]
