@@ -65,6 +65,7 @@ TAG_CRITICAL = "critical"
 TAG_PAUSED = "paused"  # generic/manual pause
 TAG_PAUSED_CRITICAL = "paused:critical"
 TAG_PAUSED_MISSING_WORKER = "paused:missing-worker"
+TAG_PAUSED_STALE_WORKER = "paused:stale-worker"
 TAG_PAUSED_DEPS = "paused:deps"
 TAG_PAUSED_EXCLUSIVE = "paused:exclusive"
 TAG_AUTO_BLOCKED = "auto-blocked"
@@ -99,7 +100,8 @@ REPO_MAP_PATH = os.environ.get("BOARD_ORCHESTRATOR_REPO_MAP", "")
 WORKER_LOG_DIR = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_DIR", "/Users/joshwegener/clawd/memory/worker-logs")
 WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_BYTES", "20000"))
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
-WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "60"))
+# Cron tick safety: spawning a worker should return quickly (worker runs in the background).
+WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "2"))
 WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "1").strip().lower() not in (
     "0",
     "false",
@@ -109,6 +111,7 @@ WORKER_LEASE_ROOT = os.environ.get("RECALLDECK_WORKER_LEASE_ROOT", "/tmp/recalld
 WORKER_LEASE_ARCHIVE_TTL_HOURS = int(os.environ.get("RECALLDECK_WORKER_LEASE_ARCHIVE_TTL_HOURS", "72"))
 LEASE_STALE_GRACE_MS = int(os.environ.get("RECALLDECK_WORKER_LEASE_GRACE_MS", "2000"))
 WORKER_LOG_STALE_MS = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_STALE_MS", "0"))
+WORKER_LOG_STALE_ACTION = os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_STALE_ACTION", "pause").strip().lower()
 THRASH_WINDOW_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_WINDOW_MIN", "30"))
 THRASH_MAX_RESPAWNS = int(os.environ.get("BOARD_ORCHESTRATOR_THRASH_MAX_RESPAWNS", "3"))
 THRASH_PAUSE_TAG = os.environ.get("BOARD_ORCHESTRATOR_THRASH_PAUSE_TAG", "paused:thrash")
@@ -118,7 +121,8 @@ REVIEWER_LOG_DIR = os.environ.get(
 )
 REVIEWER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_LOG_TAIL_BYTES", "20000"))
 REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
-REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "60"))
+# Cron tick safety: reviewer spawns should return quickly (reviewer runs in the background).
+REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "2"))
 REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "85"))
 REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
     "0",
@@ -1727,6 +1731,7 @@ def main() -> int:
         review_ids = {int(t.get("id")) for t, _sl in review_tasks}
         lease_warnings: List[str] = []
         lease_pending_ids: set[int] = set()
+        stale_worker_ids: set[int] = set()
 
         # Prefer leases as the canonical source for active workers.
         if WORKER_LEASES_ENABLED and wip_tasks:
@@ -1744,6 +1749,8 @@ def main() -> int:
                         if verdict == "unknown":
                             if note == LEASE_PENDING_NOTE:
                                 lease_pending_ids.add(tid)
+                            elif (note or "").startswith("worker log") and WORKER_LOG_STALE_ACTION == "pause":
+                                stale_worker_ids.add(tid)
                             else:
                                 lease_warnings.append(
                                     f"manual-fix: WIP #{tid} worker liveness unknown ({note or 'unknown'})."
@@ -1824,8 +1831,44 @@ def main() -> int:
             sort_key,
         )
         queued_critical_ids = {int(t.get("id")) for t, _sl_id, _col_id in queued_critical}
+        active_critical_id: Optional[int] = None
+        active_critical_col_id: Optional[int] = None
+        critical_exclusive = False  # True only when a critical card is actively in WIP.
+        if active_critical is not None:
+            try:
+                active_critical_id = int(active_critical[0].get("id") or 0)
+            except Exception:
+                active_critical_id = None
+            try:
+                active_critical_col_id = int(active_critical[2])
+            except Exception:
+                active_critical_col_id = None
+            if active_critical_col_id is not None:
+                critical_exclusive = active_critical_col_id == int(col_wip["id"])
 
         wip_count = len(wip_tasks)
+        wip_active_count_cache: Optional[int] = None
+
+        def wip_active_count() -> int:
+            nonlocal wip_active_count_cache
+            if wip_active_count_cache is not None:
+                return wip_active_count_cache
+            cnt = 0
+            for wt, _wsl in wip_tasks:
+                tid = int(wt.get("id"))
+                try:
+                    tags = get_task_tags(tid)
+                except Exception:
+                    tags = []
+                if not is_held(tags):
+                    cnt += 1
+            wip_active_count_cache = cnt
+            return cnt
+
+        def invalidate_wip_active_count() -> None:
+            nonlocal wip_active_count_cache
+            wip_active_count_cache = None
+
         actions: List[str] = []
         promoted_to_ready: List[int] = []
         moved_to_wip: List[int] = []
@@ -2535,6 +2578,8 @@ def main() -> int:
             missing_worker_tasks = [
                 (t, sl_id) for t, sl_id in missing_worker_tasks if int(t.get("id")) not in completed_wip_ids
             ]
+            stale_worker_ids.difference_update(set(completed_wip_ids))
+            invalidate_wip_active_count()
 
         # Reconcile WIP tasks missing worker handles: spawn or pause deterministically.
         paused_missing_worker_ids: List[int] = []
@@ -2583,6 +2628,8 @@ def main() -> int:
                     break
 
         # NOTE: pause is tag-based; tasks remain in WIP, so do not remove from wip_tasks/wip_count.
+        if paused_missing_worker_ids:
+            invalidate_wip_active_count()
 
         if missing_worker_tasks and budget <= 0:
             remaining = []
@@ -2598,13 +2645,45 @@ def main() -> int:
                 tail_ids = ", ".join("#" + str(x) for x in sorted(remaining)[:5])
                 errors.append(f"drift: WIP tasks missing worker handle (action budget exhausted): {tail_ids}")
 
+        # Watchdog: if a WIP worker pid is alive but its log has been stale for too long, pause the card
+        # to prevent WIP deadlocks. (We avoid auto-respawning when the pid is alive to prevent duplicate workers.)
+        paused_stale_worker_ids: List[int] = []
+        if budget > 0 and stale_worker_ids and WORKER_LOG_STALE_ACTION == "pause":
+            wip_by_id = {int(t.get("id")): (t, sl_id) for t, sl_id in wip_tasks}
+            for wid in sorted(stale_worker_ids):
+                if budget <= 0:
+                    break
+                if wid not in wip_by_id:
+                    continue
+                wt, _wsl_id = wip_by_id[wid]
+                wtitle = task_title(wt)
+                try:
+                    wtags = get_task_tags(wid)
+                except Exception:
+                    wtags = []
+                if has_tag(wtags, TAG_PAUSED_STALE_WORKER):
+                    continue
+                if dry_run:
+                    actions.append(f"Would tag WIP #{wid} ({wtitle}) as paused:stale-worker (worker log stale)")
+                else:
+                    record_action(wid)
+                    add_tags(wid, [TAG_PAUSED, TAG_PAUSED_STALE_WORKER])
+                    actions.append(f"Tagged WIP #{wid} ({wtitle}) as paused:stale-worker (worker log stale)")
+                paused_stale_worker_ids.append(wid)
+                budget -= 1
+        if paused_stale_worker_ids:
+            invalidate_wip_active_count()
+        if stale_worker_ids and budget <= 0 and not paused_stale_worker_ids:
+            tail_ids = ", ".join("#" + str(x) for x in sorted(stale_worker_ids)[:5])
+            errors.append(f"watchdog: WIP worker log stale (action budget exhausted): {tail_ids}")
+
         # ---------------------------------------------------------------------
         # CRITICAL MODE (preemptive)
         # ---------------------------------------------------------------------
         # If any non-Done task is tagged `critical`, it takes absolute priority.
-        # While critical is active (WIP or Review or anywhere not Done), pause all
-        # non-critical WIP tasks into `Paused` and do not pull/start any non-critical
-        # work. Critical is not "done" until it reaches Done.
+        # While a critical is actively in WIP, pause all non-critical WIP work and do not
+        # pull/start other work. Once the critical reaches Review (waiting on human),
+        # resume normal throughput so the pipeline can't deadlock on a single critical card.
         #
         # Note: We still respect dependencies/exclusive constraints; if the critical
         # task cannot start, we do NOT pause everything (avoids deadlock) and we
@@ -2870,7 +2949,7 @@ def main() -> int:
                 except Exception:
                     rtags = []
                 is_critical_review = is_critical(rtags)
-                if wip_count >= WIP_LIMIT and not is_critical_review:
+                if wip_active_count() >= WIP_LIMIT and not is_critical_review:
                     # Can't move yet; mark it so we keep prioritizing it.
                     if not has_tag(rtags, TAG_REVIEW_BLOCKED_WIP):
                         if dry_run:
@@ -2879,9 +2958,8 @@ def main() -> int:
                             add_tag(rid, TAG_REVIEW_BLOCKED_WIP)
                     continue
 
-                if active_critical is not None:
-                    active_id = int(active_critical[0].get("id") or 0)
-                    if rid != active_id:
+                if critical_exclusive and active_critical_id is not None:
+                    if rid != int(active_critical_id):
                         continue
                 rtitle = task_title(rt)
                 if is_held(rtags):
@@ -2897,15 +2975,17 @@ def main() -> int:
                     actions.append(f"Moved Review #{rid} ({rtitle}) -> WIP (rework)")
                 wip_tasks.append((rt, rsl_id))
                 wip_count += 1
+                invalidate_wip_active_count()
                 review_results_by_task.pop(str(rid), None)
                 reviewers_by_task.pop(str(rid), None)
                 budget -= 1
 
-        # Resume paused tasks only when NO critical tasks remain.
+        # Resume tasks paused by a prior critical whenever no critical is actively in WIP.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
 
-        if active_critical is None and paused_by_critical:
+        if (not critical_exclusive) and paused_by_critical:
             budget = max(budget, ACTION_BUDGET_CRITICAL)
+            cleared_any = False
 
             # Clear paused:critical tags when no critical remains.
             def paused_reason_tags(tags: list[str]) -> set[str]:
@@ -2943,34 +3023,20 @@ def main() -> int:
                     record_action(tid)
                     actions.append(f'Cleared paused:critical for #{tid} (critical cleared)')
                     paused_by_critical.pop(str(tid), None)
+                    cleared_any = True
                 budget -= 1
+            if cleared_any:
+                invalidate_wip_active_count()
 
             if not dry_run:
-                state['pausedByCritical'] = paused_by_critical
-                state['lastActionsByTaskId'] = last_actions
-                state['repoByTaskId'] = repo_by_task
-                state['workersByTaskId'] = workers_by_task
-                state['autoBlockedByOrchestrator'] = auto_blocked
-                state['reviewersByTaskId'] = reviewers_by_task
-                state['reviewResultsByTaskId'] = review_results_by_task
-                save_state(state)
-
-            emit_json(
-                mode=mode,
-                actions=actions,
-                promoted_to_ready=promoted_to_ready,
-                moved_to_wip=moved_to_wip,
-                created_tasks=created_tasks,
-                errors=errors,
-            )
-            return 0
+                state["pausedByCritical"] = paused_by_critical
         if active_critical is not None:
             ct, csl_id, c_col_id = active_critical
             cid = int(ct.get("id"))
             ctitle = task_title(ct)
 
-            # Critical stays active through Review; nothing else should run until it reaches Done.
-            critical_in_progress = c_col_id in (int(col_wip["id"]), int(col_review["id"]))
+            critical_in_wip = int(c_col_id) == int(col_wip["id"])
+            critical_in_review = int(c_col_id) == int(col_review["id"])
 
             def pause_noncritical_wip() -> None:
                 nonlocal budget
@@ -3014,7 +3080,9 @@ def main() -> int:
 
                 state['pausedByCritical'] = paused_state
 
-            if critical_in_progress:
+            if critical_in_wip:
+                # Only a critical actively in WIP is exclusive.
+                critical_exclusive = True
                 budget = max(budget, ACTION_BUDGET_CRITICAL)
                 entry = worker_entry_for(cid, workers_by_task)
                 if not worker_handle(entry):
@@ -3048,6 +3116,10 @@ def main() -> int:
                             budget -= 1
                 pause_noncritical_wip()
 
+            elif critical_in_review:
+                # Critical in Review is waiting on human attention; keep throughput flowing.
+                pass
+
             else:
                 full = get_task(cid)
                 desc = (full.get("description") or "")
@@ -3077,8 +3149,6 @@ def main() -> int:
                             actions.append(f"Moved critical #{cid} ({ctitle}) -> Blocked (auto): No repo mapping")
                         budget -= 1
                     else:
-                        pause_noncritical_wip()
-
                         critical_wip_exclusive_keys: set[str] = set()
                         for wt, _wsl in wip_tasks:
                             wid = int(wt.get("id"))
@@ -3112,15 +3182,20 @@ def main() -> int:
                                     )
                                 else:
                                     actions.append(f"Would spawn worker for critical #{cid} ({ctitle})")
+                                    actions.append(
+                                        f"Would tag non-critical WIP as paused:critical (for critical #{cid})"
+                                    )
                                     actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                             else:
                                 if ensure_worker_handle_for_task(cid, repo_key, repo_path):
                                     entry = worker_entry_for(cid, workers_by_task)
                                     if worker_handle(entry):
+                                        pause_noncritical_wip()
                                         move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
                                         record_action(cid)
                                         moved_to_wip.append(cid)
                                         actions.append(f"Started critical #{cid} ({ctitle}) -> WIP")
+                                        critical_exclusive = True
                                     else:
                                         pause_missing_worker(
                                             cid,
@@ -3141,32 +3216,34 @@ def main() -> int:
                                     )
                             budget -= 1
 
-            # While critical exists anywhere not Done, freeze normal pulling.
-            state["lastActionsByTaskId"] = last_actions
-            state["repoByTaskId"] = repo_by_task
-            state["workersByTaskId"] = workers_by_task
-            state["autoBlockedByOrchestrator"] = auto_blocked
-            state["reviewersByTaskId"] = reviewers_by_task
-            state["reviewResultsByTaskId"] = review_results_by_task
-            save_state(state)
+            # While a critical is actively in WIP, freeze normal pulling.
+            if critical_exclusive:
+                state["lastActionsByTaskId"] = last_actions
+                state["repoByTaskId"] = repo_by_task
+                state["workersByTaskId"] = workers_by_task
+                state["autoBlockedByOrchestrator"] = auto_blocked
+                state["reviewersByTaskId"] = reviewers_by_task
+                state["reviewResultsByTaskId"] = review_results_by_task
+                save_state(state)
 
-            emit_json(
-                mode=mode,
-                actions=actions,
-                promoted_to_ready=promoted_to_ready,
-                moved_to_wip=moved_to_wip,
-                created_tasks=created_tasks,
-                errors=errors,
-            )
-            return 0
+                emit_json(
+                    mode=mode,
+                    actions=actions,
+                    promoted_to_ready=promoted_to_ready,
+                    moved_to_wip=moved_to_wip,
+                    created_tasks=created_tasks,
+                    errors=errors,
+                )
+                return 0
 
         # ---------------------------------------------------------------------
         # NORMAL MODE
         # ---------------------------------------------------------------------
 
-        # If WIP > limit, don't pull new work (MVP)
-        if wip_count > WIP_LIMIT:
-            actions.append(f"WIP is {wip_count} (> {WIP_LIMIT}); not pulling new work")
+        # If active WIP > limit, don't pull new work (paused/held WIP does not consume capacity).
+        active_wip = wip_active_count()
+        if active_wip > WIP_LIMIT:
+            actions.append(f"WIP active is {active_wip} (> {WIP_LIMIT}); not pulling new work")
             state["lastActionsByTaskId"] = last_actions
             state["repoByTaskId"] = repo_by_task
             state["workersByTaskId"] = workers_by_task
@@ -3211,6 +3288,8 @@ def main() -> int:
             for wt, _wsl in wip_tasks:
                 wid = int(wt.get('id'))
                 wtags = get_task_tags(wid)
+                if is_held(wtags):
+                    continue
                 wdesc = (get_task(wid).get('description') or '')
                 for k in parse_exclusive_keys(wtags, wdesc):
                     wip_exclusive_keys.add(k)
@@ -3417,7 +3496,7 @@ def main() -> int:
                         did_something = True
 
             # 2) If WIP has capacity and Ready has items, move Ready -> WIP.
-            if budget > 0 and wip_count < WIP_LIMIT and ready_tasks_sorted:
+            if budget > 0 and wip_active_count() < WIP_LIMIT and ready_tasks_sorted:
                 candidate, sl_id = ready_tasks_sorted[0]
                 cid = int(candidate.get("id"))
                 tags = get_task_tags(cid)
@@ -3515,7 +3594,9 @@ def main() -> int:
                 # simulate state
                 ready_tasks_sorted = ready_tasks_sorted[1:]
                 if started:
+                    wip_tasks.append((candidate, sl_id))
                     wip_count += 1
+                    invalidate_wip_active_count()
                     for k in ex_keys:
                         wip_exclusive_keys.add(k)
                 budget -= 1
