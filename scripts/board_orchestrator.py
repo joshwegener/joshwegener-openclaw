@@ -3070,7 +3070,26 @@ def main() -> int:
                     remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
                 continue
 
-            if not worker_handle(entry) and not stored_result:
+            result_payload: Optional[Dict[str, Any]] = None
+            if stored_result:
+                result_payload = stored_result
+            else:
+                log_path = None
+                entry = worker_entry_for(rid, reviewers_by_task)
+                if isinstance(entry, dict):
+                    log_path = entry.get("logPath")
+                if not log_path:
+                    log_path = default_reviewer_log_path(rid)
+                result_payload = detect_review_result(rid, log_path)
+                if result_payload:
+                    result_revision = extract_review_revision(result_payload)
+                    if not result_revision:
+                        result_revision = extract_review_revision(entry)
+                    if not review_revision_matches(current_revision, result_revision):
+                        result_payload = None
+
+            # Only spawn if we don't already have a usable result in the log.
+            if not result_payload and not worker_handle(entry) and not stored_result:
                 if dry_run:
                     actions.append(f"Would spawn reviewer for Review #{rid} ({rtitle})")
                 else:
@@ -3089,24 +3108,6 @@ def main() -> int:
                     if ensure_reviewer_handle_for_task(rid, repo_key, repo_path, patch_path, current_revision):
                         add_tag(rid, TAG_REVIEW_INFLIGHT)
                         actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
-
-            result_payload: Optional[Dict[str, Any]] = None
-            if stored_result:
-                result_payload = stored_result
-            else:
-                log_path = None
-                entry = worker_entry_for(rid, reviewers_by_task)
-                if isinstance(entry, dict):
-                    log_path = entry.get("logPath")
-                if not log_path:
-                    log_path = default_reviewer_log_path(rid)
-                result_payload = detect_review_result(rid, log_path)
-                if result_payload:
-                    result_revision = extract_review_revision(result_payload)
-                    if not result_revision:
-                        result_revision = extract_review_revision(entry)
-                    if not review_revision_matches(current_revision, result_revision):
-                        result_payload = None
 
             if result_payload and not stored_result:
                 score = int(result_payload.get("score") or 0)
