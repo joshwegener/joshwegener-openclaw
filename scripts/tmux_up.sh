@@ -40,7 +40,11 @@ ensure_window_cmd() {
     # Replace whatever is running in the first matching window.
     local target="${TMUX_SESSION}:${name}"
     if [[ "${#ids[@]}" -ge 1 ]]; then
-      target="${ids[0]}.0"
+      # Pane indices can be non-zero (user config). Target by pane_id.
+      pane_id="$(tmux list-panes -t "${ids[0]}" -F '#{pane_id}' 2>/dev/null | head -n 1 || true)"
+      if [[ -n "$pane_id" ]]; then
+        target="$pane_id"
+      fi
     fi
     tmux respawn-pane -k -t "$target" "bash -lc $(printf %q "$cmd")"
   else
