@@ -18,13 +18,31 @@ window_exists() {
   tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | rg -q "^${name}$"
 }
 
+window_ids_by_name() {
+  local name="$1"
+  tmux list-windows -t "$TMUX_SESSION" -F '#{window_id}\t#{window_name}' 2>/dev/null \
+    | awk -F'\t' -v n="$name" '$2 == n { print $1 }'
+}
+
 ensure_window_cmd() {
   local name="$1"
   local cmd="$2"
 
   if window_exists "$name"; then
-    # Replace whatever is running in the active pane (pane index may not be 0).
-    tmux respawn-pane -k -t "${TMUX_SESSION}:${name}" "bash -lc $(printf %q "$cmd")"
+    # If duplicates exist (shouldn't), keep the first and kill the rest.
+    mapfile -t ids < <(window_ids_by_name "$name" || true)
+    if [[ "${#ids[@]}" -gt 1 ]]; then
+      for ((i=1; i<${#ids[@]}; i++)); do
+        tmux kill-window -t "${ids[$i]}" 2>/dev/null || true
+      done
+    fi
+
+    # Replace whatever is running in the first matching window.
+    local target="${TMUX_SESSION}:${name}"
+    if [[ "${#ids[@]}" -ge 1 ]]; then
+      target="${ids[0]}.0"
+    fi
+    tmux respawn-pane -k -t "$target" "bash -lc $(printf %q "$cmd")"
   else
     tmux new-window -t "$TMUX_SESSION" -n "$name" "bash -lc $(printf %q "$cmd")"
   fi
