@@ -445,7 +445,10 @@ def rpc(method: str, params: Any = None) -> Any:
         raise RuntimeError("KANBOARD_USER/KANBOARD_TOKEN not set")
 
     if DEBUG_RPC:
-        print(f"[rpc] {method}", flush=True)
+        if method in ("moveTaskPosition", "setTaskTags"):
+            print(f"[rpc] {method} params={params!r}", flush=True)
+        else:
+            print(f"[rpc] {method}", flush=True)
 
     payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method, "id": 1}
     if params is not None:
@@ -1135,11 +1138,11 @@ def scan_orphan_leases(wip_ids: set[int]) -> List[str]:
         lease = load_lease(task_id)
         if not lease:
             continue
-        verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+        verdict, worker_pid, note = evaluate_lease_liveness(task_id, lease)
         update_lease_liveness(task_id, lease, verdict, note)
         if verdict == "alive":
             alerts.append(
-                f"manual-fix: task #{task_id} has live worker pid {pid} but is not in WIP (orphan)."
+                f"manual-fix: task #{task_id} has live worker pid {worker_pid} but is not in WIP (orphan)."
             )
     return alerts
 
@@ -1831,7 +1834,7 @@ def main() -> int:
                 tid = int(wt.get("id"))
                 lease = load_lease(tid)
                 if lease:
-                    verdict, pid, note = evaluate_lease_liveness(tid, lease)
+                    verdict, _worker_pid, note = evaluate_lease_liveness(tid, lease)
                     update_lease_liveness(tid, lease, verdict, note)
                     if verdict == "dead":
                         workers_by_task.pop(str(tid), None)
@@ -2218,7 +2221,7 @@ def main() -> int:
             lease_id = None
             if lease:
                 lease_id = lease.get("leaseId")
-                verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+                verdict, _worker_pid, note = evaluate_lease_liveness(task_id, lease)
                 update_lease_liveness(task_id, lease, verdict, note)
                 if verdict == "alive":
                     workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
@@ -2385,7 +2388,7 @@ def main() -> int:
                 # Another process owns/created the lease; read + reconcile.
                 lease = load_lease(task_id)
                 if lease:
-                    verdict, pid, note = evaluate_lease_liveness(task_id, lease)
+                    verdict, _worker_pid, note = evaluate_lease_liveness(task_id, lease)
                     update_lease_liveness(task_id, lease, verdict, note)
                     if verdict == "alive":
                         workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
