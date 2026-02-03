@@ -122,7 +122,10 @@ echo "\$PID" >"\$PID_PATH"
 wait "\$PID" || true
 echo "[review \$TASK_ID] done" >>"\$LOG_PATH" 2>&1 || true
 
-exec bash
+if [[ "${CLAWD_KEEP_REVIEWER_WINDOW_OPEN:-0}" == "1" ]]; then
+  exec bash
+fi
+exit 0
 EOF
 
 chmod +x "$RUN_PATH"
