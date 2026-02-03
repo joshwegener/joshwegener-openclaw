@@ -30,11 +30,7 @@ ensure_window_cmd() {
 
   if window_exists "$name"; then
     # If duplicates exist (shouldn't), keep the first and kill the rest.
-    ids=()
-    while IFS= read -r id; do
-      [[ -n "$id" ]] || continue
-      ids+=("$id")
-    done < <(window_ids_by_name "$name" || true)
+    ids=($(window_ids_by_name "$name" || true))
     if [[ "${#ids[@]}" -gt 1 ]]; then
       for ((i=1; i<${#ids[@]}; i++)); do
         tmux kill-window -t "${ids[$i]}" 2>/dev/null || true
