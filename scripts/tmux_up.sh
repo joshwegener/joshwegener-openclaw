@@ -23,8 +23,8 @@ ensure_window_cmd() {
   local cmd="$2"
 
   if window_exists "$name"; then
-    # Replace whatever is running in pane 0 to match the desired command.
-    tmux respawn-pane -k -t "${TMUX_SESSION}:${name}.0" "bash -lc $(printf %q "$cmd")"
+    # Replace whatever is running in the active pane (pane index may not be 0).
+    tmux respawn-pane -k -t "${TMUX_SESSION}:${name}" "bash -lc $(printf %q "$cmd")"
   else
     tmux new-window -t "$TMUX_SESSION" -n "$name" "bash -lc $(printf %q "$cmd")"
   fi
@@ -45,4 +45,3 @@ ensure_window_cmd "review-logs" "tail -n 200 -F /Users/joshwegener/clawd/memory/
 
 echo "tmux session ready: ${TMUX_SESSION}"
 echo "attach: tmux attach -t ${TMUX_SESSION}"
-
