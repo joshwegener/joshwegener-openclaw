@@ -119,7 +119,12 @@ fi
 
 PID=\$!
 echo "\$PID" >"\$PID_PATH"
+# Stream logs to the tmux pane so the window isn't "empty".
+tail -n 0 -f "\$LOG_PATH" &
+TAIL_PID=\$!
 wait "\$PID" || true
+kill "\$TAIL_PID" 2>/dev/null || true
+wait "\$TAIL_PID" 2>/dev/null || true
 echo "[review \$TASK_ID] done" >>"\$LOG_PATH" 2>&1 || true
 
 if [[ "${CLAWD_KEEP_REVIEWER_WINDOW_OPEN:-0}" == "1" ]]; then
