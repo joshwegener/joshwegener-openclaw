@@ -18,7 +18,9 @@ BASENAME="${2:?basename}"
 MAX_FILES="${3:-20}"
 TAIL_LINES="${4:-200}"
 
-files0="$(python3 - <<'PY' "$ROOT_DIR" "$BASENAME" "$MAX_FILES"
+python3 - <<'PY' "$ROOT_DIR" "$BASENAME" "$MAX_FILES" \
+  | xargs -0 -r tail -n "$TAIL_LINES" -F \
+  || { echo "No logs found under $ROOT_DIR ($BASENAME)." >&2; exec bash; }
 import os
 import sys
 
@@ -42,14 +44,9 @@ for dirpath, _dirnames, filenames in os.walk(root):
 
 matches.sort(reverse=True)
 for _mt, p in matches[:max_files]:
+    # Emit NUL-delimited paths directly to stdout. Avoid capturing NULs in bash variables
+    # (bash strings can't safely store them and will mangle the list).
     sys.stdout.write(p + "\0")
+if not matches:
+    raise SystemExit(1)
 PY
-)"
-
-if [[ -z "$files0" ]]; then
-  echo "No logs found under $ROOT_DIR ($BASENAME)." >&2
-  exec bash
-fi
-
-printf '%s' "$files0" | xargs -0 tail -n "$TAIL_LINES" -F
-
