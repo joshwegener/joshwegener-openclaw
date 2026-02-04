@@ -68,6 +68,9 @@ Swimlanes:
 
 Never override:
 - `hold` / `no-auto` / `review:skip` (the orchestrator must not move/start these)
+- Exception: `hold:queued-critical` is orchestrator-owned. If a card is fenced by `hold:queued-critical`,
+  the orchestrator may remove it when that card becomes the active critical. (Legacy cleanup: it may also remove
+  a plain `hold` tag **only** when `hold:queued-critical` is present.)
 
 Repo mapping (first match wins):
 1) Tag: `repo:<key>`
@@ -85,6 +88,8 @@ Exclusivity:
 
 Critical:
 - `critical`
+- Queuing: when multiple critical cards exist, non-active critical cards are fenced with `hold:queued-critical` so they don't start.
+- Active: the active critical is automatically unfenced and allowed to start.
 
 Pause semantics:
 - `paused` (generic)
