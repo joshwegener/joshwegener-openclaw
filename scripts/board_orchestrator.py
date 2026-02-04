@@ -3461,7 +3461,11 @@ def main() -> int:
                                     "context unavailable",
                                 )
                             ):
-                                result_payload = None
+                                # Only ignore these if the patch actually contains a diff.
+                                # If the patch is empty/no-op, we want to process the BLOCKER
+                                # and park the card as blocked:artifact.
+                                if patch_has_diff(patch_path):
+                                    result_payload = None
 
                 # If the reviewer run appears stuck/crashed (no result for too long), clear it so we can respawn.
                 if not result_payload and isinstance(entry, dict) and REVIEW_RUN_TIMEOUT_MIN > 0:
