@@ -56,6 +56,7 @@ Columns (titles must match):
 - `Ready`
 - `Work in progress`
 - `Review`
+- `Documentation`
 - `Blocked`
 - `Done`
 
@@ -114,6 +115,13 @@ Review tags:
 - `review:blocked:wip` (rework is waiting for WIP capacity)
 - `review:error` (review runner/auth/quota failed)
 - `review:rerun` / `review:retry` (explicit human request to rerun review)
+
+Documentation tags:
+- `docs:auto` (orchestrator-managed docs stage)
+- `docs:pending` (card is waiting for docs work to start)
+- `docs:inflight` (docs work has started; informational)
+- `docs:completed` (docs are done; gate to Done)
+- `docs:skip` (explicit override; allow Done without docs)
 
 ---
 
@@ -239,7 +247,7 @@ Decision policy:
 
 On PASS:
 - Tag `review:pass`
-- Optionally auto-move Review → Done (config `REVIEW_AUTO_DONE`)
+- Optionally auto-move Review → Documentation (preferred) or → Done (config `REVIEW_AUTO_DONE`)
 - Kill tmux window `review-<id>`
 
 On REWORK/BLOCKER:
@@ -256,6 +264,20 @@ Reviewer errors:
 Thrash guard:
 - If the same patch revision fails review too many times within the window, stop looping:
   - move to `Backlog` tagged `blocked:thrash`
+
+### Documentation → Done (Docs Gate)
+The Documentation column is the final quality gate. We do **not** create separate “Docs: (from #X)” companion cards anymore.
+
+Decision policy:
+- A card in Documentation can move to Done only when it has `docs:completed` (or `docs:skip`).
+
+On entry to Documentation (typically after review pass):
+- Orchestrator adds: `docs:auto` + `docs:pending`
+- Orchestrator clears stale transitional docs tags: `docs:inflight`, `docs:completed`, `docs:skip`
+
+To finish Documentation:
+- Add `docs:completed` (or `docs:skip`) on the card.
+- The orchestrator will auto-move `Documentation -> Done`.
 
 ---
 

@@ -64,6 +64,11 @@ TAG_NOAUTO = "no-auto"
 TAG_STORY = "story"
 TAG_EPIC_CHILD = "epic-child"
 TAG_DOCS_REQUIRED = "docs-required"
+TAG_DOC_PENDING = "docs:pending"
+TAG_DOC_INFLIGHT = "docs:inflight"
+TAG_DOC_COMPLETED = "docs:completed"
+TAG_DOC_SKIP = "docs:skip"
+TAG_DOC_AUTO = "docs:auto"
 TAG_CRITICAL = "critical"
 TAG_PAUSED = "paused"  # generic/manual pause
 TAG_PAUSED_CRITICAL = "paused:critical"
@@ -165,6 +170,7 @@ COL_BACKLOG = "Backlog"
 COL_READY = "Ready"
 COL_WIP = "Work in progress"
 COL_REVIEW = "Review"
+COL_DOCUMENTATION = "Documentation"
 COL_BLOCKED = "Blocked"
 COL_DONE = "Done"
 
@@ -2111,6 +2117,7 @@ def main() -> int:
         col_ready = find_column(columns, COL_READY)
         col_wip = find_column(columns, COL_WIP)
         col_review = find_column(columns, COL_REVIEW)
+        col_docs = find_column(columns, COL_DOCUMENTATION)
         col_blocked = find_column(columns, COL_BLOCKED)
         col_done = find_column(columns, COL_DONE)
 
@@ -2121,6 +2128,7 @@ def main() -> int:
                 (COL_READY, col_ready),
                 (COL_WIP, col_wip),
                 (COL_REVIEW, col_review),
+                # Documentation is optional; if present we enforce Review -> Documentation -> Done.
                 # NOTE: Paused is now tag-based; the Paused column is optional/legacy.
                 (COL_BLOCKED, col_blocked),
                 (COL_DONE, col_done),
@@ -2157,6 +2165,9 @@ def main() -> int:
         ready_tasks = tasks_for_column(int(col_ready["id"]))
         backlog_tasks = tasks_for_column(int(col_backlog["id"]))
         review_tasks = tasks_for_column(int(col_review["id"]))
+        docs_tasks: List[Tuple[Dict[str, Any], int]] = []
+        if col_docs is not None:
+            docs_tasks = tasks_for_column(int(col_docs["id"]))
         # Paused is now tag-based; the Paused column is optional/legacy.
         blocked_tasks = tasks_for_column(int(col_blocked["id"]))
         done_tasks = tasks_for_column(int(col_done["id"]))
@@ -2998,59 +3009,6 @@ def main() -> int:
 
         mode = "DRY_RUN" if dry_run else "LIVE"
 
-        # Docs drift: if a review task looks like an API change, ensure a companion Docs task exists.
-        # (MVP heuristic)
-        def needs_docs(task_id: int, title: str) -> bool:
-            try:
-                tags = {x.lower() for x in get_task_tags(task_id)}
-                # Guard: never create "docs companion for docs companion" tasks.
-                # Any docs-tagged card (or a card whose title already starts with "Docs:")
-                # is itself documentation work and should not spawn more docs tickets.
-                if "docs" in tags or title.lower().startswith("docs:"):
-                    return False
-                if TAG_DOCS_REQUIRED in tags:
-                    return True
-                t = get_task(task_id)
-                desc = (t.get('description') or '').lower()
-                if desc.strip().startswith("docs companion task auto-created"):
-                    return False
-                if title.lower().startswith('server:') and ('/v1/' in title.lower() or '/v1/' in desc):
-                    return True
-            except Exception:
-                return False
-            return False
-
-        all_board_tasks: List[Tuple[int, str]] = []
-        for sl in swimlanes:
-            for c in (sl.get('columns') or []):
-                for t in (c.get('tasks') or []):
-                    all_board_tasks.append((int(t.get('id')), task_title(t)))
-
-        for rt, rsl_id in review_tasks:
-            rid = int(rt.get('id'))
-            rtitle = task_title(rt)
-            if not needs_docs(rid, rtitle):
-                continue
-            docs_title = f"Docs: (from #{rid}) {rtitle}"
-            if any(title == docs_title for _id, title in all_board_tasks):
-                continue
-            if dry_run:
-                actions.append(f"Would create docs task for review #{rid} ({rtitle})")
-            else:
-                new_id = create_task(
-                    pid,
-                    docs_title,
-                    f"Docs companion task auto-created for review card #{rid}.\n\nSource: #{rid} {rtitle}",
-                    int(col_backlog['id']),
-                    swimlane_id=int(rsl_id),
-                )
-                try:
-                    set_task_tags(pid, new_id, ['docs', TAG_DOCS_REQUIRED])
-                except Exception:
-                    pass
-                created_tasks.append(new_id)
-                actions.append(f"Created docs task #{new_id} for review #{rid} ({rtitle})")
-
         budget = ACTION_BUDGET
 
         # If a worker finished and produced artifacts but the card was moved to Blocked
@@ -3784,14 +3742,25 @@ def main() -> int:
                         add_tag(rid, TAG_REVIEW_PASS)
                         remove_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP, TAG_REVIEW_ERROR])
 
-                    # Auto-advance Review -> Done on pass (configurable).
+                    # Auto-advance Review -> Documentation (preferred) or -> Done on pass (configurable).
                     if REVIEW_AUTO_DONE and budget > 0:
-                        if dry_run:
-                            actions.append(f"Would move Review #{rid} ({rtitle}) -> Done (review pass)")
+                        if col_docs is not None:
+                            if dry_run:
+                                actions.append(f"Would move Review #{rid} ({rtitle}) -> Documentation (review pass)")
+                            else:
+                                move_task(pid, rid, int(col_docs["id"]), 1, int(rsl_id))
+                                record_action(rid)
+                                # Docs flow tags are orchestrator-owned. Clear any stale docs state and mark pending.
+                                remove_tags(rid, [TAG_DOC_COMPLETED, TAG_DOC_SKIP, TAG_DOC_INFLIGHT])
+                                add_tags(rid, [TAG_DOC_AUTO, TAG_DOC_PENDING])
+                                actions.append(f"Moved Review #{rid} ({rtitle}) -> Documentation (review pass)")
                         else:
-                            move_task(pid, rid, int(col_done["id"]), 1, int(rsl_id))
-                            record_action(rid)
-                            actions.append(f"Moved Review #{rid} ({rtitle}) -> Done (review pass)")
+                            if dry_run:
+                                actions.append(f"Would move Review #{rid} ({rtitle}) -> Done (review pass)")
+                            else:
+                                move_task(pid, rid, int(col_done["id"]), 1, int(rsl_id))
+                                record_action(rid)
+                                actions.append(f"Moved Review #{rid} ({rtitle}) -> Done (review pass)")
                         budget -= 1
                     tmux_kill_window(f"review-{rid}")
 
@@ -3913,6 +3882,68 @@ def main() -> int:
                 workers_by_task.pop(str(rid), None)
                 workers_by_task.pop(rid, None)
                 budget -= 1
+
+        # ---------------------------------------------------------------------
+        # DOCUMENTATION FLOW (Review -> Documentation -> Done)
+        # ---------------------------------------------------------------------
+        # We no longer auto-create separate "Docs: (from #X)" companion cards.
+        #
+        # Instead, when the board has a Documentation column, a card must be marked as
+        # docs:completed (or docs:skip) before it is allowed to move to Done.
+        #
+        # Tag policy:
+        # - docs:pending is the default state when a card enters Documentation.
+        # - docs:inflight is optional/human-driven (used as a signal that docs work started).
+        # - docs:completed (or docs:skip) is the gate to Done.
+        if col_docs is not None and budget > 0 and docs_tasks:
+            active_critical_id = None
+            if active_critical is not None:
+                try:
+                    active_critical_id = int(active_critical[0].get("id") or 0) or None
+                except Exception:
+                    active_critical_id = None
+
+            for dt, dsl_id in sorted(docs_tasks, key=sort_key):
+                if budget <= 0:
+                    break
+                did = int(dt.get("id"))
+                dtitle = task_title(dt)
+
+                # While any critical exists, only process docs for the active critical card.
+                if active_critical_id is not None and did != int(active_critical_id):
+                    continue
+
+                try:
+                    dtags = get_task_tags(did)
+                except Exception:
+                    dtags = []
+                if is_held(dtags):
+                    continue
+
+                lower = {t.lower() for t in (dtags or [])}
+                done_ready = (TAG_DOC_COMPLETED in lower) or (TAG_DOC_SKIP in lower)
+
+                if done_ready:
+                    if dry_run:
+                        actions.append(f"Would move Documentation #{did} ({dtitle}) -> Done (docs complete)")
+                    else:
+                        move_task(pid, did, int(col_done["id"]), 1, int(dsl_id))
+                        record_action(did)
+                        # Keep docs:completed/docs:skip as a durable breadcrumb; clear transitional tags.
+                        remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT])
+                        actions.append(f"Moved Documentation #{did} ({dtitle}) -> Done (docs complete)")
+                    budget -= 1
+                    continue
+
+                # Ensure docs:pending is present unless docs:inflight is already set.
+                if (TAG_DOC_INFLIGHT not in lower) and (TAG_DOC_PENDING not in lower):
+                    if dry_run:
+                        actions.append(f"Would tag Documentation #{did} ({dtitle}) as docs:pending")
+                    else:
+                        add_tags(did, [TAG_DOC_AUTO, TAG_DOC_PENDING])
+                        record_action(did)
+                        actions.append(f"Tagged Documentation #{did} ({dtitle}) as docs:pending")
+                    budget -= 1
 
         # Resume tasks paused by a prior critical whenever no critical is actively in WIP.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
