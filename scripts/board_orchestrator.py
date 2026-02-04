@@ -134,19 +134,25 @@ REVIEWER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD", "")
 REVIEWER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEWER_SPAWN_TIMEOUT_SEC", "2"))
 TMUX_SESSION = os.environ.get("CLAWD_TMUX_SESSION", "clawd")
 TMUX_CLEANUP_WINDOWS = os.environ.get("CLAWD_CLEANUP_TMUX_WINDOWS", "1").strip().lower() not in ("0", "false", "no")
-# "90+" means >= 91 (strictly higher than 90).
-REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "91"))
+# Reviewer run directories (for recovery after orchestrator restarts).
+CLAWD_HOME = os.environ.get("CLAWD_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLAWD_RUNS_ROOT = os.environ.get("CLAWD_RUNS_ROOT") or os.path.join(CLAWD_HOME, "runs")
+CLAWD_REVIEW_RUN_ROOT = os.environ.get("CLAWD_REVIEW_RUN_ROOT") or os.path.join(CLAWD_RUNS_ROOT, "review")
+# Review PASS threshold (score must be >= this integer).
+REVIEW_THRESHOLD = int(os.environ.get("BOARD_ORCHESTRATOR_REVIEW_THRESHOLD", "90"))
 REVIEW_AUTO_DONE = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_AUTO_DONE", "1").strip().lower() not in (
     "0",
     "false",
     "no",
 )
-# If any critical items are found by the reviewer, fail regardless of score.
-REVIEW_FAIL_ON_CRITICAL_ITEMS = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_FAIL_ON_CRITICAL_ITEMS", "1").strip().lower() not in (
+# NorthStar policy: if any critical_items are present, the review MUST fail regardless of score.
+# Keep the env var for backwards compatibility, but do not allow disabling this rule in automation.
+REVIEW_FAIL_ON_CRITICAL_ITEMS_ENV = os.environ.get("BOARD_ORCHESTRATOR_REVIEW_FAIL_ON_CRITICAL_ITEMS", "1").strip().lower() not in (
     "0",
     "false",
     "no",
 )
+REVIEW_FAIL_ON_CRITICAL_ITEMS = True
 
 MISSING_WORKER_POLICY = os.environ.get("BOARD_ORCHESTRATOR_MISSING_WORKER_POLICY", "pause").strip().lower()
 ALLOW_TITLE_REPO_HINT = os.environ.get("BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT", "1").strip().lower() not in (
@@ -771,6 +777,31 @@ def worker_is_alive(handle: Optional[str]) -> bool:
     (e.g. 'pid:12345'). For non-pid handles (exec sessions, opaque IDs),
     treat as alive (unknown).
     """
+    # tmux handles (tmux:session:window) are first-class for our pipeline because we
+    # spawn workers in per-task windows and need to detect orphaned/stale runs.
+    if handle and str(handle).startswith("tmux:"):
+        try:
+            _pfx, session, window = str(handle).split(":", 2)
+        except Exception:
+            session = ""
+            window = ""
+        if session and window:
+            tmux_bin = shutil.which("tmux")
+            if not tmux_bin:
+                return True  # can't check; treat unknown as alive
+            try:
+                out = subprocess.run(
+                    [tmux_bin, "list-windows", "-t", session, "-F", "#{window_name}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                ).stdout
+                names = {line.strip() for line in out.splitlines() if line.strip()}
+                return window in names
+            except Exception:
+                return True  # can't check; treat unknown as alive
+
     pid = extract_pid(handle)
     if pid is None:
         return True
@@ -779,14 +810,33 @@ def worker_is_alive(handle: Optional[str]) -> bool:
 def reviewer_is_alive(handle: Optional[str]) -> bool:
     """Best-effort liveness check for reviewers.
 
-    Reviewers spawned by spawn_reviewer_tmux.sh emit pid-based handles, so we can
-    safely treat dead PIDs as stale and respawn. For non-pid handles, treat as
-    alive (unknown).
+    Reviewers are usually spawned in tmux windows (tmux:session:window). For
+    pid-based handles we can treat dead PIDs as stale and respawn. For unknown
+    handles, treat as alive (unknown).
     """
+    if handle and str(handle).startswith("tmux:"):
+        return worker_is_alive(handle)
     pid = extract_pid(handle)
     if pid is None:
         return True
     return pid_alive(pid)
+
+
+def review_needs_rework(score: int, verdict: str, critical_items: List[str], threshold: int) -> bool:
+    """Centralize the pass/fail policy so it can't drift.
+
+    Pass requires:
+    - score >= threshold
+    - verdict == PASS
+    - no critical items
+    """
+    if score < threshold:
+        return True
+    if str(verdict or "").upper() != "PASS":
+        return True
+    if critical_items:
+        return True
+    return False
 
 
 # -----------------------------------------------------------------------------
@@ -890,6 +940,46 @@ def reviewer_result_from_entry(entry: Any) -> Optional[Dict[str, Any]]:
     out = dict(payload)
     out["resultPath"] = str(result_path)
     return out
+
+
+def latest_reviewer_result_for_task(task_id: int) -> Optional[Dict[str, Any]]:
+    """Best-effort recovery: find the most recent review.json for task_id.
+
+    This allows the orchestrator to consume review results even if it restarted and
+    lost the in-memory reviewer handle (reviewersByTaskId).
+    """
+    try:
+        task_dir = os.path.join(CLAWD_REVIEW_RUN_ROOT, f"task-{task_id}")
+        if not os.path.isdir(task_dir):
+            return None
+        best_path: Optional[str] = None
+        best_mtime: float = -1.0
+        with os.scandir(task_dir) as it:
+            for ent in it:
+                if not ent.is_dir():
+                    continue
+                p = os.path.join(ent.path, "review.json")
+                if not os.path.isfile(p):
+                    continue
+                try:
+                    m = os.path.getmtime(p)
+                except Exception:
+                    m = 0.0
+                if m > best_mtime:
+                    best_mtime = m
+                    best_path = p
+        if not best_path:
+            return None
+        payload = json_file(best_path)
+        if not isinstance(payload, dict):
+            return None
+        if "score" not in payload or "verdict" not in payload:
+            return None
+        out = dict(payload)
+        out["resultPath"] = best_path
+        return out
+    except Exception:
+        return None
 
 
 def lease_is_valid(task_id: int, lease: Optional[Dict[str, Any]]) -> bool:
@@ -1352,6 +1442,27 @@ def compute_patch_revision(path: Optional[str]) -> Optional[str]:
     return h.hexdigest()
 
 
+def patch_has_diff(path: Optional[str]) -> bool:
+    """Return True if a git-format patch appears to contain an actual diff.
+
+    Empty/no-op commits produced by some agents can generate a format-patch header with
+    no `diff --git` sections. Treat those as non-actionable artifacts.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(200_000)
+        s = raw.decode(errors="ignore")
+        if "diff --git " in s:
+            return True
+        if "\n+++ b/" in s or "\n--- a/" in s:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def extract_review_revision(payload: Any) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -1575,6 +1686,8 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
     verdict = None
     notes = None
     critical_items: list[str] = []
+    minor_items: list[str] = []
+    fix_plan: list[str] = []
     review_revision = None
     if isinstance(payload, dict):
         score = payload.get("score") if score is None else score
@@ -1593,6 +1706,14 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
             item = ci.strip()
             if item:
                 critical_items = [item]
+
+        mi = payload.get("minor_items") or payload.get("minorItems") or payload.get("minorIssues") or payload.get("nits")
+        if isinstance(mi, list):
+            minor_items = [str(x) for x in mi if str(x).strip()]
+
+        fp = payload.get("fix_plan") or payload.get("fixPlan") or payload.get("plan") or payload.get("next_steps")
+        if isinstance(fp, list):
+            fix_plan = [str(x) for x in fp if str(x).strip()]
 
     if score is None:
         score_match = re.search(r"score\s*[:=]\s*(\d{1,3})", parse_text, re.IGNORECASE)
@@ -1619,6 +1740,10 @@ def parse_review_result(text: str) -> Optional[Dict[str, Any]]:
         result["notes"] = str(notes)
     if critical_items:
         result["critical_items"] = critical_items
+    if minor_items:
+        result["minor_items"] = minor_items
+    if fix_plan:
+        result["fix_plan"] = fix_plan
     if review_revision:
         result["reviewRevision"] = review_revision
     return result
@@ -1968,6 +2093,9 @@ def main() -> int:
         reviewers_by_task: Dict[str, Any] = (state.get("reviewersByTaskId") or {})
         review_results_by_task: Dict[str, Any] = (state.get("reviewResultsByTaskId") or {})
         review_rework_history_by_task: Dict[str, Any] = (state.get("reviewReworkHistoryByTaskId") or {})
+        reviewer_spawn_failures_by_task: Dict[str, Any] = (state.get("reviewerSpawnFailuresByTaskId") or {})
+        if not isinstance(reviewer_spawn_failures_by_task, dict):
+            reviewer_spawn_failures_by_task = {}
 
         pid = get_project_id()
         board = get_board(pid)
@@ -2230,6 +2358,15 @@ def main() -> int:
                             inflight = True
 
                 if inflight:
+                    # If the tmux window/handle is gone, treat the run as stale immediately
+                    # (otherwise we can get stuck waiting for done.json until the timeout).
+                    h = worker_handle(entry)
+                    if h and not worker_is_alive(h):
+                        workers_by_task.pop(str(tid), None)
+                        workers_by_task.pop(tid, None)
+                        missing_worker_tasks.append((t, sl_id))
+                        continue
+
                     # If the run is taking too long, treat it as stale and allow a respawn.
                     if started_at_ms and WORKER_RUN_TIMEOUT_MIN > 0:
                         timeout_ms = WORKER_RUN_TIMEOUT_MIN * 60 * 1000
@@ -2862,10 +2999,17 @@ def main() -> int:
         def needs_docs(task_id: int, title: str) -> bool:
             try:
                 tags = {x.lower() for x in get_task_tags(task_id)}
+                # Guard: never create "docs companion for docs companion" tasks.
+                # Any docs-tagged card (or a card whose title already starts with "Docs:")
+                # is itself documentation work and should not spawn more docs tickets.
+                if "docs" in tags or title.lower().startswith("docs:"):
+                    return False
                 if TAG_DOCS_REQUIRED in tags:
                     return True
                 t = get_task(task_id)
                 desc = (t.get('description') or '').lower()
+                if desc.strip().startswith("docs companion task auto-created"):
+                    return False
                 if title.lower().startswith('server:') and ('/v1/' in title.lower() or '/v1/' in desc):
                     return True
             except Exception:
@@ -3251,18 +3395,6 @@ def main() -> int:
                     reviewers_by_task.pop(str(rid), None)
                 entry = None
 
-            # If we have a pid-based reviewer handle but the process is dead and we
-            # don't have a stored result yet, reset so we can respawn.
-            if entry is not None and not stored_result:
-                h = worker_handle(entry)
-                if h and not reviewer_is_alive(h):
-                    if dry_run:
-                        actions.append(f"Would reset dead reviewer handle for Review #{rid} ({rtitle})")
-                    else:
-                        reviewers_by_task.pop(str(rid), None)
-                        reviewers_by_task.pop(rid, None)
-                    entry = None
-
             if rerun_requested or stale_result:
                 if dry_run:
                     actions.append(f"Would reset review state for Review #{rid} ({rtitle})")
@@ -3282,22 +3414,54 @@ def main() -> int:
                     )
                     add_tag(rid, TAG_REVIEW_PENDING)
 
-            # If the reviewer is broken (auth/quota) we mark review:error and only retry
-            # when a human explicitly asks (review:rerun) to avoid infinite loops.
-            if has_tag(rtags, TAG_REVIEW_ERROR) and not rerun_requested and not stored_result:
-                # ensure we don't leave it stuck "inflight"
-                if not dry_run:
-                    remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
-                continue
-
             result_payload: Optional[Dict[str, Any]] = None
             if stored_result:
                 result_payload = stored_result
             else:
-                log_path = None
-                entry = worker_entry_for(rid, reviewers_by_task)
                 # Preferred: read structured JSON result emitted by the reviewer run.
                 result_payload = reviewer_result_from_entry(entry)
+
+                # Recovery: allow consuming a completed review even if we lost the reviewer handle
+                # (e.g., orchestrator restart) by scanning the per-run review.json directory.
+                if not result_payload:
+                    result_payload = latest_reviewer_result_for_task(rid)
+
+                # Back-compat: fall back to parsing the legacy review log marker.
+                if not result_payload:
+                    log_path = None
+                    if isinstance(entry, dict):
+                        log_path = entry.get("logPath")
+                    if not log_path:
+                        log_path = default_reviewer_log_path(rid)
+                    result_payload = detect_review_result(rid, log_path)
+
+                if result_payload:
+                    result_revision = extract_review_revision(result_payload)
+                    if not result_revision:
+                        result_revision = extract_review_revision(entry)
+                    if not review_revision_matches(current_revision, result_revision):
+                        result_payload = None
+                    else:
+                        # Ignore obviously broken review runs caused by missing Kanboard task context
+                        # (e.g., reviewer was launched without auth/env). These runs tend to claim
+                        # the task has "no title/description" even when we clearly have a title.
+                        if result_payload and (rtitle or "").strip():
+                            notes = str(result_payload.get("notes") or "")
+                            critical_items = result_payload.get("critical_items") or []
+                            if not isinstance(critical_items, list):
+                                critical_items = []
+                            blob = (notes + "\n" + "\n".join([str(x) for x in critical_items])).lower()
+                            if any(
+                                needle in blob
+                                for needle in (
+                                    "no title or description",
+                                    "has no title or description",
+                                    "task context missing",
+                                    "missing task context",
+                                    "context unavailable",
+                                )
+                            ):
+                                result_payload = None
 
                 # If the reviewer run appears stuck/crashed (no result for too long), clear it so we can respawn.
                 if not result_payload and isinstance(entry, dict) and REVIEW_RUN_TIMEOUT_MIN > 0:
@@ -3313,19 +3477,47 @@ def main() -> int:
                                 reviewers_by_task.pop(rid, None)
                             entry = None
 
-                # Back-compat: fall back to parsing the legacy review log marker.
-                if not result_payload:
-                    if isinstance(entry, dict):
-                        log_path = entry.get("logPath")
-                    if not log_path:
-                        log_path = default_reviewer_log_path(rid)
-                    result_payload = detect_review_result(rid, log_path)
-                if result_payload:
-                    result_revision = extract_review_revision(result_payload)
-                    if not result_revision:
-                        result_revision = extract_review_revision(entry)
-                    if not review_revision_matches(current_revision, result_revision):
-                        result_payload = None
+            # If the reviewer is broken (auth/quota) we mark review:error and only retry
+            # when a human explicitly asks (review:rerun) to avoid infinite loops.
+            # Still allow consuming an already-written result_payload to unblock the pipeline.
+            if has_tag(rtags, TAG_REVIEW_ERROR) and not rerun_requested and not stored_result and not result_payload:
+                # ensure we don't leave it stuck "inflight"
+                if not dry_run:
+                    remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+                continue
+
+            # If the reviewer exited and produced no result payload, treat this as a manual-review blocker.
+            # We do NOT automatically respawn in a tight loop; instead we park with review:error so a human
+            # can inspect the log/run directory and request an explicit retry.
+            if not result_payload and isinstance(entry, dict):
+                h = worker_handle(entry)
+                if h and not reviewer_is_alive(h):
+                    # Small grace window: allow the reviewer to start + flush output even if the tmux window closes fast.
+                    try:
+                        started_at_ms = int(entry.get("startedAtMs") or 0) or 0
+                    except Exception:
+                        started_at_ms = 0
+                    if started_at_ms and (now_ms() - started_at_ms) < 15_000:
+                        pass
+                    else:
+                        if dry_run:
+                            actions.append(f"Would tag Review #{rid} ({rtitle}) as review:error (reviewer exited w/out result)")
+                        else:
+                            add_tag(rid, TAG_REVIEW_ERROR)
+                            remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+                            msg = (
+                                "Reviewer exited without producing a review result.\n"
+                                "This card is parked with review:error to avoid thrash.\n"
+                                f"- handle: {h}\n"
+                                f"- logPath: {entry.get('logPath')}\n"
+                                f"- runDir: {entry.get('runDir')}\n"
+                                f"- expected resultPath: {entry.get('resultPath')}\n"
+                                "To retry after fixing the reviewer environment, add tag review:rerun (or review:retry)."
+                            )
+                            add_comment(rid, msg)
+                            reviewers_by_task.pop(str(rid), None)
+                            reviewers_by_task.pop(rid, None)
+                        continue
 
             # Only spawn if we don't already have a usable result in the log.
             if not result_payload and not worker_handle(entry) and not stored_result:
@@ -3344,9 +3536,53 @@ def main() -> int:
                     except Exception:
                         rdesc = ""
                     _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
-                    if ensure_reviewer_handle_for_task(rid, repo_key, repo_path, patch_path, current_revision):
-                        add_tag(rid, TAG_REVIEW_INFLIGHT)
+                    spawned_ok = ensure_reviewer_handle_for_task(rid, repo_key, repo_path, patch_path, current_revision)
+                    if spawned_ok:
+                        # Reset spawn failure counter on success.
+                        reviewer_spawn_failures_by_task.pop(str(rid), None)
+                        # Atomically transition tags to inflight (avoid brief pending+inflight overlap).
+                        try:
+                            current_tags = get_task_tags(rid)
+                        except Exception:
+                            current_tags = list(rtags)
+                        new_tags: List[str] = []
+                        seen: set[str] = set()
+                        for t in current_tags:
+                            tl = str(t).lower()
+                            if tl == TAG_REVIEW_PENDING.lower():
+                                continue
+                            if tl in seen:
+                                continue
+                            seen.add(tl)
+                            new_tags.append(str(t))
+                        if TAG_REVIEW_INFLIGHT.lower() not in seen:
+                            new_tags.append(TAG_REVIEW_INFLIGHT)
+                        set_task_tags(pid, rid, new_tags)
                         actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
+                    else:
+                        # Escalate repeated spawn failures to review:error so we don't sit in review:pending forever.
+                        rec = reviewer_spawn_failures_by_task.get(str(rid)) or {}
+                        if not isinstance(rec, dict):
+                            rec = {}
+                        try:
+                            fail_count = int(rec.get("count") or 0)
+                        except Exception:
+                            fail_count = 0
+                        fail_count += 1
+                        rec["count"] = fail_count
+                        rec["lastFailedAtMs"] = now_ms()
+                        reviewer_spawn_failures_by_task[str(rid)] = rec
+                        if fail_count >= 3:
+                            add_tag(rid, TAG_REVIEW_ERROR)
+                            remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
+                            msg = (
+                                "Reviewer spawn repeatedly failed.\n"
+                                f"- attempts: {fail_count}\n"
+                                "This card is parked with review:error to avoid thrash.\n"
+                                "After fixing the reviewer environment, add tag review:rerun (or review:retry) to retry."
+                            )
+                            add_comment(rid, msg)
+                            actions.append(f"Reviewer spawn failed {fail_count}x for Review #{rid} ({rtitle}); tagged review:error")
 
             if result_payload and not stored_result:
                 score = int(result_payload.get("score") or 0)
@@ -3393,6 +3629,16 @@ def main() -> int:
                         comment_lines.append(f"  - {notes}")
                     else:
                         comment_lines.append("  - No correctness notes provided")
+                    minor_items = result_payload.get("minor_items") or []
+                    if isinstance(minor_items, list) and minor_items:
+                        comment_lines.append("- Minor items:")
+                        for item in minor_items[:10]:
+                            comment_lines.append(f"  - {item}")
+                    fix_plan = result_payload.get("fix_plan") or []
+                    if isinstance(fix_plan, list) and fix_plan:
+                        comment_lines.append("- Fix plan:")
+                        for item in fix_plan[:10]:
+                            comment_lines.append(f"  - {item}")
                     comment_lines.append("- Tests to run/add:")
                     comment_lines.append("  - Run: python3 -m unittest discover -s tests")
                     if review_revision:
@@ -3403,6 +3649,8 @@ def main() -> int:
                         "verdict": verdict,
                         "notes": notes,
                         "critical_items": critical_items,
+                        "minor_items": result_payload.get("minor_items") or [],
+                        "fix_plan": result_payload.get("fix_plan") or [],
                         "commentedAtMs": now_ms(),
                         "logPath": result_payload.get("logPath"),
                         "reviewRevision": review_revision,
@@ -3416,9 +3664,7 @@ def main() -> int:
                 if not isinstance(critical_items, list):
                     critical_items = []
 
-                needs_rework = score < REVIEW_THRESHOLD or verdict in ("REWORK", "BLOCKER")
-                if REVIEW_FAIL_ON_CRITICAL_ITEMS and critical_items:
-                    needs_rework = True
+                needs_rework = review_needs_rework(score, verdict, critical_items, REVIEW_THRESHOLD)
 
                 # If the reviewer itself is broken (auth/quota), don't thrash the card back into WIP.
                 # Keep it in Review with review:error so a human can fix the reviewer environment.
@@ -3461,12 +3707,7 @@ def main() -> int:
                     non_actionable_tag = None
                     non_actionable_reason = None
 
-                    empty_patch = False
-                    if patch_path and os.path.isfile(patch_path):
-                        try:
-                            empty_patch = os.path.getsize(patch_path) == 0
-                        except Exception:
-                            empty_patch = False
+                    empty_patch = not patch_has_diff(patch_path)
 
                     notes = str(result_payload.get("notes") or "")
                     blob = (notes + "\n" + "\n".join([str(x) for x in critical_items])).lower()
@@ -3518,7 +3759,7 @@ def main() -> int:
                         )
                     else:
                         add_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK])
-                        remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_BLOCKED_WIP])
+                        remove_tags(rid, [TAG_REVIEW_PASS, TAG_REVIEW_BLOCKED_WIP, TAG_REVIEW_ERROR])
                     review_rework_queue.append((rt, rsl_id))
                     tmux_kill_window(f"review-{rid}")
                 else:
@@ -3526,7 +3767,7 @@ def main() -> int:
                         actions.append(f"Would tag Review #{rid} ({rtitle}) as review:pass")
                     else:
                         add_tag(rid, TAG_REVIEW_PASS)
-                        remove_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP])
+                        remove_tags(rid, [TAG_REVIEW_REWORK, TAG_NEEDS_REWORK, TAG_REVIEW_BLOCKED_WIP, TAG_REVIEW_ERROR])
 
                     # Auto-advance Review -> Done on pass (configurable).
                     if REVIEW_AUTO_DONE and budget > 0:
@@ -3902,6 +4143,7 @@ def main() -> int:
                 state["reviewersByTaskId"] = reviewers_by_task
                 state["reviewResultsByTaskId"] = review_results_by_task
                 state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
+                state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
                 save_state(state)
 
                 emit_json(
@@ -3929,6 +4171,7 @@ def main() -> int:
             state["reviewersByTaskId"] = reviewers_by_task
             state["reviewResultsByTaskId"] = review_results_by_task
             state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
+            state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
             save_state(state)
             emit_json(
                 mode=mode,
@@ -4306,6 +4549,7 @@ def main() -> int:
         state["reviewersByTaskId"] = reviewers_by_task
         state["reviewResultsByTaskId"] = review_results_by_task
         state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
+        state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
         if dry_run:
             if dry_runs_remaining > 0:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1

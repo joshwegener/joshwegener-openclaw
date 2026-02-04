@@ -108,6 +108,16 @@ class TestReviewResultParsing(unittest.TestCase):
         self.assertEqual(result.get("score"), 89)
         self.assertEqual(result.get("verdict"), "PASS")
 
+    def test_parse_review_result_minor_items_and_fix_plan(self) -> None:
+        text = (
+            "review_result: {\"score\": 88, \"verdict\": \"REWORK\", "
+            "\"minor_items\": [\"nit\"], \"fix_plan\": [\"do x\"]}\n"
+        )
+        result = bo.parse_review_result(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("minor_items"), ["nit"])
+        self.assertEqual(result.get("fix_plan"), ["do x"])
+
 
 class TestDetectReviewResult(unittest.TestCase):
     def test_detect_review_result_after_marker(self) -> None:
@@ -156,6 +166,13 @@ class TestReviewRevisionHelpers(unittest.TestCase):
         self.assertFalse(bo.review_revision_matches("abc", None))
         self.assertTrue(bo.review_revision_matches("abc", "abc"))
         self.assertFalse(bo.review_revision_matches("abc", "def"))
+
+class TestReviewPolicy(unittest.TestCase):
+    def test_review_needs_rework_pass_rules(self) -> None:
+        self.assertFalse(bo.review_needs_rework(90, "PASS", [], 90))
+        self.assertTrue(bo.review_needs_rework(89, "PASS", [], 90))
+        self.assertTrue(bo.review_needs_rework(95, "REWORK", [], 90))
+        self.assertTrue(bo.review_needs_rework(95, "PASS", ["Missing tests"], 90))
 
 
 if __name__ == "__main__":

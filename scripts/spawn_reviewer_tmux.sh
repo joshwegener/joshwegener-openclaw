@@ -42,6 +42,11 @@ done
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
 TMUX_WINDOW="review-${TASK_ID}"
 
+# Reviewer PASS threshold (score must be >= this value). The orchestrator enforces this
+# again when consuming results, but the reviewer prompt should match to avoid confusion.
+PASS_THRESHOLD="${PASS_THRESHOLD:-${BOARD_ORCHESTRATOR_REVIEW_THRESHOLD:-90}}"
+export PASS_THRESHOLD
+
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
 if [[ -z "$TMUX_BIN" ]]; then
   for cand in /opt/homebrew/bin/tmux /usr/local/bin/tmux; do
@@ -209,7 +214,7 @@ PY
   fi
 fi
 
-PASS_THRESHOLD="${BOARD_ORCHESTRATOR_REVIEW_THRESHOLD:-91}"
+PASS_THRESHOLD="${BOARD_ORCHESTRATOR_REVIEW_THRESHOLD:-90}"
 
 KB_TITLE_B64="$(printf '%s' "$KB_TITLE" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
 KB_DESC_B64="$(printf '%s' "$KB_DESC" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())' 2>/dev/null || true)"
@@ -235,9 +240,9 @@ patch_path = os.environ.get("PATCH_PATH", "")
 title = b64(os.environ.get("KB_TITLE_B64", ""))
 desc = b64(os.environ.get("KB_DESC_B64", ""))
 try:
-    pass_threshold = int(os.environ.get("PASS_THRESHOLD", "91"))
+    pass_threshold = int(os.environ.get("PASS_THRESHOLD", "90"))
 except Exception:
-    pass_threshold = 91
+    pass_threshold = 90
 
 prompt = f"""You are the automated code reviewer for RecallDeck Kanban task #{task_id}.
 
@@ -253,20 +258,26 @@ Instructions:
 1) If patch_path is non-empty and exists, review the patch file contents.
 2) Otherwise, review based on the Kanboard task title/description and current repo state.
 3) Output STRICT JSON only. No markdown, no prose.
+4) Be specific: include file paths (and ideally line numbers) in critical_items/minor_items when possible.
 
 JSON schema (you MUST output exactly this object; no wrapper fields):
 {{
   "score": <int 1-100>,
   "verdict": "PASS"|"REWORK"|"BLOCKER",
   "critical_items": ["..."],
+  "minor_items": ["..."],
+  "fix_plan": ["..."],
   "notes": "short summary"
 }}
 
 Policy:
-- Use a high bar. Passing threshold is {pass_threshold} (must be 90+).
+- Use a high bar. Passing threshold is {pass_threshold}.
 - If you would PASS the change, set verdict="PASS" AND score >= {pass_threshold}.
 - If score < {pass_threshold}, verdict MUST NOT be PASS.
 - If there are ANY critical_items, the review MUST fail (verdict must be REWORK or BLOCKER) regardless of score.
+- critical_items must be concrete and actionable; reference specific files/commands when possible.
+- minor_items are non-blocking polish items that would increase confidence/quality.
+- fix_plan should be a short ordered checklist to get this to PASS >= {pass_threshold}.
 """
 
 print(prompt)
@@ -276,7 +287,7 @@ PY
 echo "### REVIEW START $(date -u '+%Y-%m-%dT%H:%M:%SZ')" | tee -a "$LOG_PATH"
 echo "run_id=$RUN_ID" | tee -a "$LOG_PATH"
 
-args=(--repo-path "$REPO_PATH" --log-path "$LOG_PATH" --result-path "$RESULT_PATH" --model "${CLAUDE_MODEL:-opus}" --prompt "$PROMPT")
+args=(--repo-path "$REPO_PATH" --log-path "$LOG_PATH" --result-path "$RESULT_PATH" --model "${CLAUDE_MODEL:-opus}" --pass-threshold "$PASS_THRESHOLD" --prompt "$PROMPT")
 if [[ -n "$REVIEW_REVISION" ]]; then
   args+=(--revision "$REVIEW_REVISION")
 fi
@@ -301,6 +312,8 @@ fi
 if [[ -n "${ORCHESTRATOR_ENV_FILE:-}" ]]; then
   "$TMUX_BIN" set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_ENV_FILE" "$ORCHESTRATOR_ENV_FILE" 2>/dev/null || true
 fi
+# Also set the review threshold in tmux server env so reviewer windows have it even if not present in the env file.
+"$TMUX_BIN" set-environment -t "$TMUX_SESSION" "BOARD_ORCHESTRATOR_REVIEW_THRESHOLD" "$PASS_THRESHOLD" 2>/dev/null || true
 
 # Deduplicate by name: keep one active review window per task.
 "$TMUX_BIN" list-windows -t "$TMUX_SESSION" -F '#{window_id}:#{window_name}' 2>/dev/null \

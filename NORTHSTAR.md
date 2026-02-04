@@ -39,7 +39,7 @@ Key invariants:
   - `CLAWD_ENV_FILE` (legacy alias)
 
 Pass threshold:
-- `BOARD_ORCHESTRATOR_REVIEW_THRESHOLD` (default `91`)
+- `BOARD_ORCHESTRATOR_REVIEW_THRESHOLD` (default `90`)
 
 Leases:
 - `BOARD_ORCHESTRATOR_USE_LEASES` is **off by default** (`0`) in the run-id world.
@@ -134,7 +134,10 @@ Reviewer run files:
 
 Control flow rule:
 - The orchestrator must never infer completion from a stale file in a previous run directory.
-- The orchestrator must only accept completion via the current run’s `done.json` / `review.json`.
+- Workers: only accept completion via the *recorded* run entry’s `done.json` (`donePath` stored in state).
+- Reviewers: accept completion via `review.json` from either:
+  - the recorded run entry’s `resultPath`, or
+  - recovery mode: the most recent `runs/review/task-<id>/*/review.json` that matches the current patch revision.
 
 ---
 
@@ -243,6 +246,7 @@ On REWORK/BLOCKER:
 Reviewer errors:
 - If `review:error` is present and there is no stored result, do not respawn automatically.
 - Only rerun review on explicit human tags: `review:rerun` or `review:retry`.
+- If a reviewer exits without producing `review.json` (no result payload), tag `review:error` + comment with `runDir`/`logPath` and stop.
 
 Thrash guard:
 - If the same patch revision fails review too many times within the window, stop looping:
@@ -305,7 +309,7 @@ Treat as an API; important keys:
 ## “Working” Acceptance Criteria
 
 1) WIP → Review can only happen after a valid `done.json` from the current run.
-2) Review decisions come only from `review.json` (current run), and are idempotent.
+2) Review decisions come only from `review.json` (recorded run or recovery-mode latest matching revision), and are idempotent.
 3) No WIP ↔ Review ping-pong without new worker output (new runId) or explicit human tags.
 4) Review errors do not thrash (require `review:rerun` / `review:retry`).
 5) tmux windows are observable and cleaned up on completion (no hundreds of orphan panes).

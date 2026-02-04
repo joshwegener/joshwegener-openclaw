@@ -130,6 +130,7 @@ def main() -> int:
     ap.add_argument("--result-path", default="")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "opus"))
     ap.add_argument("--timeout-sec", type=int, default=int(os.environ.get("CLAUDE_REVIEW_TIMEOUT_SEC", "600")))
+    ap.add_argument("--pass-threshold", type=int, default=0)
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--revision", default="")
     args = ap.parse_args()
@@ -223,11 +224,33 @@ def main() -> int:
     if not isinstance(critical_items, list):
         critical_items = []
 
+    minor_items = parsed.get("minor_items")
+    if not isinstance(minor_items, list):
+        minor_items = []
+
+    fix_plan = parsed.get("fix_plan")
+    if not isinstance(fix_plan, list):
+        fix_plan = []
+
+    # Enforce policy locally even if the model ignores instructions.
+    # This prevents confusing states like verdict=PASS with a sub-threshold score.
+    pass_threshold = int(args.pass_threshold or 0)
+    normalized_score = max(1, min(100, score))
+    normalized_critical = [str(x) for x in critical_items if str(x).strip()][:20]
+    if verdict == "PASS":
+        if pass_threshold and normalized_score < pass_threshold:
+            verdict = "REWORK"
+            normalized_critical = [f"Score {normalized_score} is below pass threshold {pass_threshold}"] + normalized_critical
+        if normalized_critical:
+            verdict = "REWORK"
+
     result = {
-        "score": max(1, min(100, score)),
+        "score": normalized_score,
         "verdict": verdict,
-        "critical_items": [str(x) for x in critical_items if str(x).strip()][:20],
-        "notes": str(parsed.get("notes") or "")[:1000],
+        "critical_items": normalized_critical,
+        "minor_items": [str(x) for x in minor_items if str(x).strip()][:20],
+        "fix_plan": [str(x) for x in fix_plan if str(x).strip()][:20],
+        "notes": str(parsed.get("notes") or "")[:4000],
     }
     if args.revision:
         result["reviewRevision"] = args.revision
