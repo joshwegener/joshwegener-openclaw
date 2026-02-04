@@ -2252,7 +2252,11 @@ def main() -> int:
                 tags = get_task_tags(tid)
             except Exception:
                 tags = []
-            if is_critical(tags) and not is_held(tags):
+            # Critical queueing uses `hold:queued-critical` as an orchestrator-managed fence.
+            # Those cards are "held" for normal flow, but MUST still be considered for
+            # critical selection so we can unqueue them when they become active.
+            is_queued_critical = has_tag(tags, TAG_HOLD_QUEUED_CRITICAL)
+            if is_critical(tags) and (not is_held(tags) or is_queued_critical):
                 critical_candidates.append((t, sl_id, col_id))
                 critical_task_ids.add(tid)
 
@@ -3311,15 +3315,16 @@ def main() -> int:
         # If multiple critical tasks exist, auto-queue the non-active ones.
         # This prevents the monitor from treating multiple critical tags as an invariant violation,
         # while still preserving the priority order on the board.
-        if active_critical is not None and len(critical_candidates) > 1:
+        if active_critical is not None:
             active_id = int(active_critical[0].get("id") or 0)
 
-            # Ensure the active critical isn't held (it may have been queued previously).
+            # Ensure the active critical isn't fenced by our own queue tag.
+            # Only `hold:queued-critical` is orchestrator-owned; do NOT override a manual `hold`.
             try:
                 atags = get_task_tags(active_id)
             except Exception:
                 atags = []
-            if any(t.lower() in (TAG_HOLD, TAG_HOLD_QUEUED_CRITICAL) for t in atags):
+            if has_tag(atags, TAG_HOLD_QUEUED_CRITICAL):
                 if dry_run:
                     actions.append(f"Would untag hold/hold:queued-critical for active critical #{active_id}")
                 else:
@@ -3327,6 +3332,9 @@ def main() -> int:
                     record_action(active_id)
                     actions.append(f"Unqueued active critical #{active_id} (removed hold:queued-critical)")
 
+        # If multiple critical tasks exist, auto-queue the non-active ones.
+        if active_critical is not None and len(critical_candidates) > 1:
+            active_id = int(active_critical[0].get("id") or 0)
             for t, _sl_id, _col_id in critical_candidates:
                 tid = int(t.get("id"))
                 if tid == active_id:
@@ -3338,12 +3346,15 @@ def main() -> int:
                     ttags = get_task_tags(tid)
                 except Exception:
                     ttags = []
+                if has_tag(ttags, TAG_HOLD_QUEUED_CRITICAL):
+                    continue
                 if is_held(ttags):
                     continue
                 if dry_run:
                     actions.append(f"Would tag queued critical #{tid} ({ttitle}) as hold:queued-critical")
                 else:
-                    add_tags(tid, [TAG_HOLD, TAG_HOLD_QUEUED_CRITICAL])
+                    # Queue fence is hold:queued-critical (do not add plain `hold`; keep it human-only).
+                    add_tags(tid, [TAG_HOLD_QUEUED_CRITICAL])
                     record_action(tid)
                     actions.append(f"Queued critical #{tid} ({ttitle}) (tagged hold:queued-critical)")
                 budget -= 1
