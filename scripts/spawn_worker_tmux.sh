@@ -191,9 +191,11 @@ print(json.dumps({"title": res.get("title") or "", "description": res.get("descr
 PY
 )"
     if [[ -n "$kb_json" ]]; then
-      KB_TITLE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"title\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
-      KB_DESC="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"description\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
-      KB_ERR="$(python3 -c 'import json,sys; v=json.loads(sys.stdin.read()).get(\"error\"); import json as _j; print(\"\" if v in (None, \"\") else (v if isinstance(v,str) else _j.dumps(v)))' <<<"$kb_json" 2>/dev/null || true)"
+      # NOTE: capture parse errors to the worker log (do not silence), otherwise we can't diagnose
+      # intermittent issues where title/description appear empty.
+      KB_TITLE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"title\", \"\"))' <<<"$kb_json" 2>>"$LOG_PATH" || true)"
+      KB_DESC="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"description\", \"\"))' <<<"$kb_json" 2>>"$LOG_PATH" || true)"
+      KB_ERR="$(python3 -c 'import json,sys; v=json.loads(sys.stdin.read()).get(\"error\"); import json as _j; print(\"\" if v in (None, \"\") else (v if isinstance(v,str) else _j.dumps(v)))' <<<"$kb_json" 2>>"$LOG_PATH" || true)"
       if [[ -n "$KB_TITLE" || -n "$KB_DESC" ]]; then
         break
       fi
