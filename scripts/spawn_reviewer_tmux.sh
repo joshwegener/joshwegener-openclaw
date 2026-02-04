@@ -93,7 +93,8 @@ set -euo pipefail
 TASK_ID="${1:?task_id}"
 REPO_KEY="${2:?repo_key}"
 REPO_PATH="${3:?repo_path}"
-PATCH_PATH="${4:?patch_path}"
+# PATCH_PATH may be empty (some reviews are context-only: based on task title/desc + repo state).
+PATCH_PATH="${4:-}"
 LOG_PATH="${5:?log_path}"
 RESULT_PATH="${6:?result_path}"
 META_PATH="${7:?meta_path}"
