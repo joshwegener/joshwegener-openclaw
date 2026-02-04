@@ -138,7 +138,12 @@ fi
 KB_TITLE=""
 KB_DESC=""
 if [[ -n "${KANBOARD_BASE:-}" && -n "${KANBOARD_USER:-}" && -n "${KANBOARD_TOKEN:-}" ]]; then
-  kb_json="$(python3 - <<'PY' "$TASK_ID" 2>>"$LOG_PATH" || true
+  # Retry a few times: we've seen rare cases where Kanboard returns empty title/description
+  # transiently (race during migrations/restarts). An empty title/description causes the
+  # worker to produce no-op "missing context" patches.
+  kb_json=""
+  for attempt in 1 2 3; do
+    kb_json="$(python3 - <<'PY' "$TASK_ID" 2>>"$LOG_PATH" || true
 import base64, json, os, sys, urllib.error, urllib.request
 
 task_id = int(sys.argv[1])
@@ -185,15 +190,27 @@ res = out.get("result") or {}
 print(json.dumps({"title": res.get("title") or "", "description": res.get("description") or ""}))
 PY
 )"
-  if [[ -n "$kb_json" ]]; then
-    KB_TITLE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"title\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
-    KB_DESC="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"description\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
-    KB_ERR="$(python3 -c 'import json,sys; v=json.loads(sys.stdin.read()).get(\"error\"); import json as _j; print(\"\" if v in (None, \"\") else (v if isinstance(v,str) else _j.dumps(v)))' <<<"$kb_json" 2>/dev/null || true)"
-    if [[ -z "$KB_TITLE" && -z "$KB_DESC" && -n "$KB_ERR" ]]; then
-      KB_TITLE="(Kanboard task context unavailable)"
-      KB_DESC="$(printf 'Error fetching task #%s from Kanboard JSON-RPC (getTask):\n%s\n' "$TASK_ID" "$KB_ERR")"
-      echo "[kanboard-task] fetch_error=$KB_ERR" >>"$LOG_PATH" 2>&1 || true
+    if [[ -n "$kb_json" ]]; then
+      KB_TITLE="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"title\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
+      KB_DESC="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get(\"description\", \"\"))' <<<"$kb_json" 2>/dev/null || true)"
+      KB_ERR="$(python3 -c 'import json,sys; v=json.loads(sys.stdin.read()).get(\"error\"); import json as _j; print(\"\" if v in (None, \"\") else (v if isinstance(v,str) else _j.dumps(v)))' <<<"$kb_json" 2>/dev/null || true)"
+      if [[ -n "$KB_TITLE" || -n "$KB_DESC" ]]; then
+        break
+      fi
+      if [[ -n "$KB_ERR" ]]; then
+        echo "[kanboard-task] fetch_error(attempt=$attempt)=$KB_ERR" >>"$LOG_PATH" 2>&1 || true
+      else
+        echo "[kanboard-task] empty title/desc (attempt=$attempt)" >>"$LOG_PATH" 2>&1 || true
+      fi
     fi
+    sleep 0.5
+  done
+
+  # If we still have no context, inject an explicit error so the model doesn't
+  # confidently fabricate a task.
+  if [[ -z "$KB_TITLE" && -z "$KB_DESC" ]]; then
+    KB_TITLE="(Kanboard task context unavailable)"
+    KB_DESC="$(printf 'Error fetching task #%s from Kanboard JSON-RPC (getTask): empty title/description after retries\n' \"$TASK_ID\")"
   fi
 fi
 
