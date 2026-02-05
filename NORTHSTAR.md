@@ -122,6 +122,8 @@ Documentation tags:
 - `docs:inflight` (docs work has started; informational)
 - `docs:completed` (docs are done; gate to Done)
 - `docs:skip` (explicit override; allow Done without docs)
+- `docs:error` (docs runner/auth/quota failed; parked to avoid thrash)
+- `docs:retry` (explicit human request to rerun docs)
 
 ---
 
@@ -132,6 +134,7 @@ Everything active is a **run** with a unique `runId` and a dedicated directory.
 Run roots:
 - Workers: `/Users/joshwegener/clawd/runs/worker/task-<id>/<runId>/`
 - Reviewers: `/Users/joshwegener/clawd/runs/review/task-<id>/<runId>/`
+- Docs workers: `/Users/joshwegener/clawd/runs/docs/task-<id>/<runId>/` (planned/rolling out)
 
 Worker run files:
 - `worker.log` (human debug only)
@@ -145,12 +148,20 @@ Reviewer run files:
 - `meta.json` (spawn metadata)
 - `review.json` (canonical completion signal)
 
+Docs worker run files (planned/rolling out):
+- `docs.log` (human debug only)
+- `meta.json` (spawn metadata)
+- `patch.patch` (docs patch)
+- `kanboard-comment.md` (docs summary/comment)
+- `done.json` (canonical completion signal)
+
 Control flow rule:
 - The orchestrator must never infer completion from a stale file in a previous run directory.
 - Workers: only accept completion via the *recorded* run entry’s `done.json` (`donePath` stored in state).
 - Reviewers: accept completion via `review.json` from either:
   - the recorded run entry’s `resultPath`, or
   - recovery mode: the most recent `runs/review/task-<id>/*/review.json` that matches the current patch revision.
+- Docs workers: only accept completion via the *recorded* docs run entry’s `done.json` (no log scraping).
 
 ---
 
@@ -275,9 +286,22 @@ On entry to Documentation (typically after review pass):
 - Orchestrator adds: `docs:auto` + `docs:pending`
 - Orchestrator clears stale transitional docs tags: `docs:inflight`, `docs:completed`, `docs:skip`
 
-To finish Documentation:
+Planned automation (see Kanboard task `#89`):
+- If a card has `docs:auto` + `docs:pending`, the orchestrator should spawn a **docs worker** (Codex) to update `RecallDeck-Docs` based on:
+  - the Kanboard task title/description
+  - the code patch that just passed review (if present)
+- When the docs worker completes:
+  - If the docs patch is non-empty: tag `docs:completed`
+  - If the docs patch is empty and docs truly aren’t required: tag `docs:skip`
+  - Post the docs summary comment
+  - Move `Documentation -> Done`
+
+Manual completion (until #89 lands):
 - Add `docs:completed` (or `docs:skip`) on the card.
 - The orchestrator will auto-move `Documentation -> Done`.
+
+Failure mode:
+- If docs automation fails, tag `docs:error` and stop auto-respawning (avoid thrash). A human can add `docs:retry` after fixing the environment.
 
 ---
 
