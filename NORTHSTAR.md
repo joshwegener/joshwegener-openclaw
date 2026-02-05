@@ -41,6 +41,14 @@ Key invariants:
 Pass threshold:
 - `BOARD_ORCHESTRATOR_REVIEW_THRESHOLD` (default `90`)
 
+Spawn commands:
+- `BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD` (Codex worker)
+- `BOARD_ORCHESTRATOR_REVIEWER_SPAWN_CMD` (Claude reviewer)
+- `BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD` (Codex docs worker; default disabled/empty)
+
+Docs throughput:
+- `BOARD_ORCHESTRATOR_DOCS_WIP_LIMIT` (default `1`)
+
 Leases:
 - `BOARD_ORCHESTRATOR_USE_LEASES` is **off by default** (`0`) in the run-id world.
 
@@ -134,7 +142,7 @@ Everything active is a **run** with a unique `runId` and a dedicated directory.
 Run roots:
 - Workers: `/Users/joshwegener/clawd/runs/worker/task-<id>/<runId>/`
 - Reviewers: `/Users/joshwegener/clawd/runs/review/task-<id>/<runId>/`
-- Docs workers: `/Users/joshwegener/clawd/runs/docs/task-<id>/<runId>/` (planned/rolling out)
+- Docs workers: `/Users/joshwegener/clawd/runs/docs/task-<id>/<runId>/`
 
 Worker run files:
 - `worker.log` (human debug only)
@@ -148,7 +156,7 @@ Reviewer run files:
 - `meta.json` (spawn metadata)
 - `review.json` (canonical completion signal)
 
-Docs worker run files (planned/rolling out):
+Docs worker run files:
 - `docs.log` (human debug only)
 - `meta.json` (spawn metadata)
 - `patch.patch` (docs patch)
@@ -286,8 +294,8 @@ On entry to Documentation (typically after review pass):
 - Orchestrator adds: `docs:auto` + `docs:pending`
 - Orchestrator clears stale transitional docs tags: `docs:inflight`, `docs:completed`, `docs:skip`
 
-Planned automation (see Kanboard task `#89`):
-- If a card has `docs:auto` + `docs:pending`, the orchestrator should spawn a **docs worker** (Codex) to update `RecallDeck-Docs` based on:
+Automation:
+- If a card has `docs:auto` + `docs:pending`, the orchestrator spawns a **docs worker** (Codex) to update `RecallDeck-Docs` based on:
   - the Kanboard task title/description
   - the code patch that just passed review (if present)
 - When the docs worker completes:
@@ -296,9 +304,8 @@ Planned automation (see Kanboard task `#89`):
   - Post the docs summary comment
   - Move `Documentation -> Done`
 
-Manual completion (until #89 lands):
-- Add `docs:completed` (or `docs:skip`) on the card.
-- The orchestrator will auto-move `Documentation -> Done`.
+Manual completion:
+- Add `docs:completed` (or `docs:skip`) on the card; the orchestrator will auto-move `Documentation -> Done`.
 
 Failure mode:
 - If docs automation fails, tag `docs:error` and stop auto-respawning (avoid thrash). A human can add `docs:retry` after fixing the environment.
@@ -337,7 +344,7 @@ Useful windows:
 - `review-logs` (tails latest reviewer run logs under `runs/review/`)
 
 Cleanup behavior:
-- After a run completes, the orchestrator kills `worker-<id>` / `review-<id>` windows (configurable).
+- After a run completes, the orchestrator kills `worker-<id>` / `review-<id>` / `docs-<id>` windows (configurable).
 
 ---
 
@@ -352,6 +359,8 @@ Treat as an API; important keys:
 - `workersByTaskId` (stores the current worker run entry per task, including `donePath`)
 - `reviewersByTaskId` (stores the current reviewer run entry per task, including `resultPath`)
 - `reviewResultsByTaskId` (stored parsed results)
+- `docsWorkersByTaskId` (stores the current docs run entry per task, including `donePath`)
+- `docsSpawnFailuresByTaskId` (spawn failure counter to avoid docs:pending stalls)
 - `pausedByCritical` (who we paused and why)
 - `reviewReworkHistoryByTaskId` (thrash guard history)
 

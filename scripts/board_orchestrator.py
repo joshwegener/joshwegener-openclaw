@@ -68,6 +68,8 @@ TAG_DOC_PENDING = "docs:pending"
 TAG_DOC_INFLIGHT = "docs:inflight"
 TAG_DOC_COMPLETED = "docs:completed"
 TAG_DOC_SKIP = "docs:skip"
+TAG_DOC_ERROR = "docs:error"
+TAG_DOC_RETRY = "docs:retry"
 TAG_DOC_AUTO = "docs:auto"
 TAG_CRITICAL = "critical"
 TAG_PAUSED = "paused"  # generic/manual pause
@@ -114,6 +116,11 @@ WORKER_LOG_TAIL_BYTES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_TAIL_B
 WORKER_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD", "")
 # Cron tick safety: spawning a worker should return quickly (worker runs in the background).
 WORKER_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_SPAWN_TIMEOUT_SEC", "2"))
+DOCS_SPAWN_CMD = os.environ.get("BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD", "")
+# Cron tick safety: docs spawns should return quickly (docs worker runs in the background).
+DOCS_SPAWN_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_DOCS_SPAWN_TIMEOUT_SEC", "2"))
+DOCS_WIP_LIMIT = int(os.environ.get("BOARD_ORCHESTRATOR_DOCS_WIP_LIMIT", "1"))
+DOCS_RUN_TIMEOUT_MIN = int(os.environ.get("BOARD_ORCHESTRATOR_DOCS_RUN_TIMEOUT_MIN", "60"))
 WORKER_LEASES_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_USE_LEASES", "0").strip().lower() not in (
     "0",
     "false",
@@ -298,6 +305,9 @@ def load_state() -> Dict[str, Any]:
         "reviewersByTaskId": {},
         "reviewResultsByTaskId": {},
         "reviewReworkHistoryByTaskId": {},
+        # docs automation bookkeeping (optional, self-healing)
+        "docsWorkersByTaskId": {},
+        "docsSpawnFailuresByTaskId": {},
     }
 
 
@@ -1858,6 +1868,102 @@ def spawn_worker(task_id: int, repo_key: Optional[str], repo_path: Optional[str]
     }
 
 
+def format_docs_spawn_cmd(
+    task_id: int,
+    source_repo_key: Optional[str],
+    source_repo_path: Optional[str],
+    source_patch_path: Optional[str],
+) -> Tuple[str, str, str, str]:
+    safe_repo_key = source_repo_key or ""
+    safe_repo_path = source_repo_path or ""
+    safe_patch_path = source_patch_path or ""
+    try:
+        cmd = DOCS_SPAWN_CMD.format(
+            task_id=task_id,
+            repo_key=shlex.quote(safe_repo_key),
+            repo_path=shlex.quote(safe_repo_path),
+            patch_path=shlex.quote(safe_patch_path),
+        )
+    except Exception:
+        cmd = DOCS_SPAWN_CMD
+    return cmd, safe_repo_key, safe_repo_path, safe_patch_path
+
+
+def spawn_docs_worker(
+    task_id: int,
+    source_repo_key: Optional[str],
+    source_repo_path: Optional[str],
+    source_patch_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not DOCS_SPAWN_CMD:
+        return None
+    cmd, safe_repo_key, safe_repo_path, safe_patch_path = format_docs_spawn_cmd(
+        task_id, source_repo_key, source_repo_path, source_patch_path
+    )
+    try:
+        out = subprocess.run(
+            cmd,
+            shell=True,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=DOCS_SPAWN_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    raw = (out.stdout or "").strip()
+    if not raw:
+        return None
+
+    handle: Optional[str] = None
+    log_path: Optional[str] = None
+    run_id: Optional[str] = None
+    run_dir: Optional[str] = None
+    done_path: Optional[str] = None
+    patch_path: Optional[str] = None
+    comment_path: Optional[str] = None
+    started_at_ms: Optional[int] = None
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                handle = payload.get("execSessionId") or payload.get("handle") or payload.get("sessionId")
+                log_path = payload.get("logPath")
+                run_id = payload.get("runId") or payload.get("run_id")
+                run_dir = payload.get("runDir") or payload.get("run_dir")
+                done_path = payload.get("donePath") or payload.get("done_path")
+                patch_path = payload.get("patchPath") or payload.get("patch_path")
+                comment_path = payload.get("commentPath") or payload.get("comment_path")
+                try:
+                    if payload.get("startedAtMs") is not None:
+                        started_at_ms = int(payload.get("startedAtMs") or 0) or None
+                except Exception:
+                    started_at_ms = None
+        except Exception:
+            handle = None
+    if not handle:
+        handle = raw.splitlines()[-1].strip()
+    if not started_at_ms:
+        started_at_ms = now_ms()
+    return {
+        "kind": "docs",
+        "execSessionId": handle,
+        "logPath": log_path or "",
+        "runId": run_id or "",
+        "runDir": run_dir or "",
+        "donePath": done_path or "",
+        "patchPath": patch_path or "",
+        "commentPath": comment_path or "",
+        "startedAtMs": started_at_ms,
+        "sourceRepoKey": safe_repo_key,
+        "sourceRepoPath": safe_repo_path,
+        "sourcePatchPath": safe_patch_path,
+    }
+
+
 def spawn_reviewer(
     task_id: int,
     repo_key: Optional[str],
@@ -2102,6 +2208,12 @@ def main() -> int:
         reviewer_spawn_failures_by_task: Dict[str, Any] = (state.get("reviewerSpawnFailuresByTaskId") or {})
         if not isinstance(reviewer_spawn_failures_by_task, dict):
             reviewer_spawn_failures_by_task = {}
+        docs_workers_by_task: Dict[str, Any] = (state.get("docsWorkersByTaskId") or {})
+        if not isinstance(docs_workers_by_task, dict):
+            docs_workers_by_task = {}
+        docs_spawn_failures_by_task: Dict[str, Any] = (state.get("docsSpawnFailuresByTaskId") or {})
+        if not isinstance(docs_spawn_failures_by_task, dict):
+            docs_spawn_failures_by_task = {}
 
         pid = get_project_id()
         board = get_board(pid)
@@ -2173,6 +2285,7 @@ def main() -> int:
         done_tasks = tasks_for_column(int(col_done["id"]))
 
         review_ids = {int(t.get("id")) for t, _sl in review_tasks}
+        docs_ids = {int(t.get("id")) for t, _sl in docs_tasks}
         lease_warnings: List[str] = []
         lease_pending_ids: set[int] = set()
         stale_worker_ids: set[int] = set()
@@ -2230,6 +2343,18 @@ def main() -> int:
                     review_results_by_task.pop(k, None)
             except Exception:
                 review_results_by_task.pop(k, None)
+        for k in list(docs_workers_by_task.keys()):
+            try:
+                if int(k) not in docs_ids:
+                    docs_workers_by_task.pop(k, None)
+            except Exception:
+                docs_workers_by_task.pop(k, None)
+        for k in list(docs_spawn_failures_by_task.keys()):
+            try:
+                if int(k) not in docs_ids:
+                    docs_spawn_failures_by_task.pop(k, None)
+            except Exception:
+                docs_spawn_failures_by_task.pop(k, None)
 
         # Sort helper
         def sort_key(item: Tuple[Any, ...]) -> Tuple[int, int]:
@@ -2887,6 +3012,47 @@ def main() -> int:
                     entry["patchPath"] = str(done.get("patchPath"))
                     return str(done.get("patchPath"))
             return None
+
+        def docs_inflight_count() -> int:
+            count = 0
+            for entry in (docs_workers_by_task or {}).values():
+                if not isinstance(entry, dict):
+                    continue
+                if worker_done_from_entry(entry):
+                    continue
+                h = worker_handle(entry)
+                if not h:
+                    continue
+                # worker_is_alive treats unknown handles as alive.
+                if worker_is_alive(h):
+                    count += 1
+            return count
+
+        def ensure_docs_worker_handle_for_task(
+            task_id: int,
+            source_repo_key: Optional[str],
+            source_repo_path: Optional[str],
+            source_patch_path: Optional[str],
+        ) -> bool:
+            entry = worker_entry_for(task_id, docs_workers_by_task)
+            # Require a donePath so we can deterministically reconcile completion.
+            if isinstance(entry, dict) and not (entry.get("donePath") or entry.get("done_path")):
+                docs_workers_by_task.pop(str(task_id), None)
+                docs_workers_by_task.pop(task_id, None)
+                entry = None
+
+            handle = worker_handle(entry)
+            if handle and worker_is_alive(handle):
+                return True
+            if handle and not worker_is_alive(handle):
+                docs_workers_by_task.pop(str(task_id), None)
+                docs_workers_by_task.pop(task_id, None)
+            if DOCS_SPAWN_CMD:
+                spawned = spawn_docs_worker(task_id, source_repo_key, source_repo_path, source_patch_path)
+                if spawned and spawned.get("donePath"):
+                    docs_workers_by_task[str(task_id)] = spawned
+                    return True
+            return False
 
         def ensure_reviewer_handle_for_task(
             task_id: int,
@@ -3927,6 +4093,20 @@ def main() -> int:
 
                 lower = {t.lower() for t in (dtags or [])}
                 done_ready = (TAG_DOC_COMPLETED in lower) or (TAG_DOC_SKIP in lower)
+                retry_requested = TAG_DOC_RETRY in lower
+
+                # Docs retry: clear docs:error and allow respawn (explicit human intent).
+                if retry_requested:
+                    if dry_run:
+                        actions.append(f"Would clear docs:error for Documentation #{did} ({dtitle}) (docs:retry)")
+                    else:
+                        remove_tags(did, [TAG_DOC_ERROR, TAG_DOC_RETRY])
+                        try:
+                            dtags = get_task_tags(did)
+                        except Exception:
+                            dtags = list(dtags)
+                        lower = {t.lower() for t in (dtags or [])}
+                        done_ready = (TAG_DOC_COMPLETED in lower) or (TAG_DOC_SKIP in lower)
 
                 if done_ready:
                     if dry_run:
@@ -3936,12 +4116,211 @@ def main() -> int:
                         record_action(did)
                         # Keep docs:completed/docs:skip as a durable breadcrumb; clear transitional tags.
                         remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT])
+                        # Best-effort docs worker cleanup (if one was running or left stale state).
+                        docs_workers_by_task.pop(str(did), None)
+                        docs_workers_by_task.pop(did, None)
+                        tmux_kill_window(f"docs-{did}")
                         actions.append(f"Moved Documentation #{did} ({dtitle}) -> Done (docs complete)")
                     budget -= 1
                     continue
 
+                # If a docs worker run completed, consume it and advance deterministically.
+                entry = worker_entry_for(did, docs_workers_by_task)
+                done_payload = worker_done_from_entry(entry) if isinstance(entry, dict) else None
+                if done_payload:
+                    ok = bool(done_payload.get("ok"))
+                    patch_exists = bool(done_payload.get("patchExists"))
+                    comment_exists = bool(done_payload.get("commentExists"))
+                    try:
+                        patch_bytes = int(done_payload.get("patchBytes") or 0)
+                    except Exception:
+                        patch_bytes = 0
+                    patch_path = str(done_payload.get("patchPath") or "") if patch_exists else ""
+                    comment_path = str(done_payload.get("commentPath") or "") if comment_exists else ""
+
+                    usable = bool(ok and patch_exists and comment_exists and patch_path and comment_path)
+                    if not usable:
+                        if dry_run:
+                            actions.append(
+                                f"Would tag Documentation #{did} ({dtitle}) as docs:error (docs worker output unusable)"
+                            )
+                        else:
+                            add_tag(did, TAG_DOC_ERROR)
+                            remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT, TAG_DOC_RETRY])
+                            msg = (
+                                "Docs worker finished without usable artifacts.\n"
+                                "This card is parked with docs:error to avoid thrash.\n"
+                                f"- handle: {worker_handle(entry)}\n"
+                                f"- logPath: {entry.get('logPath') if isinstance(entry, dict) else ''}\n"
+                                f"- runDir: {entry.get('runDir') if isinstance(entry, dict) else ''}\n"
+                                f"- donePath: {done_payload.get('donePath')}\n"
+                                "To retry after fixing the docs worker environment, add tag docs:retry."
+                            )
+                            add_comment(did, msg)
+                            docs_workers_by_task.pop(str(did), None)
+                            docs_workers_by_task.pop(did, None)
+                            tmux_kill_window(f"docs-{did}")
+                            record_action(did)
+                            actions.append(
+                                f"Tagged Documentation #{did} ({dtitle}) as docs:error (docs worker output unusable)"
+                            )
+                        budget -= 1
+                        continue
+
+                    result_tag = TAG_DOC_COMPLETED if patch_bytes > 0 else TAG_DOC_SKIP
+                    if dry_run:
+                        actions.append(
+                            f"Would move Documentation #{did} ({dtitle}) -> Done ({result_tag}; docs worker complete)"
+                        )
+                    else:
+                        add_tag(did, result_tag)
+                        remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT, TAG_DOC_ERROR, TAG_DOC_RETRY])
+                        comment_text = read_text(comment_path, 20000).strip()
+                        if comment_text:
+                            add_comment(did, comment_text)
+                        move_task(pid, did, int(col_done["id"]), 1, int(dsl_id))
+                        record_action(did)
+                        docs_workers_by_task.pop(str(did), None)
+                        docs_workers_by_task.pop(did, None)
+                        tmux_kill_window(f"docs-{did}")
+                        actions.append(
+                            f"Moved Documentation #{did} ({dtitle}) -> Done ({result_tag}; docs worker complete)"
+                        )
+                    budget -= 1
+                    continue
+
+                # If a docs worker handle exists but exited without producing done.json, park with docs:error.
+                if isinstance(entry, dict):
+                    h = worker_handle(entry)
+                    if h and not worker_is_alive(h):
+                        try:
+                            started_at_ms = int(entry.get("startedAtMs") or 0) or 0
+                        except Exception:
+                            started_at_ms = 0
+                        # Grace window for fast tmux startup/exit.
+                        if started_at_ms and (now_ms() - started_at_ms) < 15_000:
+                            pass
+                        else:
+                            if dry_run:
+                                actions.append(
+                                    f"Would tag Documentation #{did} ({dtitle}) as docs:error (docs worker exited without done.json)"
+                                )
+                            else:
+                                add_tag(did, TAG_DOC_ERROR)
+                                remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT, TAG_DOC_RETRY])
+                                msg = (
+                                    "Docs worker exited without producing done.json.\n"
+                                    "This card is parked with docs:error to avoid thrash.\n"
+                                    f"- handle: {h}\n"
+                                    f"- logPath: {entry.get('logPath')}\n"
+                                    f"- runDir: {entry.get('runDir')}\n"
+                                    f"- expected donePath: {entry.get('donePath')}\n"
+                                    "To retry after fixing the docs worker environment, add tag docs:retry."
+                                )
+                                add_comment(did, msg)
+                                docs_workers_by_task.pop(str(did), None)
+                                docs_workers_by_task.pop(did, None)
+                                tmux_kill_window(f"docs-{did}")
+                                record_action(did)
+                                actions.append(
+                                    f"Tagged Documentation #{did} ({dtitle}) as docs:error (docs worker exited without done.json)"
+                                )
+                            budget -= 1
+                            continue
+
+                # Docs spawn: when docs:auto + docs:pending, spawn a docs worker (respect global docs WIP limit).
+                if (
+                    DOCS_SPAWN_CMD
+                    and TAG_DOC_AUTO in lower
+                    and TAG_DOC_PENDING in lower
+                    and (TAG_DOC_ERROR not in lower)
+                ):
+                    if DOCS_WIP_LIMIT > 0 and docs_inflight_count() >= DOCS_WIP_LIMIT:
+                        continue
+                    if dry_run:
+                        actions.append(f"Would spawn docs worker for Documentation #{did} ({dtitle})")
+                    else:
+                        try:
+                            full = get_task(did)
+                            ddesc = (full.get("description") or "")
+                        except Exception:
+                            ddesc = ""
+                        repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(did, dtitle, dtags, ddesc)
+                        patch_path = resolve_patch_path_for_task(did) or ""
+                        if not repo_ok:
+                            add_tag(did, TAG_DOC_ERROR)
+                            remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT, TAG_DOC_RETRY])
+                            add_comment(
+                                did,
+                                "Docs automation cannot resolve the source repo mapping for this card.\n"
+                                "This card is parked with docs:error to avoid thrash.\n"
+                                "Fix the repo mapping (repo:<key> tag or Repo: ... in description), then add docs:retry.",
+                            )
+                            record_action(did)
+                            actions.append(
+                                f"Tagged Documentation #{did} ({dtitle}) as docs:error (no source repo mapping)"
+                            )
+                            budget -= 1
+                            continue
+                        spawned_ok = ensure_docs_worker_handle_for_task(did, repo_key, repo_path, patch_path)
+                        if spawned_ok:
+                            docs_spawn_failures_by_task.pop(str(did), None)
+                            # Atomically transition pending -> inflight (avoid overlap).
+                            try:
+                                current_tags = get_task_tags(did)
+                            except Exception:
+                                current_tags = list(dtags)
+                            new_tags: List[str] = []
+                            seen: set[str] = set()
+                            for t in current_tags:
+                                tl = str(t).lower()
+                                if tl in (TAG_DOC_PENDING.lower(), TAG_DOC_ERROR.lower(), TAG_DOC_RETRY.lower()):
+                                    continue
+                                if tl in seen:
+                                    continue
+                                seen.add(tl)
+                                new_tags.append(str(t))
+                            if TAG_DOC_AUTO.lower() not in seen:
+                                new_tags.append(TAG_DOC_AUTO)
+                            if TAG_DOC_INFLIGHT.lower() not in seen:
+                                new_tags.append(TAG_DOC_INFLIGHT)
+                            set_task_tags(pid, did, new_tags)
+                            record_action(did)
+                            actions.append(f"Spawned docs worker for Documentation #{did} ({dtitle})")
+                        else:
+                            rec = docs_spawn_failures_by_task.get(str(did)) or {}
+                            if not isinstance(rec, dict):
+                                rec = {}
+                            try:
+                                fail_count = int(rec.get("count") or 0)
+                            except Exception:
+                                fail_count = 0
+                            fail_count += 1
+                            rec["count"] = fail_count
+                            rec["lastFailedAtMs"] = now_ms()
+                            docs_spawn_failures_by_task[str(did)] = rec
+                            record_action(did)
+                            if fail_count >= 3:
+                                add_tag(did, TAG_DOC_ERROR)
+                                remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT])
+                                msg = (
+                                    "Docs worker spawn repeatedly failed.\n"
+                                    f"- attempts: {fail_count}\n"
+                                    "This card is parked with docs:error to avoid thrash.\n"
+                                    "After fixing the docs worker environment, add tag docs:retry to retry."
+                                )
+                                add_comment(did, msg)
+                                actions.append(
+                                    f"Docs worker spawn failed {fail_count}x for Documentation #{did} ({dtitle}); tagged docs:error"
+                                )
+                        budget -= 1
+                    if budget <= 0:
+                        break
+                    continue
+
                 # Ensure docs:pending is present unless docs:inflight is already set.
-                if (TAG_DOC_INFLIGHT not in lower) and (TAG_DOC_PENDING not in lower):
+                # If docs:error is present, do not auto-add docs:pending (avoid respawn loops).
+                if (TAG_DOC_ERROR not in lower) and (TAG_DOC_INFLIGHT not in lower) and (TAG_DOC_PENDING not in lower):
                     if dry_run:
                         actions.append(f"Would tag Documentation #{did} ({dtitle}) as docs:pending")
                     else:
@@ -4195,6 +4574,8 @@ def main() -> int:
                 state["reviewResultsByTaskId"] = review_results_by_task
                 state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
                 state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
+                state["docsWorkersByTaskId"] = docs_workers_by_task
+                state["docsSpawnFailuresByTaskId"] = docs_spawn_failures_by_task
                 save_state(state)
 
                 emit_json(
@@ -4223,6 +4604,8 @@ def main() -> int:
             state["reviewResultsByTaskId"] = review_results_by_task
             state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
             state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
+            state["docsWorkersByTaskId"] = docs_workers_by_task
+            state["docsSpawnFailuresByTaskId"] = docs_spawn_failures_by_task
             save_state(state)
             emit_json(
                 mode=mode,
@@ -4660,6 +5043,8 @@ def main() -> int:
         state["reviewResultsByTaskId"] = review_results_by_task
         state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task
         state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
+        state["docsWorkersByTaskId"] = docs_workers_by_task
+        state["docsSpawnFailuresByTaskId"] = docs_spawn_failures_by_task
         if dry_run:
             if dry_runs_remaining > 0:
                 state["dryRunRunsRemaining"] = dry_runs_remaining - 1
