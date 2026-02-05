@@ -17,12 +17,26 @@ fi
 /Users/joshwegener/clawd/scripts/tmux_up.sh
 
 if [[ "$WITH_LAUNCHD" == "1" ]]; then
-  PLIST="$HOME/Library/LaunchAgents/com.recalldeck.clawd.orchestrator.plist"
-  if [[ -f "$PLIST" ]]; then
-    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  ORCH_PLIST="$HOME/Library/LaunchAgents/com.recalldeck.clawd.orchestrator.plist"
+  if [[ -f "$ORCH_PLIST" ]]; then
+    launchctl bootstrap "gui/$(id -u)" "$ORCH_PLIST" 2>/dev/null || true
     launchctl enable "gui/$(id -u)/com.recalldeck.clawd.orchestrator" 2>/dev/null || true
   else
-    echo "WARN: missing launchd plist: $PLIST" >&2
+    echo "WARN: missing launchd plist: $ORCH_PLIST" >&2
+  fi
+
+  GUARD_LABEL="com.recalldeck.clawd.orchestrator-guardian"
+  GUARD_SRC="/Users/joshwegener/clawd/launchd/${GUARD_LABEL}.plist"
+  GUARD_PLIST="$HOME/Library/LaunchAgents/${GUARD_LABEL}.plist"
+  if [[ ! -f "$GUARD_PLIST" && -f "$GUARD_SRC" ]]; then
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cp -f "$GUARD_SRC" "$GUARD_PLIST"
+  fi
+  if [[ -f "$GUARD_PLIST" ]]; then
+    launchctl bootstrap "gui/$(id -u)" "$GUARD_PLIST" 2>/dev/null || true
+    launchctl enable "gui/$(id -u)/${GUARD_LABEL}" 2>/dev/null || true
+  else
+    echo "WARN: missing guardian launchd plist: $GUARD_PLIST" >&2
   fi
 fi
 

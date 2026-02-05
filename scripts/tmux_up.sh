@@ -5,6 +5,7 @@ set -euo pipefail
 # Safe to run multiple times.
 
 TMUX_SESSION="${CLAWD_TMUX_SESSION:-clawd}"
+ORCHESTRATOR_WINDOW_CMD="${CLAWD_ORCHESTRATOR_WINDOW_CMD:-/Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh}"
 
 DEFAULT_ENV_FILE=""
 if [[ -f "/Users/joshwegener/.config/clawd/orchestrator.env" ]]; then
@@ -66,13 +67,22 @@ ensure_session
 if [[ -n "${ENV_FILE:-}" ]]; then
   tmux set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_ENV_FILE" "$ENV_FILE" 2>/dev/null || true
 fi
+if [[ -n "${CLAWD_TICK_SECONDS:-}" ]]; then
+  tmux set-environment -t "$TMUX_SESSION" "CLAWD_TICK_SECONDS" "$CLAWD_TICK_SECONDS" 2>/dev/null || true
+fi
+if [[ -n "${CLAWD_ORCHESTRATOR_HEARTBEAT_PATH:-}" ]]; then
+  tmux set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_HEARTBEAT_PATH" "$CLAWD_ORCHESTRATOR_HEARTBEAT_PATH" 2>/dev/null || true
+fi
+if [[ -n "${CLAWD_ORCHESTRATOR_WINDOW_CMD:-}" ]]; then
+  tmux set-environment -t "$TMUX_SESSION" "CLAWD_ORCHESTRATOR_WINDOW_CMD" "$CLAWD_ORCHESTRATOR_WINDOW_CMD" 2>/dev/null || true
+fi
 
 chmod +x /Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_worker_tmux.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_reviewer_tmux.sh
 chmod +x /Users/joshwegener/clawd/scripts/tail_latest_logs.sh
 
-ensure_window_cmd "orchestrator" "/Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh"
+ensure_window_cmd "orchestrator" "$ORCHESTRATOR_WINDOW_CMD"
 
 # Convenience: quick tails (optional, but helpful).
 ensure_window_cmd "worker-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/worker worker.log 20 200"

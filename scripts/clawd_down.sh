@@ -5,9 +5,13 @@ set -euo pipefail
 
 PLIST="$HOME/Library/LaunchAgents/com.recalldeck.clawd.orchestrator.plist"
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+GUARD_PLIST="$HOME/Library/LaunchAgents/com.recalldeck.clawd.orchestrator-guardian.plist"
+launchctl bootout "gui/$(id -u)" "$GUARD_PLIST" 2>/dev/null || true
 
 pkill -f '/Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh' 2>/dev/null || true
 pkill -f '/Users/joshwegener/clawd/scripts/board_orchestrator.py' 2>/dev/null || true
+pkill -f '/Users/joshwegener/clawd/scripts/run_orchestrator_guardian.sh' 2>/dev/null || true
+pkill -f '/Users/joshwegener/clawd/scripts/orchestrator_guardian.py' 2>/dev/null || true
 
 if tmux ls 2>/dev/null | rg -q '^clawd:'; then
   # Kill only the orchestrator window; keep workers for forensics.
