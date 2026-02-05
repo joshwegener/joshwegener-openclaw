@@ -2948,6 +2948,7 @@ def main() -> int:
             reason_tag: str,
             *,
             from_label: str,
+            auto_blocked: bool = False,
         ) -> None:
             """Backlog+tag policy for non-actionable cards.
 
@@ -2957,6 +2958,10 @@ def main() -> int:
             """
             record_action(task_id)
             tags_to_add = [reason_tag]
+            # Certain blocked reasons are transient (deps/exclusive/repo mapping) and should auto-heal
+            # once the condition clears. Mark these as orchestrator-owned so we can safely clear them.
+            if auto_blocked:
+                tags_to_add.append(TAG_AUTO_BLOCKED)
             if reason_tag == TAG_BLOCKED_REPO:
                 tags_to_add.append(TAG_NO_REPO)
             add_tags(task_id, tags_to_add)
@@ -4323,6 +4328,62 @@ def main() -> int:
         while budget > 0:
             did_something = False
 
+            # 0) Auto-heal Backlog tasks that were auto-blocked and are now clear.
+            # (e.g. deps resolved, exclusives released, repo mapping added.)
+            # Only do this when Ready is empty to avoid thrash.
+            if budget > 0 and not ready_tasks_sorted and backlog_sorted:
+                for bt, bsl_id in backlog_sorted:
+                    bid = int(bt.get("id"))
+                    btitle = task_title(bt)
+                    try:
+                        btags = get_task_tags(bid)
+                    except Exception:
+                        btags = []
+                    lower = {t.lower() for t in btags}
+                    if TAG_AUTO_BLOCKED not in lower:
+                        continue
+                    # Only auto-heal for the transient blocked reasons.
+                    if not (TAG_BLOCKED_DEPS in lower or TAG_BLOCKED_EXCLUSIVE in lower or TAG_BLOCKED_REPO in lower):
+                        continue
+                    if not cooled(bid):
+                        continue
+
+                    try:
+                        full = get_task(bid)
+                        desc = (full.get("description") or "")
+                    except Exception:
+                        desc = ""
+
+                    # deps
+                    deps = parse_depends_on(desc)
+                    unmet = [d for d in deps if not is_done(d)]
+                    if unmet:
+                        continue
+
+                    # exclusive
+                    ex_keys = parse_exclusive_keys(btags, desc)
+                    if any(k in wip_exclusive_keys for k in ex_keys):
+                        continue
+
+                    # repo mapping
+                    if not has_repo_mapping(bid, btitle, btags, desc):
+                        continue
+
+                    if dry_run:
+                        actions.append(f"Would auto-heal Backlog #{bid} ({btitle}) -> Ready")
+                    else:
+                        move_task(pid, bid, int(col_ready["id"]), 1, bsl_id)
+                        record_action(bid)
+                        promoted_to_ready.append(bid)
+                        remove_tags(bid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS, TAG_BLOCKED_EXCLUSIVE, TAG_BLOCKED_REPO, TAG_NO_REPO])
+                        auto_blocked.pop(str(bid), None)
+                        actions.append(f"Auto-healed Backlog #{bid} ({btitle}) -> Ready")
+                    budget -= 1
+                    did_something = True
+                    ready_tasks_sorted = sorted(tasks_for_column(int(col_ready["id"])), key=sort_key)
+                    backlog_sorted = sorted(tasks_for_column(int(col_backlog["id"])), key=sort_key)
+                    break
+
             # 0) Auto-heal Blocked tasks that were auto-blocked and are now clear.
             # Only do this when Ready is empty to avoid thrash.
             if budget > 0 and not ready_tasks_sorted and blocked_tasks:
@@ -4405,6 +4466,7 @@ def main() -> int:
                             reason,
                             reason_tag,
                             from_label="Backlog",
+                            auto_blocked=reason_tag in (TAG_BLOCKED_DEPS, TAG_BLOCKED_EXCLUSIVE, TAG_BLOCKED_REPO),
                         )
                     budget -= 1
                     did_something = True
@@ -4503,6 +4565,7 @@ def main() -> int:
                             reason,
                             TAG_BLOCKED_DEPS,
                             from_label="Ready",
+                            auto_blocked=True,
                         )
                     budget -= 1
                     did_something = True
@@ -4542,6 +4605,7 @@ def main() -> int:
                             "No repo mapping",
                             TAG_BLOCKED_REPO,
                             from_label="Ready",
+                            auto_blocked=True,
                         )
                     budget -= 1
                     did_something = True
