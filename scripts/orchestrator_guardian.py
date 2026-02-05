@@ -142,11 +142,15 @@ def read_heartbeat(path: str) -> Optional[Dict[str, Any]]:
     return parse_heartbeat_text(txt)
 
 
-def restart_limiter_allows(state: Dict[str, Any], *, now_epoch_s: int, max_restarts: int, window_s: int) -> bool:
-    blocked_until = int(state.get("blockedUntilS") or 0)
-    if blocked_until and now_epoch_s < blocked_until:
-        return False
+def restart_block_active(state: Dict[str, Any], *, now_epoch_s: int) -> bool:
+    try:
+        blocked_until = int(state.get("blockedUntilS") or 0)
+    except Exception:
+        blocked_until = 0
+    return bool(blocked_until and now_epoch_s < blocked_until)
 
+
+def restart_limiter_allows(state: Dict[str, Any], *, now_epoch_s: int, max_restarts: int, window_s: int) -> bool:
     history = state.get("restartHistoryS")
     if not isinstance(history, list):
         history = []
@@ -227,65 +231,92 @@ def main() -> int:
         state["missingEnv"] = False
 
     now_epoch_s = now_s()
-    if not restart_limiter_allows(state, now_epoch_s=now_epoch_s, max_restarts=max_restarts, window_s=restart_window_s):
-        state["blockedUntilS"] = max(int(state.get("blockedUntilS") or 0), now_epoch_s + block_s)
-        notify(
-            f"RecallDeck orchestrator guardian: restart loop detected (>= {max_restarts} attempts in {restart_window_min}m). Pausing auto-repair for {block_min}m.",
-            state=state,
-            key="restart-loop",
-            cooldown_s=block_s,
-        )
-        save_json(state_path, state)
-        return 0
+    if not restart_block_active(state, now_epoch_s=now_epoch_s):
+        # Clear expired blocks (do not keep stale timestamps around).
+        try:
+            if int(state.get("blockedUntilS") or 0) and now_epoch_s >= int(state.get("blockedUntilS") or 0):
+                state["blockedUntilS"] = 0
+        except Exception:
+            state["blockedUntilS"] = 0
 
     clawd_home = os.environ.get("CLAWD_HOME") or "/Users/joshwegener/clawd"
     tmux_up = os.path.join(clawd_home, "scripts", "tmux_up.sh")
     window_cmd = os.environ.get("CLAWD_ORCHESTRATOR_WINDOW_CMD") or os.path.join(clawd_home, "scripts", "run_orchestrator_loop.sh")
 
+    pane_id: Optional[str] = None
+    hb: Optional[Dict[str, Any]] = None
+    stale = True
+    needs_repair = False
+    repair_reason = ""
+    did_repair = False
+
     if not has_session(session):
-        # Recreate the full tmux session + windows.
-        try:
-            subprocess.run([tmux_up], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except Exception:
-            pass
-        record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
-        save_json(state_path, state)
-        return 0
+        needs_repair = True
+        repair_reason = "session-missing"
+    else:
+        wid = window_id_by_name(session, window_name)
+        if not wid:
+            needs_repair = True
+            repair_reason = "window-missing"
+        else:
+            pane_id = first_pane_id(wid)
+            if not pane_id:
+                needs_repair = True
+                repair_reason = "pane-missing"
+            else:
+                hb = read_heartbeat(heartbeat_path)
+                stale = is_heartbeat_stale(hb, now_s=now_epoch_s, tick_seconds=tick_seconds, factor=stale_factor)
+                if stale:
+                    needs_repair = True
+                    repair_reason = "heartbeat-stale"
 
-    wid = window_id_by_name(session, window_name)
-    if not wid:
-        try:
-            subprocess.run([tmux_up], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except Exception:
-            pass
-        record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
-        save_json(state_path, state)
-        return 0
+    if needs_repair:
+        # If we are currently blocked due to restart thrash, do not attempt repair.
+        if restart_block_active(state, now_epoch_s=now_epoch_s):
+            state["lastCheckAtS"] = now_epoch_s
+            state["lastRepairReason"] = repair_reason
+            save_json(state_path, state)
+            return 0
 
-    pid = first_pane_id(wid)
-    if not pid:
-        try:
-            subprocess.run([tmux_up], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except Exception:
-            pass
-        record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
-        save_json(state_path, state)
-        return 0
+        if not restart_limiter_allows(state, now_epoch_s=now_epoch_s, max_restarts=max_restarts, window_s=restart_window_s):
+            state["blockedUntilS"] = now_epoch_s + block_s
+            state["lastCheckAtS"] = now_epoch_s
+            state["lastRepairReason"] = repair_reason
+            notify(
+                f"RecallDeck orchestrator guardian: restart loop detected (>= {max_restarts} attempts in {restart_window_min}m). Pausing auto-repair for {block_min}m.",
+                state=state,
+                key="restart-loop",
+                cooldown_s=block_s,
+            )
+            save_json(state_path, state)
+            return 0
 
-    hb = read_heartbeat(heartbeat_path)
-    stale = is_heartbeat_stale(hb, now_s=now_epoch_s, tick_seconds=tick_seconds, factor=stale_factor)
-    if stale:
-        # If the loop is hung/dead, respawn just the orchestrator pane. Fall back to full tmux_up.
-        ok = respawn_pane(pid, window_cmd)
-        if not ok:
+        if repair_reason in ("session-missing", "window-missing", "pane-missing"):
             try:
                 subprocess.run([tmux_up], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             except Exception:
                 pass
-        record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
+            record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
+            state["lastRepairAtS"] = now_epoch_s
+            state["lastRepairReason"] = repair_reason
+            did_repair = True
 
-    # If heartbeat is healthy again, clear any block.
-    if not stale:
+        if repair_reason == "heartbeat-stale":
+            ok = False
+            if pane_id:
+                ok = respawn_pane(pane_id, window_cmd)
+            if not ok:
+                try:
+                    subprocess.run([tmux_up], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                except Exception:
+                    pass
+            record_restart(state, now_epoch_s=now_epoch_s, window_s=restart_window_s)
+            state["lastRepairAtS"] = now_epoch_s
+            state["lastRepairReason"] = repair_reason
+            did_repair = True
+
+    # If heartbeat is healthy (or no repair needed), clear any prior block.
+    if not needs_repair and not did_repair:
         state["blockedUntilS"] = 0
 
     # Store a tiny status snapshot (useful for ops_status without parsing tmux).
