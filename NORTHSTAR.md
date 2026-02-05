@@ -49,6 +49,10 @@ Spawn commands:
 Docs throughput:
 - `BOARD_ORCHESTRATOR_DOCS_WIP_LIMIT` (default `1`)
 
+Local toggles (edits orchestrator env file):
+- Enable docs automation: `scripts/docs_on.sh`
+- Disable docs automation: `scripts/docs_off.sh`
+
 Leases:
 - `BOARD_ORCHESTRATOR_USE_LEASES` is **off by default** (`0`) in the run-id world.
 
