@@ -11,12 +11,14 @@ Column titles (Kanboard):
 - Ready
 - Work in progress (WIP)
 - Review
+- Documentation
 - Blocked
 - Done
 
 Definitions:
 - **WIP** means active coding/execution. **Hard limit = 2** (except temporary overflow when a review failure must return to WIP; when WIP > 2, do not pull new work).
 - **Review** is separate and can be unlimited.
+- **Documentation** is the final quality gate: a card must be marked `docs:completed` (or `docs:skip`) before it can move to Done.
 
 State path:
 - Default: `/Users/joshwegener/clawd/memory/board-orchestrator-state.json`
@@ -29,6 +31,11 @@ State path:
 - `hold` (or `no-auto`) = **escape hatch**: orchestrator must not move/start this task
 - `docs-required` = requires a docs companion task
 - `exclusive:<key>` = only one task with this key can be in WIP at a time (e.g. `exclusive:server-db`)
+- Documentation tags (orchestrator-owned workflow):
+  - `docs:auto` + `docs:pending` = eligible for docs worker spawn
+  - `docs:inflight` = docs worker running
+  - `docs:completed` / `docs:skip` = gate to Done
+  - `docs:error` = automation failed; requires `docs:retry` to retry
 
 ## Dependencies
 
@@ -88,6 +95,17 @@ Leases are canonical; PID is used for liveness checks (best-effort).
 - The Paused column is optional/legacy; prefer keeping cards in place and using tags.
 - A task is only moved into WIP when a worker handle can be recorded immediately (no silent WIP).
 - If a worker log shows a completed output (patch marker / kanboard comment file), auto-move WIP → Review.
+
+## Documentation flow (Review -> Documentation -> Done)
+If the board has a Documentation column:
+- On Review PASS, the orchestrator moves the card to Documentation and tags it `docs:auto` + `docs:pending`.
+- If `BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD` is configured, cards with `docs:auto` + `docs:pending` spawn a docs worker (Codex) to update `RecallDeck-Docs`.
+- Docs worker completion is file-signaled via `done.json`:
+  - non-empty docs patch -> tag `docs:completed`
+  - empty docs patch -> tag `docs:skip`
+  - post the docs comment and move Documentation -> Done
+- Failure mode:
+  - on unusable output or repeated spawn failures, tag `docs:error` and stop auto-respawning until `docs:retry` is added.
 
 ## Safety valves
 

@@ -4391,6 +4391,7 @@ def main() -> int:
 
             critical_in_wip = int(c_col_id) == int(col_wip["id"])
             critical_in_review = int(c_col_id) == int(col_review["id"])
+            critical_in_docs = bool(col_docs is not None and int(c_col_id) == int(col_docs["id"]))
 
             def pause_noncritical_wip() -> None:
                 nonlocal budget
@@ -4472,6 +4473,11 @@ def main() -> int:
 
             elif critical_in_review:
                 # Critical in Review is waiting on human attention; keep throughput flowing.
+                pass
+
+            elif critical_in_docs:
+                # Critical already passed review and is in Documentation.
+                # Do NOT bounce it back into WIP; the Documentation flow will handle docs:auto/docs:pending.
                 pass
 
             else:

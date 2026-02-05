@@ -9,6 +9,7 @@ Use this when the Kanboard pipeline looks “stuck” (no movement for a while, 
   - `hold:*` / `no-auto`
   - `auto-blocked` + `blocked:*`
   - `review:*`
+  - `docs:*`
 
 ## 2) If a task is in WIP but not progressing
 ### A) Missing worker
@@ -48,4 +49,19 @@ If non-critical WIP cards are stuck paused by a critical:
   - `python3 scripts/board_orchestrator.py`
 - Check for orphan workers (live pid but task not in WIP):
   - Look for `manual-fix: ... orphan` warnings in orchestrator output.
+
+## 5) If a task is in Documentation but not progressing
+Symptoms:
+- Task is in **Documentation** with `docs:pending` (and often `docs:auto`) for a long time.
+
+Actions:
+- Ensure docs automation is enabled:
+  - `BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD` must be configured in the orchestrator env.
+  - Quick toggle helpers:
+    - enable: `scripts/docs_on.sh`
+    - disable: `scripts/docs_off.sh`
+- If the card is tagged `docs:error`:
+  - Read the docs worker run dir/log referenced in the card comment.
+  - Fix the docs environment (docs repo path, Codex CLI, Kanboard env).
+  - Add tag `docs:retry` to allow a retry (or manually tag `docs:skip` / `docs:completed` to finish).
 

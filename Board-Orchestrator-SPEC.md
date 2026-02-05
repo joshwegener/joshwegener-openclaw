@@ -13,12 +13,14 @@ Columns (by title):
 - `Ready`
 - `Work in progress`
 - `Review`
+- `Documentation`
 - `Blocked`
 - `Done`
 
 Definitions:
 - **WIP** = active coding/execution. **Hard limit = 2**.
 - **Review** = separate lane, unlimited.
+- **Documentation** = final gate; cards require `docs:completed` or `docs:skip` to move to Done.
 - If a review fails and a task must return to WIP, WIP may temporarily exceed 2, but the orchestrator must **stop pulling new work** until WIP <= 2.
 
 Ordering:
@@ -32,6 +34,14 @@ Swimlanes (MVP):
 - `story` + `epic-child` — child task belonging to an epic
 - `hold` or `no-auto` — **escape hatch**: orchestrator must not move/start this task
 - `docs-required` — this task requires a docs update task before it can be considered complete
+- Documentation workflow (orchestrator-owned):
+  - `docs:auto` — docs automation enabled for this card
+  - `docs:pending` — card is waiting for docs work
+  - `docs:inflight` — docs worker running
+  - `docs:completed` — docs updated (gate to Done)
+  - `docs:skip` — docs intentionally skipped (gate to Done)
+  - `docs:error` — docs automation failed; no auto-respawn
+  - `docs:retry` — explicit human intent to retry after fixing environment
 
 ## Dependencies + exclusivity (new)
 Dependencies convention (preferred): add a line in the task description:
@@ -156,6 +166,15 @@ Runs every 15 minutes.
    - If no safe repo mapping is available, do **not** start; instead comment and/or move to Blocked.
 5) Escalation:
    - Anything truly blocked on Josh must go to `Blocked` and message Josh immediately.
+
+6) Documentation (when column exists):
+   - On Review PASS, move Review -> Documentation and tag `docs:auto` + `docs:pending`.
+   - If `BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD` is configured and the card has `docs:auto` + `docs:pending`, spawn a docs worker (Codex) that updates `RecallDeck-Docs`.
+   - On docs completion:
+     - non-empty docs patch -> tag `docs:completed`
+     - empty docs patch -> tag `docs:skip`
+     - post docs summary comment and move Documentation -> Done
+   - On failure or unusable artifacts, tag `docs:error` and require `docs:retry` to retry (avoid thrash).
 
 ## Script interface
 Python script: `/Users/joshwegener/clawd/scripts/board_orchestrator.py`
