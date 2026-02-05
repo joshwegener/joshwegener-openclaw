@@ -4135,10 +4135,15 @@ def main() -> int:
                         patch_bytes = int(done_payload.get("patchBytes") or 0)
                     except Exception:
                         patch_bytes = 0
+                    try:
+                        comment_bytes = int(done_payload.get("commentBytes") or 0)
+                    except Exception:
+                        comment_bytes = 0
                     patch_path = str(done_payload.get("patchPath") or "") if patch_exists else ""
                     comment_path = str(done_payload.get("commentPath") or "") if comment_exists else ""
 
-                    usable = bool(ok and patch_exists and comment_exists and patch_path and comment_path)
+                    # Docs completion requires a comment even if the patch is intentionally empty (docs:skip).
+                    usable = bool(ok and patch_exists and comment_exists and patch_path and comment_path and comment_bytes > 0)
                     if not usable:
                         if dry_run:
                             actions.append(

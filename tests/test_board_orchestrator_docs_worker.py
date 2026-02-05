@@ -268,6 +268,99 @@ class TestDocsWorkerAutomation(unittest.TestCase):
                 bo.WORKER_SPAWN_CMD = old_worker_spawn
                 bo.REVIEWER_SPAWN_CMD = old_reviewer_spawn
 
+    def test_docs_done_empty_comment_tags_error_and_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeKanboard()
+            state_path = Path(tmp) / "state.json"
+
+            tid = 22
+            fake.tasks[tid] = {
+                "id": tid,
+                "title": "Docs: missing comment",
+                "description": "Repo: /tmp",
+                "column_id": fake.col_docs,
+                "swimlane_id": 1,
+                "position": 1,
+            }
+            fake.tags_by_task_id[tid] = ["docs:auto", "docs:pending"]
+
+            patch_path = Path(tmp) / "patch.patch"
+            patch_path.write_text("")
+            comment_path = Path(tmp) / "kanboard-comment.md"
+            comment_path.write_text("")
+            done_path = Path(tmp) / "done.json"
+            done_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "taskId": tid,
+                        "runId": "r1",
+                        "ok": True,
+                        "exitCode": 0,
+                        "patchPath": str(patch_path),
+                        "commentPath": str(comment_path),
+                        "patchExists": True,
+                        "commentExists": True,
+                        "patchBytes": 0,
+                        "commentBytes": 0,
+                    }
+                )
+            )
+
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "dryRun": False,
+                        "dryRunRunsRemaining": 0,
+                        "docsWorkersByTaskId": {
+                            str(tid): {
+                                "execSessionId": "opaque-handle",
+                                "donePath": str(done_path),
+                                "patchPath": str(patch_path),
+                                "commentPath": str(comment_path),
+                                "runDir": str(Path(tmp)),
+                                "logPath": str(Path(tmp) / "docs.log"),
+                                "startedAtMs": 1,
+                            }
+                        },
+                    }
+                )
+            )
+
+            old_rpc = bo.rpc
+            old_state = bo.STATE_PATH
+            old_lock = bo.LOCK_PATH
+            old_docs_spawn_cmd = bo.DOCS_SPAWN_CMD
+            old_worker_spawn = bo.WORKER_SPAWN_CMD
+            old_reviewer_spawn = bo.REVIEWER_SPAWN_CMD
+            try:
+                bo.rpc = fake.rpc  # type: ignore[assignment]
+                bo.STATE_PATH = str(state_path)
+                bo.LOCK_PATH = str(Path(tmp) / "lock.json")
+                bo.DOCS_SPAWN_CMD = ""
+                bo.WORKER_SPAWN_CMD = ""
+                bo.REVIEWER_SPAWN_CMD = ""
+
+                rc = bo.main()
+                self.assertEqual(rc, 0)
+                self.assertEqual(int(fake.tasks[tid]["column_id"]), fake.col_docs)
+
+                tags = {t.lower() for t in fake.tags_by_task_id.get(tid, [])}
+                self.assertIn("docs:error", tags)
+                self.assertNotIn("docs:pending", tags)
+
+                self.assertTrue(fake.comments_by_task_id.get(tid))
+
+                saved = json.loads(state_path.read_text())
+                self.assertNotIn(str(tid), (saved.get("docsWorkersByTaskId") or {}))
+            finally:
+                bo.rpc = old_rpc
+                bo.STATE_PATH = old_state
+                bo.LOCK_PATH = old_lock
+                bo.DOCS_SPAWN_CMD = old_docs_spawn_cmd
+                bo.WORKER_SPAWN_CMD = old_worker_spawn
+                bo.REVIEWER_SPAWN_CMD = old_reviewer_spawn
+
     def test_docs_error_stops_respawn_until_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeKanboard()
@@ -371,4 +464,3 @@ class TestDocsWorkerAutomation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

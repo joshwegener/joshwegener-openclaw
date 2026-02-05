@@ -80,6 +80,7 @@ fi
 chmod +x /Users/joshwegener/clawd/scripts/run_orchestrator_loop.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_worker_tmux.sh
 chmod +x /Users/joshwegener/clawd/scripts/spawn_reviewer_tmux.sh
+chmod +x /Users/joshwegener/clawd/scripts/spawn_docs_tmux.sh
 chmod +x /Users/joshwegener/clawd/scripts/tail_latest_logs.sh
 
 ensure_window_cmd "orchestrator" "$ORCHESTRATOR_WINDOW_CMD"
@@ -87,6 +88,7 @@ ensure_window_cmd "orchestrator" "$ORCHESTRATOR_WINDOW_CMD"
 # Convenience: quick tails (optional, but helpful).
 ensure_window_cmd "worker-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/worker worker.log 20 200"
 ensure_window_cmd "review-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/review review.log 20 200"
+ensure_window_cmd "docs-logs" "/Users/joshwegener/clawd/scripts/tail_latest_logs.sh /Users/joshwegener/clawd/runs/docs docs.log 20 200"
 ensure_window_cmd "orchestrator-logs" "tail -n 300 -F /Users/joshwegener/clawd/memory/orchestrator.log 2>/dev/null || bash"
 
 echo "tmux session ready: ${TMUX_SESSION}"

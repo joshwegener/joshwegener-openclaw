@@ -298,6 +298,8 @@ Automation:
 - If a card has `docs:auto` + `docs:pending`, the orchestrator spawns a **docs worker** (Codex) to update `RecallDeck-Docs` based on:
   - the Kanboard task title/description
   - the code patch that just passed review (if present)
+- Spawn command:
+  - `BOARD_ORCHESTRATOR_DOCS_SPAWN_CMD` → `scripts/spawn_docs_tmux.sh {task_id} {repo_key} {repo_path} {patch_path}`
 - When the docs worker completes:
   - If the docs patch is non-empty: tag `docs:completed`
   - If the docs patch is empty and docs truly aren’t required: tag `docs:skip`
