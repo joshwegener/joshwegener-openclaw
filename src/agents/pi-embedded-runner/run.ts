@@ -1,4 +1,6 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import * as readline from "node:readline";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { RunEmbeddedPiAgentParams } from "./run/params.js";
 import type { EmbeddedPiAgentMeta, EmbeddedPiRunResult } from "./types.js";
@@ -43,6 +45,8 @@ import {
   pickFallbackThinkingLevel,
   type FailoverReason,
 } from "../pi-embedded-helpers.js";
+import { normalizeToolName } from "../tool-policy.js";
+import { INIT_TOOL_NAME } from "../tools/init-tool.js";
 import { normalizeUsage, type UsageLike } from "../usage.js";
 import { compactEmbeddedPiSessionDirect } from "./compact.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
@@ -51,6 +55,46 @@ import { resolveModel } from "./model.js";
 import { runEmbeddedAttempt } from "./run/attempt.js";
 import { buildEmbeddedRunPayloads } from "./run/payloads.js";
 import { describeUnknownError } from "./utils.js";
+
+async function sessionHasInitPreflight(sessionFile: string): Promise<boolean> {
+  try {
+    await fs.stat(sessionFile);
+  } catch {
+    return false;
+  }
+
+  const stream = fsSync.createReadStream(sessionFile, { encoding: "utf-8" });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const entry = parsed as { type?: unknown; message?: unknown };
+        if (entry?.type !== "message" || !entry.message || typeof entry.message !== "object") {
+          continue;
+        }
+        const msg = entry.message as { role?: unknown; toolName?: unknown };
+        if (msg.role !== "toolResult") {
+          continue;
+        }
+        const toolName = typeof msg.toolName === "string" ? msg.toolName : "";
+        if (normalizeToolName(toolName) === INIT_TOOL_NAME) {
+          return true;
+        }
+      } catch {
+        // ignore malformed lines
+      }
+    }
+  } finally {
+    rl.close();
+    stream.close();
+  }
+  return false;
+}
 
 type ApiKeyInfo = ResolvedProviderAuth;
 
@@ -304,6 +348,11 @@ export async function runEmbeddedPiAgent(
       }
 
       let overflowCompactionAttempted = false;
+      const shouldInitPreflight =
+        !params.disableTools &&
+        !isProbeSession &&
+        (await sessionHasInitPreflight(params.sessionFile).then((has) => !has));
+      let initPreflightRan = false;
       try {
         while (true) {
           attemptedThinking.add(thinkLevel);
@@ -311,6 +360,72 @@ export async function runEmbeddedPiAgent(
 
           const prompt =
             provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
+
+          if (shouldInitPreflight && !initPreflightRan) {
+            await runEmbeddedAttempt({
+              sessionId: params.sessionId,
+              sessionKey: params.sessionKey,
+              messageChannel: params.messageChannel,
+              messageProvider: params.messageProvider,
+              agentAccountId: params.agentAccountId,
+              messageTo: params.messageTo,
+              messageThreadId: params.messageThreadId,
+              groupId: params.groupId,
+              groupChannel: params.groupChannel,
+              groupSpace: params.groupSpace,
+              spawnedBy: params.spawnedBy,
+              currentChannelId: params.currentChannelId,
+              currentThreadTs: params.currentThreadTs,
+              replyToMode: params.replyToMode,
+              hasRepliedRef: params.hasRepliedRef,
+              sessionFile: params.sessionFile,
+              workspaceDir: params.workspaceDir,
+              agentDir,
+              config: params.config,
+              skillsSnapshot: params.skillsSnapshot,
+              prompt,
+              images: params.images,
+              disableTools: params.disableTools,
+              toolGateMode: "init_only",
+              provider,
+              modelId,
+              model,
+              authStorage,
+              modelRegistry,
+              thinkLevel,
+              verboseLevel: params.verboseLevel,
+              reasoningLevel: params.reasoningLevel,
+              toolResultFormat: resolvedToolResultFormat,
+              execOverrides: params.execOverrides,
+              bashElevated: params.bashElevated,
+              timeoutMs: params.timeoutMs,
+              runId: `${params.runId}:init`,
+              abortSignal: params.abortSignal,
+              extraSystemPrompt: [
+                params.extraSystemPrompt,
+                "[openclaw preflight] Before doing anything else, call the init tool. Do not answer the user in this step.",
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+              streamParams: params.streamParams,
+              ownerNumbers: params.ownerNumbers,
+              enforceFinalTag: params.enforceFinalTag,
+              // Suppress user-visible streaming during preflight.
+              onPartialReply: undefined,
+              onAssistantMessageStart: undefined,
+              onBlockReply: undefined,
+              onBlockReplyFlush: undefined,
+              onReasoningStream: undefined,
+              onToolResult: undefined,
+              onAgentEvent: undefined,
+            });
+            initPreflightRan = true;
+          }
+
+          const effectivePrompt =
+            shouldInitPreflight && initPreflightRan
+              ? "[openclaw] Continue. Answer the previous user request using the preflight results."
+              : prompt;
 
           const attempt = await runEmbeddedAttempt({
             sessionId: params.sessionId,
@@ -333,7 +448,7 @@ export async function runEmbeddedPiAgent(
             agentDir,
             config: params.config,
             skillsSnapshot: params.skillsSnapshot,
-            prompt,
+            prompt: effectivePrompt,
             images: params.images,
             disableTools: params.disableTools,
             provider,

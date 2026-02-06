@@ -36,6 +36,7 @@ export const TOOL_GROUPS: Record<string, string[]> = {
   "group:nodes": ["nodes"],
   // All OpenClaw native tools (excludes provider plugins).
   "group:openclaw": [
+    "init",
     "browser",
     "canvas",
     "nodes",
@@ -58,13 +59,14 @@ export const TOOL_GROUPS: Record<string, string[]> = {
 
 const TOOL_PROFILES: Record<ToolProfileId, ToolProfilePolicy> = {
   minimal: {
-    allow: ["session_status"],
+    allow: ["init", "session_status"],
   },
   coding: {
-    allow: ["group:fs", "group:runtime", "group:sessions", "group:memory", "image"],
+    allow: ["init", "group:fs", "group:runtime", "group:sessions", "group:memory", "image"],
   },
   messaging: {
     allow: [
+      "init",
       "group:messaging",
       "sessions_list",
       "sessions_history",

@@ -25,6 +25,11 @@
     ]
   },
   "tools": {
+    "init": {
+      "emoji": "🚦",
+      "title": "Init",
+      "detailKeys": []
+    },
     "exec": {
       "emoji": "🛠️",
       "title": "Exec",

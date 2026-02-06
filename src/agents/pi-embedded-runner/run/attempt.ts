@@ -2,6 +2,7 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ImageContent } from "@mariozechner/pi-ai";
 import { streamSimple } from "@mariozechner/pi-ai";
 import { createAgentSession, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
@@ -56,6 +57,8 @@ import {
 } from "../../skills.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
+import { normalizeToolName } from "../../tool-policy.js";
+import { INIT_TOOL_NAME, type InitToolOutputV1 } from "../../tools/init-tool.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
 import { isAbortError } from "../abort.js";
@@ -240,6 +243,14 @@ export async function runEmbeddedAttempt(
         });
     const tools = sanitizeToolsForGoogle({ tools: toolsRaw, provider: params.provider });
     logToolSchemasForGoogle({ tools, provider: params.provider });
+    const toolGateMode = params.toolGateMode ?? "full";
+    const toolsForModel =
+      toolGateMode === "init_only"
+        ? tools.filter((tool) => normalizeToolName(tool.name) === INIT_TOOL_NAME)
+        : tools;
+    if (toolGateMode === "init_only" && toolsForModel.length === 0) {
+      throw new Error("init-only gating requested but init tool is not available");
+    }
 
     const machineName = await getMachineDisplayName();
     const runtimeChannel = normalizeMessageChannel(params.messageChannel ?? params.messageProvider);
@@ -360,7 +371,7 @@ export async function runEmbeddedAttempt(
       runtimeInfo,
       messageToolHints,
       sandboxInfo,
-      tools,
+      tools: toolsForModel,
       modelAliasLines: buildModelAliasLines(params.config),
       userTimezone,
       userTime,
@@ -442,24 +453,25 @@ export async function runEmbeddedAttempt(
       });
 
       const { builtInTools, customTools } = splitSdkTools({
-        tools,
+        tools: toolsForModel,
         sandboxEnabled: !!sandbox?.enabled,
       });
 
       // Add client tools (OpenResponses hosted tools) to customTools
       let clientToolCallDetected: { name: string; params: Record<string, unknown> } | null = null;
-      const clientToolDefs = params.clientTools
-        ? toClientToolDefinitions(
-            params.clientTools,
-            (toolName, toolParams) => {
-              clientToolCallDetected = { name: toolName, params: toolParams };
-            },
-            {
-              agentId: sessionAgentId,
-              sessionKey: params.sessionKey,
-            },
-          )
-        : [];
+      const clientToolDefs =
+        toolGateMode === "init_only" || !params.clientTools
+          ? []
+          : toClientToolDefinitions(
+              params.clientTools,
+              (toolName, toolParams) => {
+                clientToolCallDetected = { name: toolName, params: toolParams };
+              },
+              {
+                agentId: sessionAgentId,
+                sessionKey: params.sessionKey,
+              },
+            );
 
       const allCustomTools = [...customTools, ...clientToolDefs];
 
@@ -819,6 +831,251 @@ export async function runEmbeddedAttempt(
             throw err;
           }
         }
+
+        const appendToolCallTurn = (calls: Array<{ id: string; name: string; args: unknown }>) => {
+          sessionManager.appendMessage({
+            role: "assistant",
+            content: calls.map((call) => ({
+              type: "toolCall",
+              id: call.id,
+              name: call.name,
+              arguments: call.args ?? {},
+            })),
+            stopReason: "toolUse",
+            api: params.model.api,
+            provider: params.provider,
+            model: params.modelId,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+            timestamp: Date.now(),
+          } as AgentMessage);
+        };
+
+        const appendToolResultTurn = (params: {
+          id: string;
+          name: string;
+          result: { content?: unknown; details?: unknown };
+          isError?: boolean;
+        }) => {
+          sessionManager.appendMessage({
+            role: "toolResult",
+            toolCallId: params.id,
+            toolName: params.name,
+            content: (params.result.content ?? []) as never,
+            details: params.result.details,
+            isError: Boolean(params.isError),
+            timestamp: Date.now(),
+          } as AgentMessage);
+        };
+
+        const parseInitOutput = (msg: AgentMessage | undefined): InitToolOutputV1 | null => {
+          if (!msg || typeof msg !== "object") {
+            return null;
+          }
+          if ((msg as { role?: unknown }).role !== "toolResult") {
+            return null;
+          }
+          const toolName =
+            typeof (msg as { toolName?: unknown }).toolName === "string"
+              ? String((msg as { toolName?: unknown }).toolName)
+              : "";
+          if (normalizeToolName(toolName) !== INIT_TOOL_NAME) {
+            return null;
+          }
+          const details = (msg as { details?: unknown }).details;
+          if (
+            details &&
+            typeof details === "object" &&
+            (details as { type?: unknown }).type === "openclaw_init" &&
+            (details as { version?: unknown }).version === 1
+          ) {
+            return details as InitToolOutputV1;
+          }
+          const content = (msg as { content?: unknown }).content;
+          const text =
+            Array.isArray(content) && content[0] && typeof content[0] === "object"
+              ? (content[0] as { type?: unknown; text?: unknown }).type === "text"
+                ? (content[0] as { text?: unknown }).text
+                : undefined
+              : undefined;
+          if (typeof text !== "string" || !text.trim()) {
+            return null;
+          }
+          try {
+            const parsed = JSON.parse(text) as unknown;
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              (parsed as { type?: unknown }).type === "openclaw_init" &&
+              (parsed as { version?: unknown }).version === 1
+            ) {
+              return parsed as InitToolOutputV1;
+            }
+          } catch {
+            return null;
+          }
+          return null;
+        };
+
+        const runInitPreflightIfNeeded = async () => {
+          if (toolGateMode !== "init_only") {
+            return;
+          }
+          if (promptError || aborted) {
+            return;
+          }
+
+          const toolMap = new Map<string, (typeof tools)[number]>();
+          for (const tool of tools) {
+            toolMap.set(normalizeToolName(tool.name), tool);
+          }
+          const initTool = toolMap.get(INIT_TOOL_NAME);
+          if (!initTool) {
+            throw new Error("init tool missing during preflight");
+          }
+
+          const messages = activeSession.messages;
+          let lastInit: AgentMessage | undefined;
+          for (let i = messages.length - 1; i >= 0; i -= 1) {
+            const msg = messages[i];
+            if (!msg || typeof msg !== "object") {
+              continue;
+            }
+            if ((msg as { role?: unknown }).role !== "toolResult") {
+              continue;
+            }
+            const name =
+              typeof (msg as { toolName?: unknown }).toolName === "string"
+                ? String((msg as { toolName?: unknown }).toolName)
+                : "";
+            if (normalizeToolName(name) === INIT_TOOL_NAME) {
+              lastInit = msg;
+              break;
+            }
+          }
+
+          let initOut = parseInitOutput(lastInit);
+          const normalizedPrompt = params.prompt ?? "";
+          if (!initOut || !initOut.prompt?.trim()) {
+            const callId = `init_${randomUUID()}`;
+            appendToolCallTurn([
+              { id: callId, name: INIT_TOOL_NAME, args: { prompt: normalizedPrompt } },
+            ]);
+            const result = await initTool.execute(callId, { prompt: normalizedPrompt });
+            const isError =
+              result?.details &&
+              typeof result.details === "object" &&
+              (result.details as { status?: unknown }).status === "error";
+            appendToolResultTurn({
+              id: callId,
+              name: INIT_TOOL_NAME,
+              result,
+              isError,
+            });
+            initOut = (result?.details ?? null) as InitToolOutputV1 | null;
+            if (!initOut || initOut.type !== "openclaw_init" || initOut.version !== 1) {
+              // Fallback: attempt to parse from content if details aren't persisted.
+              initOut = parseInitOutput({
+                role: "toolResult",
+                toolName: INIT_TOOL_NAME,
+                content: result?.content,
+                details: result?.details,
+              } as AgentMessage);
+            }
+          }
+
+          if (!initOut) {
+            throw new Error("init preflight did not produce a valid init payload");
+          }
+
+          const nextCalls = Array.isArray(initOut.next_calls) ? initOut.next_calls : [];
+          for (const group of nextCalls) {
+            const calls = Array.isArray(group) ? group : [];
+            if (calls.length === 0) {
+              continue;
+            }
+            const prepared = calls.map((call) => {
+              const toolName = typeof call.tool === "string" ? call.tool : "";
+              const normalized = normalizeToolName(toolName);
+              const tool = toolMap.get(normalized);
+              const id = `pf_${randomUUID()}`;
+              return { id, toolName, normalized, tool, args: call.args ?? {} };
+            });
+            appendToolCallTurn(prepared.map((c) => ({ id: c.id, name: c.toolName, args: c.args })));
+            const results = await Promise.all(
+              prepared.map(async (c) => {
+                if (!c.tool) {
+                  return {
+                    id: c.id,
+                    name: c.toolName,
+                    result: {
+                      content: [
+                        {
+                          type: "text",
+                          text: JSON.stringify(
+                            {
+                              status: "error",
+                              tool: c.normalized,
+                              error: "tool not available",
+                            },
+                            null,
+                            2,
+                          ),
+                        },
+                      ],
+                      details: {
+                        status: "error",
+                        tool: c.normalized,
+                        error: "tool not available",
+                      },
+                    },
+                    isError: true,
+                  };
+                }
+                try {
+                  const result = await c.tool.execute(c.id, c.args);
+                  const isError =
+                    result?.details &&
+                    typeof result.details === "object" &&
+                    (result.details as { status?: unknown }).status === "error";
+                  return { id: c.id, name: c.toolName, result, isError };
+                } catch (err) {
+                  return {
+                    id: c.id,
+                    name: c.toolName,
+                    result: {
+                      content: [{ type: "text", text: `error: ${String(err)}` }],
+                      details: { status: "error", tool: c.normalized, error: String(err) },
+                    },
+                    isError: true,
+                  };
+                }
+              }),
+            );
+            for (const r of results) {
+              appendToolResultTurn({
+                id: r.id,
+                name: r.name,
+                result: r.result,
+                isError: r.isError,
+              });
+            }
+          }
+        };
+
+        await runInitPreflightIfNeeded();
 
         messagesSnapshot = activeSession.messages.slice();
         sessionIdUsed = activeSession.sessionId;

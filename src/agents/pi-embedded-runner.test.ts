@@ -33,6 +33,42 @@ vi.mock("@mariozechner/pi-ai", async () => {
     timestamp: Date.now(),
   });
 
+  const buildAssistantToolCall = (params: {
+    model: { api: string; provider: string; id: string };
+    toolCallId: string;
+    name: string;
+    args: Record<string, unknown>;
+  }) => ({
+    role: "assistant" as const,
+    content: [
+      {
+        type: "toolCall" as const,
+        id: params.toolCallId,
+        name: params.name,
+        arguments: params.args,
+      },
+    ],
+    stopReason: "toolUse" as const,
+    api: params.model.api,
+    provider: params.model.provider,
+    model: params.model.id,
+    usage: {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+      },
+    },
+    timestamp: Date.now(),
+  });
+
   const buildAssistantErrorMessage = (model: { api: string; provider: string; id: string }) => ({
     role: "assistant" as const,
     content: [] as const,
@@ -58,30 +94,136 @@ vi.mock("@mariozechner/pi-ai", async () => {
     timestamp: Date.now(),
   });
 
+  const findToolNames = (args: unknown[]): string[] => {
+    for (const arg of args) {
+      if (!arg || typeof arg !== "object") {
+        continue;
+      }
+      const rec = arg as Record<string, unknown>;
+      const candidates = [rec.tools, rec.customTools, rec.functions];
+      for (const candidate of candidates) {
+        if (!Array.isArray(candidate)) {
+          continue;
+        }
+        const names = candidate
+          .map((tool) => {
+            if (!tool || typeof tool !== "object") {
+              return "";
+            }
+            const t = tool as Record<string, unknown>;
+            return typeof t.name === "string"
+              ? t.name
+              : typeof (t.function as { name?: unknown } | undefined)?.name === "string"
+                ? String((t.function as { name?: unknown }).name)
+                : "";
+          })
+          .filter(Boolean);
+        if (names.length > 0) {
+          return names;
+        }
+      }
+    }
+    return [];
+  };
+
+  const findMessages = (
+    args: unknown[],
+  ): Array<{ role?: unknown; content?: unknown; toolName?: unknown }> => {
+    for (const arg of args) {
+      if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+        const rec = arg as { messages?: unknown };
+        if (Array.isArray(rec.messages)) {
+          return rec.messages as Array<{ role?: unknown; content?: unknown; toolName?: unknown }>;
+        }
+      }
+      if (!Array.isArray(arg)) {
+        continue;
+      }
+      if (arg.some((item) => item && typeof item === "object" && "role" in (item as object))) {
+        return arg as Array<{ role?: unknown; content?: unknown; toolName?: unknown }>;
+      }
+    }
+    return [];
+  };
+
+  const textFromContent = (content: unknown): string => {
+    if (typeof content === "string") {
+      return content;
+    }
+    if (Array.isArray(content)) {
+      const first = content.find(
+        (c) => c && typeof c === "object" && (c as { type?: unknown }).type === "text",
+      ) as { text?: unknown } | undefined;
+      if (typeof first?.text === "string") {
+        return first.text;
+      }
+    }
+    return "";
+  };
+
+  const shouldReturnInitToolCall = (args: unknown[]): { prompt: string } | null => {
+    const toolNames = findToolNames(args)
+      .map((n) => n.trim().toLowerCase())
+      .filter(Boolean);
+    if (toolNames.length !== 1 || toolNames[0] !== "init") {
+      return null;
+    }
+    const messages = findMessages(args);
+    const hasInitResult = messages.some(
+      (m) =>
+        m &&
+        m.role === "toolResult" &&
+        String(m.toolName ?? "")
+          .trim()
+          .toLowerCase() === "init",
+    );
+    if (hasInitResult) {
+      return null;
+    }
+    const lastUser = messages
+      .slice()
+      .toReversed()
+      .find((m) => m && m.role === "user");
+    const prompt = lastUser ? textFromContent(lastUser.content) : "";
+    return { prompt };
+  };
+
+  const completeWithToolAwareness = async (
+    model: { api: string; provider: string; id: string },
+    ...args: unknown[]
+  ) => {
+    if (model.id === "mock-error") {
+      return buildAssistantErrorMessage(model);
+    }
+    const initCall = shouldReturnInitToolCall(args);
+    if (initCall) {
+      return buildAssistantToolCall({
+        model,
+        toolCallId: "call_init",
+        name: "init",
+        args: { prompt: initCall.prompt },
+      });
+    }
+    return buildAssistantMessage(model);
+  };
+
   return {
     ...actual,
-    complete: async (model: { api: string; provider: string; id: string }) => {
-      if (model.id === "mock-error") {
-        return buildAssistantErrorMessage(model);
-      }
-      return buildAssistantMessage(model);
-    },
-    completeSimple: async (model: { api: string; provider: string; id: string }) => {
-      if (model.id === "mock-error") {
-        return buildAssistantErrorMessage(model);
-      }
-      return buildAssistantMessage(model);
-    },
-    streamSimple: (model: { api: string; provider: string; id: string }) => {
+    complete: async (model: { api: string; provider: string; id: string }, ...args: unknown[]) =>
+      completeWithToolAwareness(model, ...args),
+    completeSimple: async (
+      model: { api: string; provider: string; id: string },
+      ...args: unknown[]
+    ) => completeWithToolAwareness(model, ...args),
+    streamSimple: (model: { api: string; provider: string; id: string }, ...args: unknown[]) => {
       const stream = new actual.AssistantMessageEventStream();
-      queueMicrotask(() => {
+      queueMicrotask(async () => {
+        const message = await completeWithToolAwareness(model, ...args);
         stream.push({
           type: "done",
-          reason: "stop",
-          message:
-            model.id === "mock-error"
-              ? buildAssistantErrorMessage(model)
-              : buildAssistantMessage(model),
+          reason:
+            (message as { stopReason?: unknown }).stopReason === "toolUse" ? "toolUse" : "stop",
+          message,
         });
         stream.end();
       });
@@ -136,6 +278,28 @@ const makeOpenAiConfig = (modelIds: string[]) =>
     },
   }) satisfies OpenClawConfig;
 
+const makeAnthropicConfig = (modelIds: string[]) =>
+  ({
+    models: {
+      providers: {
+        anthropic: {
+          api: "anthropic-messages",
+          apiKey: "sk-test",
+          baseUrl: "https://example.com",
+          models: modelIds.map((id) => ({
+            id,
+            name: `Mock ${id}`,
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 16_000,
+            maxTokens: 2048,
+          })),
+        },
+      },
+    },
+  }) satisfies OpenClawConfig;
+
 const ensureModels = (cfg: OpenClawConfig) => ensureOpenClawModelsJson(cfg, agentDir) as unknown;
 
 const nextSessionFile = () => {
@@ -165,11 +329,11 @@ const readSessionMessages = async (sessionFile: string) => {
       (line) =>
         JSON.parse(line) as {
           type?: string;
-          message?: { role?: string; content?: unknown };
+          message?: { role?: string; content?: unknown; toolName?: unknown };
         },
     )
     .filter((entry) => entry.type === "message")
-    .map((entry) => entry.message as { role?: string; content?: unknown });
+    .map((entry) => entry.message as { role?: string; content?: unknown; toolName?: unknown });
 };
 
 describe("runEmbeddedPiAgent", () => {
@@ -252,6 +416,99 @@ describe("runEmbeddedPiAgent", () => {
       }
     },
   );
+
+  itIfNotWin32("runs init preflight once per session", async () => {
+    const sessionFile = nextSessionFile();
+    const cfg = makeOpenAiConfig(["mock-1"]);
+    await ensureModels(cfg);
+
+    const first = await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: testSessionKey,
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "hello",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+      enqueue: immediateEnqueue,
+    });
+    expect(first.payloads?.[0]?.text).toBeTruthy();
+
+    const afterFirst = await readSessionMessages(sessionFile);
+    const initResultsFirst = afterFirst.filter(
+      (m) =>
+        m?.role === "toolResult" &&
+        String(m.toolName ?? "")
+          .trim()
+          .toLowerCase() === "init",
+    );
+    expect(initResultsFirst.length).toBe(1);
+    expect(
+      afterFirst.some(
+        (m) =>
+          m?.role === "user" &&
+          typeof textFromContent(m.content) === "string" &&
+          String(textFromContent(m.content)).includes("[openclaw] Continue."),
+      ),
+    ).toBe(true);
+
+    await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: testSessionKey,
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "second",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+      enqueue: immediateEnqueue,
+    });
+
+    const afterSecond = await readSessionMessages(sessionFile);
+    const initResultsSecond = afterSecond.filter(
+      (m) =>
+        m?.role === "toolResult" &&
+        String(m.toolName ?? "")
+          .trim()
+          .toLowerCase() === "init",
+    );
+    expect(initResultsSecond.length).toBe(1);
+  });
+
+  itIfNotWin32("runs init preflight for anthropic providers too", async () => {
+    const sessionFile = nextSessionFile();
+    const cfg = makeAnthropicConfig(["mock-a"]);
+    await ensureModels(cfg);
+
+    await runEmbeddedPiAgent({
+      sessionId: "session:test",
+      sessionKey: testSessionKey,
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "hello",
+      provider: "anthropic",
+      model: "mock-a",
+      timeoutMs: 5_000,
+      agentDir,
+      enqueue: immediateEnqueue,
+    });
+
+    const messages = await readSessionMessages(sessionFile);
+    const initResults = messages.filter(
+      (m) =>
+        m?.role === "toolResult" &&
+        String(m.toolName ?? "")
+          .trim()
+          .toLowerCase() === "init",
+    );
+    expect(initResults.length).toBe(1);
+  });
 
   it("persists the user message when prompt fails before assistant output", async () => {
     const sessionFile = nextSessionFile();

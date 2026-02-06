@@ -46,6 +46,12 @@ export type EmbeddedRunAttemptParams = {
   clientTools?: ClientToolDefinition[];
   /** Disable built-in tools for this run (LLM-only mode). */
   disableTools?: boolean;
+  /**
+   * Tool gating mode for this attempt.
+   * - "init_only": expose only the `init` tool to the model
+   * - "full": expose the normal toolset (default)
+   */
+  toolGateMode?: "init_only" | "full";
   provider: string;
   modelId: string;
   model: Model<Api>;
