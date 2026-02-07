@@ -1372,8 +1372,23 @@ WORKER_LOG_EXPAND_LINES = int(os.environ.get("BOARD_ORCHESTRATOR_WORKER_LOG_EXPA
 
 # Very small heuristic classifier. These strings are intentionally broad.
 _DIAG_PATTERNS = [
-    ("quota", re.compile(r"\b(quota|rate limit|429|insufficient_quota)\b", re.IGNORECASE)),
-    ("auth", re.compile(r"\b(unauthorized|forbidden|401|403|invalid api key|expired token)\b", re.IGNORECASE)),
+    # NOTE: Avoid matching bare HTTP status codes like "401" / "403" / "429".
+    # Those appear frequently in *documentation text* that workers may print while
+    # reading API docs, and we do not want false "auth/quota" diagnoses.
+    (
+        "quota",
+        re.compile(
+            r"\b(quota|rate[\s_-]?limit|insufficient[_-]?quota|HTTP\s*429|429\s+too\s+many\s+requests)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "auth",
+        re.compile(
+            r"\b(unauthorized|forbidden|invalid api key|expired token|no api key|not logged|login required|HTTP\s*401|HTTP\s*403|401\s+unauthorized|403\s+forbidden)\b",
+            re.IGNORECASE,
+        ),
+    ),
     ("permissions", re.compile(r"\b(permission denied|operation not permitted|EPERM|EACCES)\b", re.IGNORECASE)),
     ("git", re.compile(r"\b(fatal:|could not read from remote repository|not a git repository|merge conflict)\b", re.IGNORECASE)),
     ("network", re.compile(r"\b(network is unreachable|timed out|timeout|ENOTFOUND|ECONNRESET|EAI_AGAIN|Temporary failure in name resolution)\b", re.IGNORECASE)),
