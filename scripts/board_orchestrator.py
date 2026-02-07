@@ -99,6 +99,15 @@ TAG_REVIEW_SKIP = "review:skip"
 TAG_REVIEW_RERUN = "review:rerun"
 TAG_REVIEW_RETRY = "review:retry"  # alias for review:rerun (human muscle memory)
 
+# When enabled (default), any active critical task freezes normal throughput until the critical reaches Done.
+# This prevents the system from burning tokens on non-critical work while a critical is waiting in Review/Docs.
+CRITICAL_FREEZE_ALL = os.environ.get("BOARD_ORCHESTRATOR_CRITICAL_FREEZE_ALL", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 # Accept both "Depends on:" and "Dependencies:" prefixes (we've seen both in task descriptions).
 DEPENDS_RE = re.compile(r"^(?:depends on|dependency|dependencies)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 EXCLUSIVE_RE = re.compile(r"^exclusive\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -2406,7 +2415,9 @@ def main() -> int:
         queued_critical_ids = {int(t.get("id")) for t, _sl_id, _col_id in queued_critical}
         active_critical_id: Optional[int] = None
         active_critical_col_id: Optional[int] = None
-        critical_exclusive = False  # True only when a critical card is actively in WIP.
+        # When CRITICAL_FREEZE_ALL=1, any active critical freezes normal pulling until the critical reaches Done.
+        # Otherwise, we only freeze when a critical is actively in WIP.
+        critical_exclusive = False
         if active_critical is not None:
             try:
                 active_critical_id = int(active_critical[0].get("id") or 0)
@@ -2417,7 +2428,10 @@ def main() -> int:
             except Exception:
                 active_critical_col_id = None
             if active_critical_col_id is not None:
-                critical_exclusive = active_critical_col_id == int(col_wip["id"])
+                if CRITICAL_FREEZE_ALL:
+                    critical_exclusive = active_critical_col_id != int(col_done["id"])
+                else:
+                    critical_exclusive = active_critical_col_id == int(col_wip["id"])
 
         wip_count = len(wip_tasks)
         wip_active_count_cache: Optional[int] = None
@@ -4340,10 +4354,10 @@ def main() -> int:
                         actions.append(f"Tagged Documentation #{did} ({dtitle}) as docs:pending")
                     budget -= 1
 
-        # Resume tasks paused by a prior critical whenever no critical is actively in WIP.
+        # Resume tasks paused by a prior critical only when there is no active critical.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
 
-        if (not critical_exclusive) and paused_by_critical:
+        if active_critical is None and paused_by_critical:
             budget = max(budget, ACTION_BUDGET_CRITICAL)
             cleared_any = False
 
@@ -4440,6 +4454,10 @@ def main() -> int:
                     budget -= 1
 
                 state['pausedByCritical'] = paused_state
+
+            # While a critical is active (and freeze is enabled), keep other WIP cards paused.
+            if critical_exclusive:
+                pause_noncritical_wip()
 
             if critical_in_wip:
                 # Only a critical actively in WIP is exclusive.
