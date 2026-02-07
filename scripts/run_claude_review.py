@@ -138,8 +138,9 @@ def main() -> int:
     log_path = args.log_path
     append_line(log_path, f"### REVIEW START {utc_now()}")
 
+    claude_bin = (os.environ.get("CLAUDE_BIN") or "").strip() or "claude"
     cmd = [
-        "claude",
+        claude_bin,
         "-p",
         "--model",
         args.model,
@@ -176,7 +177,7 @@ def main() -> int:
             "score": 1,
             "verdict": "BLOCKER",
             "critical_items": [f"Reviewer execution error: {type(e).__name__}: {e}"],
-            "notes": "Claude review command failed to execute.",
+            "notes": f"Claude review command failed to execute (tried {claude_bin!r}).",
         }
         if args.revision:
             result["reviewRevision"] = args.revision
