@@ -86,6 +86,8 @@ TAG_BLOCKED_REPO = "blocked:repo"
 TAG_BLOCKED_CONTEXT = "blocked:context"
 TAG_BLOCKED_ARTIFACT = "blocked:artifact"
 TAG_BLOCKED_THRASH = "blocked:thrash"
+TAG_BLOCKED_AUTH = "blocked:auth"
+TAG_BLOCKED_QUOTA = "blocked:quota"
 TAG_NO_REPO = "no-repo"
 TAG_NEEDS_REWORK = "needs-rework"  # legacy
 
@@ -100,9 +102,9 @@ TAG_REVIEW_SKIP = "review:skip"
 TAG_REVIEW_RERUN = "review:rerun"
 TAG_REVIEW_RETRY = "review:retry"  # alias for review:rerun (human muscle memory)
 
-# When enabled (default), any active critical task freezes normal throughput until the critical reaches Done.
+# When enabled, any active critical task freezes normal throughput until the critical reaches Done.
 # This prevents the system from burning tokens on non-critical work while a critical is waiting in Review/Docs.
-CRITICAL_FREEZE_ALL = os.environ.get("BOARD_ORCHESTRATOR_CRITICAL_FREEZE_ALL", "1").strip().lower() in (
+CRITICAL_FREEZE_ALL = os.environ.get("BOARD_ORCHESTRATOR_CRITICAL_FREEZE_ALL", "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -311,6 +313,8 @@ def load_state() -> Dict[str, Any]:
         "repoMap": {},
         "repoByTaskId": {},
         "autoBlockedByOrchestrator": {},
+        # provider health/backoff bookkeeping (optional, self-healing)
+        "providerHealth": {},
         # review automation bookkeeping (optional, self-healing)
         "reviewersByTaskId": {},
         "reviewResultsByTaskId": {},
@@ -396,6 +400,338 @@ def maybe_notify(state: Dict[str, Any], *, actions: List[str], errors: List[str]
         state["notify"] = {"lastDigest": digest, "lastAtS": now_s}
     except Exception:
         pass
+
+
+# -----------------------------------------------------------------------------
+# Provider preflight + exponential backoff (anti-thrash)
+# -----------------------------------------------------------------------------
+
+PREFLIGHT_ENABLED = os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+PREFLIGHT_TIMEOUT_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_TIMEOUT_SEC", "4"))
+PREFLIGHT_OK_TTL_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_OK_TTL_SEC", "300"))
+PREFLIGHT_BACKOFF_BASE_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_BACKOFF_BASE_SEC", "60"))
+PREFLIGHT_BACKOFF_MAX_SEC = int(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_BACKOFF_MAX_SEC", "3600"))
+# Add a small jitter to avoid herd effects if multiple cron jobs run at once.
+PREFLIGHT_BACKOFF_JITTER_PCT = float(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGHT_BACKOFF_JITTER_PCT", "0.10"))
+
+
+def _classify_provider_failure(output: str) -> str:
+    """Return 'quota' or 'auth' or 'unknown' based on common CLI error strings."""
+    s = (output or "").lower()
+    if any(x in s for x in ("insufficient_quota", "rate limit", "rate_limit", "quota", "too many requests", "http 429")):
+        return "quota"
+    if any(
+        x in s
+        for x in (
+            "not logged",
+            "login required",
+            "unauthorized",
+            "forbidden",
+            "expired token",
+            "invalid api key",
+            "no api key",
+            "http 401",
+            "http 403",
+        )
+    ):
+        return "auth"
+    return "unknown"
+
+
+def _preflight_override(kind: str) -> str:
+    env_key = f"BOARD_ORCHESTRATOR_PREFLIGHT_{kind.upper()}_PROVIDER"
+    return str(os.environ.get(env_key, "auto") or "auto").strip().lower()
+
+
+def infer_preflight_provider(kind: str, spawn_cmd: str) -> str:
+    """Infer which provider a spawn command depends on.
+
+    We keep this heuristic intentionally conservative so unit tests using stub/echo
+    spawn commands don't depend on local Codex/Claude installs.
+
+    Override via:
+      BOARD_ORCHESTRATOR_PREFLIGHT_WORKER_PROVIDER=codex|none|auto
+      BOARD_ORCHESTRATOR_PREFLIGHT_DOCS_PROVIDER=codex|none|auto
+      BOARD_ORCHESTRATOR_PREFLIGHT_REVIEWER_PROVIDER=claude|none|auto
+    """
+    override = _preflight_override(kind)
+    if override and override != "auto":
+        if override in ("none", "off", "disabled", "0", "false", "no"):
+            return ""
+        return override
+
+    if not spawn_cmd:
+        return ""
+    s = spawn_cmd.lower()
+    if kind in ("worker", "docs"):
+        # Typical: /.../spawn_worker_* or /.../spawn_docs_* wrappers that invoke `codex exec`.
+        if any(x in s for x in ("spawn_worker", "spawn_docs", "codex exec", " codex ", "/codex", "openai")):
+            return "codex"
+        return ""
+    if kind == "reviewer":
+        # Typical: /.../spawn_reviewer_* wrappers that invoke `claude` via run_claude_review.py.
+        if any(x in s for x in ("spawn_reviewer", "run_claude_review.py", " claude ", "/claude", "anthropic")):
+            return "claude"
+        return ""
+    return ""
+
+
+def preflight_codex(*, timeout_sec: int) -> Dict[str, Any]:
+    codex_bin = shutil.which("codex") or ""
+    if not codex_bin:
+        return {"ok": False, "category": "auth", "message": "codex not found in PATH"}
+    try:
+        out = subprocess.run(
+            [codex_bin, "login", "status"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(1, int(timeout_sec)),
+        )
+    except Exception:
+        return {"ok": False, "category": "unknown", "message": "codex login status failed to run"}
+
+    raw = (out.stdout or "").strip()
+    if out.returncode == 0 and "logged in" in raw.lower():
+        return {"ok": True, "message": raw.splitlines()[0] if raw else "Logged in"}
+
+    category = _classify_provider_failure(raw)
+    msg = raw.splitlines()[0].strip() if raw else "codex login status failed"
+    if not msg:
+        msg = "codex login status failed"
+    return {"ok": False, "category": category, "message": msg}
+
+
+def preflight_claude(*, timeout_sec: int) -> Dict[str, Any]:
+    # Quick sanity: reviewer scripts rely on a `claude` CLI.
+    claude_bin = shutil.which("claude") or ""
+    if not claude_bin:
+        return {"ok": False, "category": "auth", "message": "claude not found in PATH"}
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    status_sh = os.path.join(script_dir, "claude-auth-status.sh")
+    if not os.path.isfile(status_sh):
+        return {"ok": False, "category": "unknown", "message": "claude-auth-status.sh missing"}
+
+    try:
+        out = subprocess.run(
+            [status_sh, "simple"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(1, int(timeout_sec)),
+        )
+    except Exception:
+        return {"ok": False, "category": "unknown", "message": "claude auth status check failed to run"}
+
+    raw = (out.stdout or "").strip()
+    if raw == "OK" or raw.endswith("_EXPIRING"):
+        # EXPIRING is still usable; treat as OK for preflight gating.
+        return {"ok": True, "message": raw}
+
+    category = _classify_provider_failure(raw)
+    if "expired" in raw.lower() or raw.endswith("_EXPIRED"):
+        category = "auth"
+    msg = raw.splitlines()[0].strip() if raw else "claude auth not OK"
+    if not msg:
+        msg = "claude auth not OK"
+    return {"ok": False, "category": category, "message": msg}
+
+
+def _provider_health(state: Dict[str, Any]) -> Dict[str, Any]:
+    ph = state.get("providerHealth")
+    if isinstance(ph, dict):
+        return ph
+    ph = {}
+    state["providerHealth"] = ph
+    return ph
+
+
+def provider_preflight_gate(
+    state: Dict[str, Any],
+    *,
+    provider: str,
+    errors: List[str],
+) -> Tuple[bool, Optional[str], str]:
+    """Return (ok, category, message). On failure, records an exponential backoff window in state."""
+    if not PREFLIGHT_ENABLED:
+        return True, None, "disabled"
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return True, None, "no-provider"
+
+    nowm = now_ms()
+    now_s = int(time.time())
+
+    ph = _provider_health(state)
+    entry = ph.get(provider)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    try:
+        blocked_until = int(entry.get("blockedUntilMs") or 0)
+    except Exception:
+        blocked_until = 0
+    if blocked_until and nowm < blocked_until:
+        cat = str(entry.get("lastErrorCategory") or "unknown")
+        msg = str(entry.get("lastErrorMessage") or "provider unavailable")
+        return False, cat, msg
+
+    # Positive cache: if we checked recently and it was OK, don't re-run external checks.
+    try:
+        last_ok = int(entry.get("lastOkAtMs") or 0)
+    except Exception:
+        last_ok = 0
+    if last_ok and (nowm - last_ok) < (max(1, PREFLIGHT_OK_TTL_SEC) * 1000):
+        return True, None, "ok(cached)"
+
+    # Run an actual preflight check.
+    entry["lastCheckAtMs"] = nowm
+    check: Dict[str, Any]
+    if provider == "codex":
+        check = preflight_codex(timeout_sec=PREFLIGHT_TIMEOUT_SEC)
+    elif provider == "claude":
+        check = preflight_claude(timeout_sec=PREFLIGHT_TIMEOUT_SEC)
+    else:
+        check = {"ok": False, "category": "unknown", "message": f"unknown provider {provider!r}"}
+
+    ok = bool(check.get("ok"))
+    if ok:
+        entry["status"] = "ok"
+        entry["lastOkAtMs"] = nowm
+        entry["blockedUntilMs"] = 0
+        entry["consecutiveFailures"] = 0
+        entry["lastErrorCategory"] = ""
+        entry["lastErrorMessage"] = ""
+        # Reset outage notification dedupe.
+        entry["lastNotifiedKey"] = ""
+        entry["lastNotifiedAtS"] = 0
+        ph[provider] = entry
+        state["providerHealth"] = ph
+        return True, None, str(check.get("message") or "ok")
+
+    category = str(check.get("category") or "unknown")
+    message = str(check.get("message") or "provider unavailable")
+    try:
+        fail_count = int(entry.get("consecutiveFailures") or 0)
+    except Exception:
+        fail_count = 0
+    fail_count += 1
+    entry["consecutiveFailures"] = fail_count
+    entry["status"] = "blocked"
+    entry["lastErrorCategory"] = category
+    entry["lastErrorMessage"] = message
+
+    base = max(1, int(PREFLIGHT_BACKOFF_BASE_SEC))
+    cap = max(base, int(PREFLIGHT_BACKOFF_MAX_SEC))
+    backoff = min(cap, base * (2 ** (max(0, fail_count - 1))))
+    # jitter in [1-j, 1+j]
+    jitter_pct = max(0.0, min(0.9, float(PREFLIGHT_BACKOFF_JITTER_PCT)))
+    if jitter_pct > 0:
+        # secrets.randbelow gives a stable-ish jitter without importing random.
+        r = secrets.randbelow(10_000) / 10_000.0
+        factor = (1.0 - jitter_pct) + (2.0 * jitter_pct * r)
+        backoff = int(max(1, backoff * factor))
+
+    entry["blockedUntilMs"] = nowm + (backoff * 1000)
+    entry["lastBackoffSec"] = backoff
+
+    # Single-notification guard: only emit once per outage "key".
+    outage_key = f"{category}:{message}"
+    last_key = str(entry.get("lastNotifiedKey") or "")
+    try:
+        last_at = int(entry.get("lastNotifiedAtS") or 0)
+    except Exception:
+        last_at = 0
+    if outage_key and outage_key != last_key and (not last_at or (now_s - last_at) > 5):
+        entry["lastNotifiedKey"] = outage_key
+        entry["lastNotifiedAtS"] = now_s
+        errors.append(
+            f"manual-fix: provider {provider} unavailable ({category}): {message}. Backing off for {backoff}s."
+        )
+
+    ph[provider] = entry
+    state["providerHealth"] = ph
+    return False, category, message
+
+
+def provider_force_block(
+    state: Dict[str, Any],
+    *,
+    provider: str,
+    category: str,
+    message: str,
+    errors: List[str],
+) -> None:
+    """Mark a provider as unavailable without running any external preflight checks.
+
+    Intended for cases where a worker/reviewer already ran and emitted a clear
+    auth/quota signal in its logs. This helps prevent further spawns from
+    thrashing while the outage persists.
+    """
+    if not PREFLIGHT_ENABLED:
+        return
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return
+    category = (category or "unknown").strip().lower()
+    message = (message or "provider unavailable").strip()
+
+    nowm = now_ms()
+    now_s = int(time.time())
+    ph = _provider_health(state)
+    entry = ph.get(provider)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    try:
+        fail_count = int(entry.get("consecutiveFailures") or 0)
+    except Exception:
+        fail_count = 0
+    fail_count += 1
+    entry["consecutiveFailures"] = fail_count
+    entry["status"] = "blocked"
+    entry["lastErrorCategory"] = category
+    entry["lastErrorMessage"] = message
+    entry["lastCheckAtMs"] = nowm
+
+    base = max(1, int(PREFLIGHT_BACKOFF_BASE_SEC))
+    cap = max(base, int(PREFLIGHT_BACKOFF_MAX_SEC))
+    backoff = min(cap, base * (2 ** (max(0, fail_count - 1))))
+    jitter_pct = max(0.0, min(0.9, float(PREFLIGHT_BACKOFF_JITTER_PCT)))
+    if jitter_pct > 0:
+        r = secrets.randbelow(10_000) / 10_000.0
+        factor = (1.0 - jitter_pct) + (2.0 * jitter_pct * r)
+        backoff = int(max(1, backoff * factor))
+
+    try:
+        blocked_until = int(entry.get("blockedUntilMs") or 0)
+    except Exception:
+        blocked_until = 0
+    entry["blockedUntilMs"] = max(blocked_until, nowm + (backoff * 1000))
+    entry["lastBackoffSec"] = backoff
+
+    outage_key = f"{category}:{message}"
+    last_key = str(entry.get("lastNotifiedKey") or "")
+    try:
+        last_at = int(entry.get("lastNotifiedAtS") or 0)
+    except Exception:
+        last_at = 0
+    if outage_key and outage_key != last_key and (not last_at or (now_s - last_at) > 5):
+        entry["lastNotifiedKey"] = outage_key
+        entry["lastNotifiedAtS"] = now_s
+        errors.append(
+            f"manual-fix: provider {provider} unavailable ({category}): {message}. Backing off for {backoff}s."
+        )
+
+    ph[provider] = entry
+    state["providerHealth"] = ph
 
 
 def tmux_kill_window(window_name: str) -> None:
@@ -2689,7 +3025,7 @@ def main() -> int:
             task_id: int,
             repo_key: Optional[str],
             repo_path: Optional[str],
-        ) -> bool:
+        ) -> Tuple[bool, Optional[Dict[str, Any]]]:
             entry = worker_entry_for(task_id, workers_by_task)
             # Greenfield: a worker entry without a donePath is treated as incomplete/stale.
             # Clear it so reconciliation can spawn a fresh worker run.
@@ -2699,7 +3035,7 @@ def main() -> int:
                 entry = None
             handle = worker_handle(entry)
             if handle and worker_is_alive(handle):
-                return True
+                return True, None
 
             # If we have a pid-based handle but the process is dead, diagnose + decide.
             if handle and not worker_is_alive(handle):
@@ -2742,15 +3078,24 @@ def main() -> int:
                     )
                     add_comment(task_id, msg)
 
-                    # Ensure this results in a Telegram alert via the cron wrapper.
-                    errors.append(
-                        f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
-                    )
+                    if category in ("auth", "quota"):
+                        provider_force_block(
+                            state,
+                            provider="codex",
+                            category=category,
+                            message=f"Detected from worker log (WIP #{task_id})",
+                            errors=errors,
+                        )
+                    else:
+                        # Ensure this results in a Telegram alert via the cron wrapper.
+                        errors.append(
+                            f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
+                        )
 
                     # Drop stale handle so it doesn't get treated as alive.
                     workers_by_task.pop(str(task_id), None)
                     workers_by_task.pop(task_id, None)
-                    return False
+                    return False, {"kind": "worker-dead", "category": category}
 
                 # Otherwise, attempt a controlled respawn (anti-thrash).
                 restart_count = 0
@@ -2780,17 +3125,44 @@ def main() -> int:
                     )
                     workers_by_task.pop(str(task_id), None)
                     workers_by_task.pop(task_id, None)
-                    return False
+                    return False, {"kind": "thrash"}
 
                 # Never spawn workers during dry-run.
                 if dry_run:
-                    return False
+                    return False, {"kind": "dry-run"}
 
                 # Drop stale entry and respawn.
                 workers_by_task.pop(str(task_id), None)
                 workers_by_task.pop(task_id, None)
 
                 if WORKER_SPAWN_CMD and repo_path:
+                    provider = infer_preflight_provider("worker", WORKER_SPAWN_CMD)
+                    if provider:
+                        ok, category2, msg2 = provider_preflight_gate(state, provider=provider, errors=errors)
+                        if not ok:
+                            reason_tag = TAG_BLOCKED_QUOTA if str(category2) == "quota" else TAG_BLOCKED_AUTH
+                            if dry_run:
+                                actions.append(
+                                    f"Would tag WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                                )
+                            else:
+                                try:
+                                    existing = get_task_tags(task_id)
+                                except Exception:
+                                    existing = []
+                                lower = {t.lower() for t in (existing or [])}
+                                if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                                    add_tags(task_id, [reason_tag, TAG_AUTO_BLOCKED])
+                                    record_action(task_id)
+                                    actions.append(
+                                        f"Tagged WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                                    )
+                            return False, {
+                                "kind": "provider-blocked",
+                                "provider": provider,
+                                "category": category2,
+                                "message": msg2,
+                            }
                     spawned = spawn_worker(task_id, repo_key, repo_path)
                     if spawned:
                         spawned["restartCount"] = restart_count + 1
@@ -2799,24 +3171,51 @@ def main() -> int:
                         actions.append(
                             f"Respawned worker for WIP #{task_id} (diagnosed dead pid; category {category})"
                         )
-                        return True
-                return False
+                        return True, None
+                return False, None
 
             # No handle: spawn if allowed.
             if dry_run:
-                return False
+                return False, {"kind": "dry-run"}
             if WORKER_SPAWN_CMD and repo_path:
+                provider = infer_preflight_provider("worker", WORKER_SPAWN_CMD)
+                if provider:
+                    ok, category2, msg2 = provider_preflight_gate(state, provider=provider, errors=errors)
+                    if not ok:
+                        reason_tag = TAG_BLOCKED_QUOTA if str(category2) == "quota" else TAG_BLOCKED_AUTH
+                        if dry_run:
+                            actions.append(
+                                f"Would tag WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                            )
+                        else:
+                            try:
+                                existing = get_task_tags(task_id)
+                            except Exception:
+                                existing = []
+                            lower = {t.lower() for t in (existing or [])}
+                            if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                                add_tags(task_id, [reason_tag, TAG_AUTO_BLOCKED])
+                                record_action(task_id)
+                                actions.append(
+                                    f"Tagged WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                                )
+                        return False, {
+                            "kind": "provider-blocked",
+                            "provider": provider,
+                            "category": category2,
+                            "message": msg2,
+                        }
                 spawned = spawn_worker(task_id, repo_key, repo_path)
                 if spawned:
                     workers_by_task[str(task_id)] = spawned
-                    return True
-            return False
+                    return True, None
+            return False, None
 
         def ensure_worker_handle_for_task(
             task_id: int,
             repo_key: Optional[str],
             repo_path: Optional[str],
-        ) -> bool:
+        ) -> Tuple[bool, Optional[Dict[str, Any]]]:
             if not WORKER_LEASES_ENABLED:
                 return ensure_worker_handle_for_task_legacy(task_id, repo_key, repo_path)
 
@@ -2829,16 +3228,16 @@ def main() -> int:
                 update_lease_liveness(task_id, lease, verdict, note)
                 if verdict == "alive":
                     workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
-                    return True
+                    return True, None
                 if verdict == "unknown":
                     if note == LEASE_PENDING_NOTE:
                         workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
-                        return True
+                        return True, None
                     errors.append(
                         f"manual-fix: WIP #{task_id} worker liveness unknown ({note or 'unknown'})."
                     )
                     workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
-                    return False
+                    return False, {"kind": "lease-unknown", "note": note}
 
             # If we have a dead lease or a dead pid-based handle, diagnose + decide.
             handle = worker_handle(entry)
@@ -2883,15 +3282,24 @@ def main() -> int:
                     )
                     add_comment(task_id, msg)
 
-                    errors.append(
-                        f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
-                    )
+                    if category in ("auth", "quota"):
+                        provider_force_block(
+                            state,
+                            provider="codex",
+                            category=category,
+                            message=f"Detected from worker log (WIP #{task_id})",
+                            errors=errors,
+                        )
+                    else:
+                        errors.append(
+                            f"manual-fix: WIP #{task_id} ({title}) worker died ({category}); auto-paused."
+                        )
                     workers_by_task.pop(str(task_id), None)
                     workers_by_task.pop(task_id, None)
                     if lease:
                         archive_lease_dir(task_id, lease_id or lease.get("leaseId"))
                     record_spawn_attempt(task_id, lease_id, run_id, "refused", f"manual-{category}")
-                    return False
+                    return False, {"kind": "worker-dead", "category": category}
 
                 # Otherwise, attempt a controlled respawn (anti-thrash).
                 nowm = now_ms()
@@ -2914,12 +3322,12 @@ def main() -> int:
                     if lease:
                         archive_lease_dir(task_id, lease_id or lease.get("leaseId"))
                     record_spawn_attempt(task_id, lease_id, run_id, "refused", "thrash")
-                    return False
+                    return False, {"kind": "thrash"}
 
                 # Never spawn workers during dry-run.
                 if dry_run:
                     record_spawn_attempt(task_id, lease_id, run_id, "refused", "dry-run")
-                    return False
+                    return False, {"kind": "dry-run"}
 
                 # Drop stale entry and stale lease before respawn.
                 workers_by_task.pop(str(task_id), None)
@@ -2935,12 +3343,14 @@ def main() -> int:
                         verdict, _pid, note = evaluate_lease_liveness(task_id, existing)
                         update_lease_liveness(task_id, existing, verdict, note)
                         workers_by_task[str(task_id)] = lease_worker_entry(task_id, existing)
-                        return verdict == "alive"
+                        if verdict == "alive":
+                            return True, None
+                        return False, {"kind": "lease-unknown", "note": note}
                     if recover_stale_lease_dir(task_id):
                         if not acquire_lease_dir(task_id):
-                            return False
+                            return False, {"kind": "lease-race"}
                     else:
-                        return False
+                        return False, {"kind": "lease-race"}
                 cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
                 lease_payload = init_lease_payload(
                     task_id,
@@ -2961,16 +3371,45 @@ def main() -> int:
                 lease_payload["worker"]["execSessionId"] = handle
                 write_lease_files(task_id, lease_payload)
                 workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
-                return True
+                return True, None
 
             # No lease or lease cleaned up: attempt to acquire + spawn.
             if dry_run:
                 record_spawn_attempt(task_id, lease_id, run_id, "refused", "dry-run")
-                return False
+                return False, {"kind": "dry-run"}
             if not WORKER_SPAWN_CMD or not repo_path:
                 reason = "no-spawn-cmd" if not WORKER_SPAWN_CMD else "missing-repo-path"
                 record_spawn_attempt(task_id, lease_id, run_id, "refused", reason)
-                return False
+                return False, {"kind": "misconfig", "reason": reason}
+
+            provider = infer_preflight_provider("worker", WORKER_SPAWN_CMD)
+            if provider:
+                ok, category2, msg2 = provider_preflight_gate(state, provider=provider, errors=errors)
+                if not ok:
+                    reason_tag = TAG_BLOCKED_QUOTA if str(category2) == "quota" else TAG_BLOCKED_AUTH
+                    if dry_run:
+                        actions.append(
+                            f"Would tag WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                        )
+                    else:
+                        try:
+                            existing = get_task_tags(task_id)
+                        except Exception:
+                            existing = []
+                        lower = {t.lower() for t in (existing or [])}
+                        if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                            add_tags(task_id, [reason_tag, TAG_AUTO_BLOCKED])
+                            record_action(task_id)
+                            actions.append(
+                                f"Tagged WIP #{task_id} as {reason_tag} (provider {provider} {category2}: {msg2})"
+                            )
+                    record_spawn_attempt(task_id, lease_id, run_id, "refused", f"provider-{category2}")
+                    return False, {
+                        "kind": "provider-blocked",
+                        "provider": provider,
+                        "category": category2,
+                        "message": msg2,
+                    }
 
             if not thrash_guard_allows(task_id, now_ms()):
                 try:
@@ -2986,7 +3425,7 @@ def main() -> int:
                     f"manual-fix: WIP #{task_id} ({title}) worker keeps dying; paused (thrash guard)."
                 )
                 record_spawn_attempt(task_id, lease_id, run_id, "refused", "thrash")
-                return False
+                return False, {"kind": "thrash"}
 
             if not acquire_lease_dir(task_id):
                 # Another process owns/created the lease; read + reconcile.
@@ -2996,24 +3435,24 @@ def main() -> int:
                     update_lease_liveness(task_id, lease, verdict, note)
                     if verdict == "alive":
                         workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
-                        return True
+                        return True, None
                     if verdict == "unknown":
                         errors.append(
                             f"manual-fix: WIP #{task_id} worker liveness unknown ({note or 'unknown'})."
                         )
                         workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease)
-                        return False
+                        return False, {"kind": "lease-unknown", "note": note}
                     # Dead/invalid lease: archive and retry once.
                     archive_lease_dir(task_id, lease.get("leaseId"))
                     if not acquire_lease_dir(task_id):
                         record_spawn_attempt(task_id, lease.get("leaseId"), run_id, "refused", "lease-race")
-                        return False
+                        return False, {"kind": "lease-race"}
                 else:
                     if recover_stale_lease_dir(task_id) and acquire_lease_dir(task_id):
                         pass
                     else:
                         record_spawn_attempt(task_id, lease_id, run_id, "refused", "lease-race")
-                        return False
+                        return False, {"kind": "lease-race"}
 
             cmd, safe_repo_key, safe_repo_path = format_worker_spawn_cmd(task_id, repo_key, repo_path)
             lease_payload = init_lease_payload(
@@ -3034,7 +3473,7 @@ def main() -> int:
             if not spawned:
                 record_spawn_attempt(task_id, lease_id, run_id, "failed", "spawn-failed")
                 archive_lease_dir(task_id, lease_id)
-                return False
+                return False, {"kind": "spawn-failed"}
 
             worker_pid = extract_pid(worker_handle(spawned))
             lease_payload["worker"]["pid"] = worker_pid
@@ -3047,7 +3486,7 @@ def main() -> int:
 
             record_spawn_attempt(task_id, lease_id, run_id, "spawned")
             workers_by_task[str(task_id)] = lease_worker_entry(task_id, lease_payload)
-            return True
+            return True, None
 
         def resolve_patch_path_for_task(task_id: int) -> Optional[str]:
             entry = worker_entry_for(task_id, workers_by_task)
@@ -3087,7 +3526,7 @@ def main() -> int:
             source_repo_key: Optional[str],
             source_repo_path: Optional[str],
             source_patch_path: Optional[str],
-        ) -> bool:
+        ) -> Tuple[bool, Optional[Dict[str, Any]]]:
             entry = worker_entry_for(task_id, docs_workers_by_task)
             # Require a donePath so we can deterministically reconcile completion.
             if isinstance(entry, dict) and not (entry.get("donePath") or entry.get("done_path")):
@@ -3097,16 +3536,38 @@ def main() -> int:
 
             handle = worker_handle(entry)
             if handle and worker_is_alive(handle):
-                return True
+                return True, None
             if handle and not worker_is_alive(handle):
                 docs_workers_by_task.pop(str(task_id), None)
                 docs_workers_by_task.pop(task_id, None)
             if DOCS_SPAWN_CMD:
+                provider = infer_preflight_provider("docs", DOCS_SPAWN_CMD)
+                if provider:
+                    ok, category, msg = provider_preflight_gate(state, provider=provider, errors=errors)
+                    if not ok:
+                        reason_tag = TAG_BLOCKED_QUOTA if str(category) == "quota" else TAG_BLOCKED_AUTH
+                        if dry_run:
+                            actions.append(
+                                f"Would tag Documentation #{task_id} as {reason_tag} (provider {provider} {category}: {msg})"
+                            )
+                        else:
+                            try:
+                                existing = get_task_tags(task_id)
+                            except Exception:
+                                existing = []
+                            lower = {t.lower() for t in (existing or [])}
+                            if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                                add_tags(task_id, [reason_tag, TAG_AUTO_BLOCKED])
+                                record_action(task_id)
+                                actions.append(
+                                    f"Tagged Documentation #{task_id} as {reason_tag} (provider {provider} {category}: {msg})"
+                                )
+                        return False, {"kind": "provider-blocked", "provider": provider, "category": category, "message": msg}
                 spawned = spawn_docs_worker(task_id, source_repo_key, source_repo_path, source_patch_path)
                 if spawned and spawned.get("donePath"):
                     docs_workers_by_task[str(task_id)] = spawned
-                    return True
-            return False
+                    return True, None
+            return False, None
 
         def ensure_reviewer_handle_for_task(
             task_id: int,
@@ -3114,7 +3575,7 @@ def main() -> int:
             repo_path: Optional[str],
             patch_path: Optional[str],
             review_revision: Optional[str],
-        ) -> bool:
+        ) -> Tuple[bool, Optional[Dict[str, Any]]]:
             entry = worker_entry_for(task_id, reviewers_by_task)
             # Greenfield: a reviewer entry without a resultPath is treated as incomplete/stale.
             if isinstance(entry, dict) and not (entry.get("resultPath") or entry.get("result_path")):
@@ -3123,17 +3584,39 @@ def main() -> int:
                 entry = None
             handle = worker_handle(entry)
             if handle and reviewer_is_alive(handle):
-                return True
+                return True, None
             if handle and not reviewer_is_alive(handle):
                 # Drop stale reviewer bookkeeping so we can respawn deterministically.
                 reviewers_by_task.pop(str(task_id), None)
                 reviewers_by_task.pop(task_id, None)
             if REVIEWER_SPAWN_CMD:
+                provider = infer_preflight_provider("reviewer", REVIEWER_SPAWN_CMD)
+                if provider:
+                    ok, category, msg = provider_preflight_gate(state, provider=provider, errors=errors)
+                    if not ok:
+                        reason_tag = TAG_BLOCKED_QUOTA if str(category) == "quota" else TAG_BLOCKED_AUTH
+                        if dry_run:
+                            actions.append(
+                                f"Would tag Review #{task_id} as {reason_tag} (provider {provider} {category}: {msg})"
+                            )
+                        else:
+                            try:
+                                existing = get_task_tags(task_id)
+                            except Exception:
+                                existing = []
+                            lower = {t.lower() for t in (existing or [])}
+                            if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                                add_tags(task_id, [reason_tag, TAG_AUTO_BLOCKED])
+                                record_action(task_id)
+                                actions.append(
+                                    f"Tagged Review #{task_id} as {reason_tag} (provider {provider} {category}: {msg})"
+                                )
+                        return False, {"kind": "provider-blocked", "provider": provider, "category": category, "message": msg}
                 spawned = spawn_reviewer(task_id, repo_key, repo_path, patch_path, review_revision)
                 if spawned:
                     reviewers_by_task[str(task_id)] = spawned
-                    return True
-            return False
+                    return True, None
+            return False, None
 
         def pause_missing_worker(
             task_id: int,
@@ -3439,10 +3922,16 @@ def main() -> int:
                             paused_missing_worker_ids.append(wid)
                         budget -= 1
                         continue
-                    if ensure_worker_handle_for_task(wid, repo_key, repo_path):
+                    ok, reason = ensure_worker_handle_for_task(wid, repo_key, repo_path)
+                    if ok:
                         actions.append(f"Spawned worker for {label} #{wid} ({wtitle})")
                         budget -= 1
                         spawned = True
+                    else:
+                        # If the provider is unavailable, don't auto-pause/move; just tag and stop spawning.
+                        if isinstance(reason, dict) and reason.get("kind") == "provider-blocked":
+                            budget -= 1
+                            continue
 
                 if spawned:
                     continue
@@ -3726,6 +4215,34 @@ def main() -> int:
                         if dry_run:
                             actions.append(f"Would tag Review #{rid} ({rtitle}) as review:error (reviewer exited w/out result)")
                         else:
+                            # If the reviewer died due to auth/quota, treat it as a provider outage so we don't
+                            # keep spawning new reviewers and burning usage.
+                            try:
+                                rlog_path = str(entry.get("logPath") or "") if isinstance(entry, dict) else ""
+                            except Exception:
+                                rlog_path = ""
+                            if not rlog_path:
+                                rlog_path = default_reviewer_log_path(rid)
+                            diag = diagnose_worker_failure(rid, rlog_path)
+                            category = str(diag.get("category") or "")
+                            if category in ("auth", "quota"):
+                                provider_force_block(
+                                    state,
+                                    provider="claude",
+                                    category=category,
+                                    message=f"Detected from reviewer log (Review #{rid})",
+                                    errors=errors,
+                                )
+                                reason_tag = TAG_BLOCKED_QUOTA if category == "quota" else TAG_BLOCKED_AUTH
+                                try:
+                                    existing = get_task_tags(rid)
+                                except Exception:
+                                    existing = []
+                                lower = {t.lower() for t in (existing or [])}
+                                if reason_tag.lower() not in lower or TAG_AUTO_BLOCKED.lower() not in lower:
+                                    add_tags(rid, [reason_tag, TAG_AUTO_BLOCKED])
+                                    record_action(rid)
+
                             add_tag(rid, TAG_REVIEW_ERROR)
                             remove_tags(rid, [TAG_REVIEW_INFLIGHT, TAG_REVIEW_PENDING])
                             msg = (
@@ -3759,7 +4276,9 @@ def main() -> int:
                     except Exception:
                         rdesc = ""
                     _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
-                    spawned_ok = ensure_reviewer_handle_for_task(rid, repo_key, repo_path, patch_path, current_revision)
+                    spawned_ok, spawned_reason = ensure_reviewer_handle_for_task(
+                        rid, repo_key, repo_path, patch_path, current_revision
+                    )
                     if spawned_ok:
                         # Reset spawn failure counter on success.
                         reviewer_spawn_failures_by_task.pop(str(rid), None)
@@ -3783,6 +4302,9 @@ def main() -> int:
                         set_task_tags(pid, rid, new_tags)
                         actions.append(f"Spawned reviewer for Review #{rid} ({rtitle})")
                     else:
+                        # Provider preflight failures are global and should not escalate per-card to review:error.
+                        if isinstance(spawned_reason, dict) and spawned_reason.get("kind") == "provider-blocked":
+                            continue
                         # Escalate repeated spawn failures to review:error so we don't sit in review:pending forever.
                         rec = reviewer_spawn_failures_by_task.get(str(rid)) or {}
                         if not isinstance(rec, dict):
@@ -4346,7 +4868,7 @@ def main() -> int:
                             )
                             budget -= 1
                             continue
-                        spawned_ok = ensure_docs_worker_handle_for_task(did, repo_key, repo_path, patch_path)
+                        spawned_ok, spawned_reason = ensure_docs_worker_handle_for_task(did, repo_key, repo_path, patch_path)
                         if spawned_ok:
                             docs_spawn_failures_by_task.pop(str(did), None)
                             # Atomically transition pending -> inflight (avoid overlap).
@@ -4372,6 +4894,10 @@ def main() -> int:
                             record_action(did)
                             actions.append(f"Spawned docs worker for Documentation #{did} ({dtitle})")
                         else:
+                            # Provider preflight failures are global and should not escalate per-card to docs:error.
+                            if isinstance(spawned_reason, dict) and spawned_reason.get("kind") == "provider-blocked":
+                                budget -= 1
+                                continue
                             rec = docs_spawn_failures_by_task.get(str(did)) or {}
                             if not isinstance(rec, dict):
                                 rec = {}
@@ -4413,10 +4939,10 @@ def main() -> int:
                         actions.append(f"Tagged Documentation #{did} ({dtitle}) as docs:pending")
                     budget -= 1
 
-        # Resume tasks paused by a prior critical only when there is no active critical.
+        # Resume tasks paused by a prior critical when the critical no longer enforces exclusivity.
         paused_by_critical: Dict[str, Any] = state.get("pausedByCritical") or {}
 
-        if active_critical is None and paused_by_critical:
+        if (active_critical is None or not critical_exclusive) and paused_by_critical:
             budget = max(budget, ACTION_BUDGET_CRITICAL)
             cleared_any = False
 
@@ -4532,7 +5058,8 @@ def main() -> int:
                         ctags = []
                         cdesc = ""
                     repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, ctags, cdesc)
-                    if repo_path and ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                    ok, reason = ensure_worker_handle_for_task(cid, repo_key, repo_path) if repo_path else (False, None)
+                    if repo_path and ok:
                         if worker_handle(worker_entry_for(cid, workers_by_task)):
                             actions.append(f"Spawned worker for active critical #{cid} ({ctitle})")
                         else:
@@ -4545,13 +5072,18 @@ def main() -> int:
                             ):
                                 budget -= 1
                     else:
-                        reason = "missing worker handle"
-                        if not repo_ok and not repo_path:
-                            reason = "missing worker handle + repo mapping"
-                        if not WORKER_SPAWN_CMD:
-                            reason = "missing worker handle (no worker spawn command configured)"
-                        if pause_missing_worker(cid, int(csl_id), ctitle, reason, label="critical"):
+                        if isinstance(reason, dict) and reason.get("kind") == "provider-blocked":
+                            # Provider outage; do not auto-pause critical further here (we already tagged it).
                             budget -= 1
+                            pause_noncritical_wip()
+                        else:
+                            reason = "missing worker handle"
+                            if not repo_ok and not repo_path:
+                                reason = "missing worker handle + repo mapping"
+                            if not WORKER_SPAWN_CMD:
+                                reason = "missing worker handle (no worker spawn command configured)"
+                            if pause_missing_worker(cid, int(csl_id), ctitle, reason, label="critical"):
+                                budget -= 1
                 pause_noncritical_wip()
 
             elif critical_in_review:
@@ -4629,7 +5161,8 @@ def main() -> int:
                                     )
                                     actions.append(f"Would start critical #{cid} ({ctitle}) -> WIP")
                             else:
-                                if ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                                ok, reason = ensure_worker_handle_for_task(cid, repo_key, repo_path)
+                                if ok:
                                     entry = worker_entry_for(cid, workers_by_task)
                                     if worker_handle(entry):
                                         pause_noncritical_wip()
@@ -4648,14 +5181,18 @@ def main() -> int:
                                             label="critical",
                                         )
                                 else:
-                                    pause_missing_worker(
-                                        cid,
-                                        int(csl_id),
-                                        ctitle,
-                                        "cannot start worker",
-                                        force=True,
-                                        label="critical",
-                                    )
+                                    if isinstance(reason, dict) and reason.get("kind") == "provider-blocked":
+                                        # Provider outage; do not pause/move this critical.
+                                        pass
+                                    else:
+                                        pause_missing_worker(
+                                            cid,
+                                            int(csl_id),
+                                            ctitle,
+                                            "cannot start worker",
+                                            force=True,
+                                            label="critical",
+                                        )
                             budget -= 1
 
             # While a critical is actively in WIP, freeze normal pulling.
@@ -5101,18 +5638,26 @@ def main() -> int:
                         actions.append(f"Would spawn worker for #{cid} ({ctitle}) then move Ready -> WIP")
                         started = True
                 else:
-                    if ensure_worker_handle_for_task(cid, repo_key, repo_path):
+                    ok, reason = ensure_worker_handle_for_task(cid, repo_key, repo_path)
+                    if ok:
                         move_task(pid, cid, int(col_wip["id"]), 1, sl_id)
                         record_action(cid)
                         moved_to_wip.append(cid)
                         actions.append(f"Moved Ready #{cid} ({ctitle}) -> WIP")
                         started = True
                     else:
-                        # Can't start worker (misconfig or spawn failure). Leave the card in Ready,
-                        # tag it so it doesn't keep getting retried, and surface the problem.
-                        record_action(cid)
-                        add_tags(cid, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
-                        actions.append(f"Tagged Ready #{cid} ({ctitle}) as paused:missing-worker (cannot start worker)")
+                        if isinstance(reason, dict) and reason.get("kind") == "provider-blocked":
+                            # Provider outage: don't tag paused:missing-worker (not actionable per-card).
+                            # Stop pulling additional Ready work this tick to avoid churn.
+                            budget = 0
+                        else:
+                            # Can't start worker (misconfig or spawn failure). Leave the card in Ready,
+                            # tag it so it doesn't keep getting retried, and surface the problem.
+                            record_action(cid)
+                            add_tags(cid, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
+                            actions.append(
+                                f"Tagged Ready #{cid} ({ctitle}) as paused:missing-worker (cannot start worker)"
+                            )
 
                 # simulate state
                 ready_tasks_sorted = ready_tasks_sorted[1:]
