@@ -78,6 +78,7 @@ TAG_PAUSED_MISSING_WORKER = "paused:missing-worker"
 TAG_PAUSED_STALE_WORKER = "paused:stale-worker"
 TAG_PAUSED_DEPS = "paused:deps"
 TAG_PAUSED_EXCLUSIVE = "paused:exclusive"
+TAG_PAUSED_ARTIFACT = "paused:artifact"
 TAG_AUTO_BLOCKED = "auto-blocked"
 TAG_BLOCKED_DEPS = "blocked:deps"
 TAG_BLOCKED_EXCLUSIVE = "blocked:exclusive"
@@ -2141,6 +2142,25 @@ def is_epic(tags: List[str]) -> bool:
 def is_critical(tags: List[str]) -> bool:
     return TAG_CRITICAL in {x.lower() for x in tags}
 
+def is_hard_hold(tags: List[str]) -> bool:
+    """Hard holds are human intent to stop automation.
+
+    We intentionally *do not* treat paused/blocked tags as hard holds for purposes
+    of critical selection. A critical task may be paused/blocked and should still
+    freeze throughput until it is resolved.
+    """
+    lower = {x.lower() for x in tags}
+    # Legacy: some older runs incorrectly added plain `hold` alongside `hold:queued-critical`.
+    # In that case, treat it as orchestrator-managed and allow selection so we can unqueue.
+    if TAG_HOLD in lower and TAG_HOLD_QUEUED_CRITICAL not in lower:
+        return True
+    if TAG_NOAUTO in lower:
+        return True
+    for t in lower:
+        if t.startswith("hold:") and t != TAG_HOLD_QUEUED_CRITICAL:
+            return True
+    return False
+
 
 def has_tag(tags: List[str], tag: str) -> bool:
     return tag.lower() in {x.lower() for x in tags}
@@ -2400,8 +2420,7 @@ def main() -> int:
             # Critical queueing uses `hold:queued-critical` as an orchestrator-managed fence.
             # Those cards are "held" for normal flow, but MUST still be considered for
             # critical selection so we can unqueue them when they become active.
-            is_queued_critical = has_tag(tags, TAG_HOLD_QUEUED_CRITICAL)
-            if is_critical(tags) and (not is_held(tags) or is_queued_critical):
+            if is_critical(tags) and (not is_hard_hold(tags)):
                 critical_candidates.append((t, sl_id, col_id))
                 critical_task_ids.add(tid)
 
@@ -3295,17 +3314,42 @@ def main() -> int:
                         reason = f"worker exited non-zero (see done.json)"
                     if patch_exists and patch_bytes == 0:
                         reason = "worker produced empty patch"
+                    try:
+                        wtags = get_task_tags(wid)
+                    except Exception:
+                        wtags = []
+                    critical_wip = is_critical(wtags)
                     if dry_run:
-                        actions.append(f"Would keep WIP #{wid} ({wtitle}) in Backlog; tagged blocked:artifact: {reason}")
+                        if critical_wip:
+                            actions.append(
+                                f"Would keep CRITICAL WIP #{wid} ({wtitle}) in WIP; tagged paused:artifact: {reason}"
+                            )
+                        else:
+                            actions.append(
+                                f"Would keep WIP #{wid} ({wtitle}) in Backlog; tagged blocked:artifact: {reason}"
+                            )
                     else:
-                        tag_blocked_and_keep_in_backlog(
-                            wid,
-                            int(wsl_id),
-                            wtitle,
-                            reason,
-                            TAG_BLOCKED_ARTIFACT,
-                            from_label="WIP",
-                        )
+                        if critical_wip:
+                            # Do not demote critical cards out of WIP on worker failure. Pause them in-place and
+                            # require explicit human intervention (unpause / rerun) to avoid burn+thrash.
+                            add_tags(wid, [TAG_PAUSED, TAG_PAUSED_ARTIFACT])
+                            remove_tags(wid, [TAG_REVIEW_PENDING, TAG_REVIEW_INFLIGHT])
+                            add_comment(
+                                wid,
+                                "Worker finished without usable artifacts. This CRITICAL card has been paused in WIP "
+                                f"(tagged {TAG_PAUSED_ARTIFACT}) to prevent respawn thrash.\n"
+                                f"Reason: {reason}\n"
+                                "Next: inspect the worker log/done.json, fix env/tooling, then remove paused tags to rerun.",
+                            )
+                        else:
+                            tag_blocked_and_keep_in_backlog(
+                                wid,
+                                int(wsl_id),
+                                wtitle,
+                                reason,
+                                TAG_BLOCKED_ARTIFACT,
+                                from_label="WIP",
+                            )
                         workers_by_task.pop(str(wid), None)
                         workers_by_task.pop(wid, None)
                         tmux_kill_window(f"worker-{wid}")
