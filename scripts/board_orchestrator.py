@@ -3011,6 +3011,12 @@ def main() -> int:
                 if done and done.get("patchPath") and os.path.isfile(str(done.get("patchPath"))):
                     entry["patchPath"] = str(done.get("patchPath"))
                     return str(done.get("patchPath"))
+            # Fallback: allow manual injection of a patch artifact without a worker handle.
+            # This supports cases where a patch was produced out-of-band but we still want
+            # to run the standard review automation.
+            p = default_worker_patch_path(task_id)
+            if p and os.path.isfile(str(p)):
+                return str(p)
             return None
 
         def docs_inflight_count() -> int:
