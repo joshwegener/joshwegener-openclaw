@@ -4283,11 +4283,16 @@ def main() -> int:
 
                 # Recovery: allow consuming a completed review even if we lost the reviewer handle
                 # (e.g., orchestrator restart) by scanning the per-run review.json directory.
-                if not result_payload:
+                #
+                # IMPORTANT: If a human explicitly requested a rerun (review:retry/review:rerun),
+                # we must NOT consume stale on-disk review.json/log markers. Otherwise a previous
+                # BLOCKER result can immediately re-assert review:error and prevent reruns.
+                if not result_payload and not rerun_requested:
                     result_payload = latest_reviewer_result_for_task(rid)
 
                 # Back-compat: fall back to parsing the legacy review log marker.
-                if not result_payload:
+                # Same rule as above: never consume legacy results when a rerun is requested.
+                if not result_payload and not rerun_requested:
                     log_path = None
                     if isinstance(entry, dict):
                         log_path = entry.get("logPath")
