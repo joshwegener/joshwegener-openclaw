@@ -50,6 +50,27 @@ function buildMemorySection(params: { isMinimal: boolean; availableTools: Set<st
   ];
 }
 
+function buildRecallDeckScopeSection(params: { isMinimal: boolean; availableTools: Set<string> }) {
+  if (params.isMinimal) {
+    return [];
+  }
+  const hasRecallDeck = [...params.availableTools].some((t) =>
+    t.toLowerCase().includes("recalldeck"),
+  );
+  if (!hasRecallDeck) {
+    return [];
+  }
+  return [
+    "## RecallDeck (Deck Scope)",
+    'Default retrieval scope for clawd/OpenClaw workers: the dedicated "RecallDeck" deck + the read-only "Docs" deck.',
+    "- If you use RecallDeck recall/search tools and the user/task did not specify deck scope:",
+    '  - Resolve deck ids by name via list_decks, then pass deck_ids=\'[\"<RecallDeck deck id>\",\"<Docs deck id>\"]\' on recall/search calls (a JSON array string).',
+    '  - For writes/imports, use the "RecallDeck" deck only (never write to "Docs").',
+    "- If deck ids change (decks recreated), re-resolve by name and continue.",
+    "",
+  ];
+}
+
 function buildUserIdentitySection(ownerLine: string | undefined, isMinimal: boolean) {
   if (!ownerLine || isMinimal) {
     return [];
@@ -352,6 +373,7 @@ export function buildAgentSystemPrompt(params: {
     readToolName,
   });
   const memorySection = buildMemorySection({ isMinimal, availableTools });
+  const recallDeckSection = buildRecallDeckScopeSection({ isMinimal, availableTools });
   const docsSection = buildDocsSection({
     docsPath: params.docsPath,
     isMinimal,
@@ -409,6 +431,7 @@ export function buildAgentSystemPrompt(params: {
     "",
     ...skillsSection,
     ...memorySection,
+    ...recallDeckSection,
     // Skip self-update for subagent/none modes
     hasGateway && !isMinimal ? "## OpenClaw Self-Update" : "",
     hasGateway && !isMinimal

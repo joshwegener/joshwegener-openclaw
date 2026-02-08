@@ -31,6 +31,16 @@ HARD SAFETY RULES (must follow):
 - Do not search for secrets/keys/tokens or paste private content into logs/comments.
 - Only read/edit code relevant to the task inside the repo (typically scripts/, tests/, src/).
 
+RecallDeck scope (default for clawd workers):
+- Default recall/search deck scope is the dedicated "RecallDeck" deck + the read-only "Docs" deck.
+- Default write deck is "RecallDeck" (never write to "Docs").
+- If you use RecallDeck tools that support `deck_ids` / `deckIds` and the task/user did not explicitly specify scope:
+  - Use deck_ids='["2e134680-3970-4d8d-ad18-52220117ea5b","ee83fcd2-d6d2-4961-8572-a4d9c99a16cf"]' for recall/search.
+  - Use deck_id="2e134680-3970-4d8d-ad18-52220117ea5b" for imports/writes.
+  - If a tool errors on deck ids (decks recreated), call list_decks and re-resolve by name.
+- For auditability, print one line before your first RecallDeck recall/search call:
+  [RD_SCOPE] read=RecallDeck+Docs write=RecallDeck
+
 Work in the repo at: ${REPO_PATH}
 Repo key: ${REPO_KEY}
 
