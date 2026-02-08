@@ -60,6 +60,9 @@ FIRST_RUN_DRYRUNS = 1  # first run only
 TAG_EPIC = "epic"
 TAG_HOLD = "hold"
 TAG_HOLD_QUEUED_CRITICAL = "hold:queued-critical"
+TAG_HOLD_DEPS = "hold:deps"
+TAG_HOLD_NEEDS_REPO = "hold:needs-repo"
+TAG_HOLD_MANUAL = "hold:manual"
 TAG_NOAUTO = "no-auto"
 TAG_STORY = "story"
 TAG_EPIC_CHILD = "epic-child"
@@ -2535,14 +2538,18 @@ def is_hard_hold(tags: List[str]) -> bool:
     freeze throughput until it is resolved.
     """
     lower = {x.lower() for x in tags}
+    orchestrator_holds = {TAG_HOLD_QUEUED_CRITICAL, TAG_HOLD_DEPS, TAG_HOLD_NEEDS_REPO}
     # Legacy: some older runs incorrectly added plain `hold` alongside `hold:queued-critical`.
     # In that case, treat it as orchestrator-managed and allow selection so we can unqueue.
-    if TAG_HOLD in lower and TAG_HOLD_QUEUED_CRITICAL not in lower:
+    if TAG_HOLD in lower:
+        if TAG_HOLD_QUEUED_CRITICAL in lower:
+            return False
+        # Plain `hold` is ambiguous; treat as human intent (manual hold).
         return True
     if TAG_NOAUTO in lower:
         return True
     for t in lower:
-        if t.startswith("hold:") and t != TAG_HOLD_QUEUED_CRITICAL:
+        if t.startswith("hold:") and t not in orchestrator_holds:
             return True
     return False
 
@@ -2616,6 +2623,9 @@ def main() -> int:
         repo_map: Dict[str, str] = (state.get("repoMap") or {})
         repo_by_task: Dict[str, Any] = (state.get("repoByTaskId") or {})
         auto_blocked: Dict[str, Any] = (state.get("autoBlockedByOrchestrator") or {})
+        repo_hold_commented_by_task_id: Dict[str, Any] = (state.get("repoHoldCommentedByTaskId") or {})
+        if not isinstance(repo_hold_commented_by_task_id, dict):
+            repo_hold_commented_by_task_id = {}
         reviewers_by_task: Dict[str, Any] = (state.get("reviewersByTaskId") or {})
         review_results_by_task: Dict[str, Any] = (state.get("reviewResultsByTaskId") or {})
         review_rework_history_by_task: Dict[str, Any] = (state.get("reviewReworkHistoryByTaskId") or {})
@@ -2750,6 +2760,12 @@ def main() -> int:
                     repo_by_task.pop(k, None)
             except Exception:
                 repo_by_task.pop(k, None)
+        for k in list(repo_hold_commented_by_task_id.keys()):
+            try:
+                if int(k) in done_ids:
+                    repo_hold_commented_by_task_id.pop(k, None)
+            except Exception:
+                repo_hold_commented_by_task_id.pop(k, None)
         for k in list(reviewers_by_task.keys()):
             try:
                 if int(k) not in review_ids:
@@ -2952,7 +2968,7 @@ def main() -> int:
                     continue
                 if not has_repo_mapping(tid, title, tags, desc):
                     errors.append(
-                        f"drift: WIP #{tid} ({title}) has no repo mapping (add 'Repo:' in description or tag repo:<key>)"
+                        f"drift: WIP #{tid} ({title}) has no repo mapping (add 'Repo:' in description or tag repo:<key> or tag no-repo)"
                     )
             except Exception:
                 pass
@@ -3059,6 +3075,28 @@ def main() -> int:
                 rpc("createComment", {"task_id": task_id, "user_id": user_id, "content": comment})
             except Exception:
                 pass
+
+        def maybe_comment_needs_repo(task_id: int) -> None:
+            """Post a one-time comment explaining how to add a repo mapping.
+
+            Uses state to avoid re-posting every tick.
+            """
+            if str(task_id) in repo_hold_commented_by_task_id:
+                return
+            msg = (
+                "Automation is paused: this card needs an explicit repo mapping.\n"
+                "Add ONE of:\n"
+                "- `Repo: /absolute/path/to/repo` (in the description)\n"
+                "- tag `repo:<key>` (e.g. `repo:clawd`)\n"
+                "- tag `no-repo` (explicit opt-out)\n"
+                "\n"
+                "Once fixed, the orchestrator will clear `hold:needs-repo`/`blocked:repo` automatically."
+            )
+            if dry_run:
+                actions.append(f"Would comment on #{task_id}: needs repo mapping (Repo:/repo:*/no-repo)")
+                return
+            add_comment(task_id, msg)
+            repo_hold_commented_by_task_id[str(task_id)] = now_ms()
 
         def ensure_worker_handle_for_task_legacy(
             task_id: int,
@@ -3173,8 +3211,8 @@ def main() -> int:
                 # Drop stale entry and respawn.
                 workers_by_task.pop(str(task_id), None)
                 workers_by_task.pop(task_id, None)
-
-                if WORKER_SPAWN_CMD and repo_path:
+                
+                if WORKER_SPAWN_CMD and repo_path is not None:
                     provider = infer_preflight_provider("worker", WORKER_SPAWN_CMD)
                     if provider:
                         ok, category2, msg2 = provider_preflight_gate(state, provider=provider, errors=errors)
@@ -3202,21 +3240,19 @@ def main() -> int:
                                 "category": category2,
                                 "message": msg2,
                             }
-                    spawned = spawn_worker(task_id, repo_key, repo_path)
-                    if spawned:
-                        spawned["restartCount"] = restart_count + 1
-                        spawned["lastRestartAtMs"] = nowm
-                        workers_by_task[str(task_id)] = spawned
-                        actions.append(
-                            f"Respawned worker for WIP #{task_id} (diagnosed dead pid; category {category})"
-                        )
-                        return True, None
+                spawned = spawn_worker(task_id, repo_key, repo_path)
+                if spawned:
+                    spawned["restartCount"] = restart_count + 1
+                    spawned["lastRestartAtMs"] = nowm
+                    workers_by_task[str(task_id)] = spawned
+                    actions.append(f"Respawned worker for WIP #{task_id} (diagnosed dead pid; category {category})")
+                    return True, None
                 return False, None
 
             # No handle: spawn if allowed.
             if dry_run:
                 return False, {"kind": "dry-run"}
-            if WORKER_SPAWN_CMD and repo_path:
+            if WORKER_SPAWN_CMD and repo_path is not None:
                 provider = infer_preflight_provider("worker", WORKER_SPAWN_CMD)
                 if provider:
                     ok, category2, msg2 = provider_preflight_gate(state, provider=provider, errors=errors)
@@ -3674,6 +3710,12 @@ def main() -> int:
             else:
                 record_action(task_id)
                 add_tags(task_id, [TAG_PAUSED, TAG_PAUSED_MISSING_WORKER])
+                # If the card can't run because we can't resolve its repo mapping, attach an explicit hold reason
+                # and a one-time comment so the fix is obvious in Kanboard.
+                if "repo" in (reason or "").lower():
+                    add_tags(task_id, [TAG_AUTO_BLOCKED, TAG_BLOCKED_REPO, TAG_HOLD_NEEDS_REPO])
+                    remove_tags(task_id, [TAG_NO_REPO, TAG_HOLD])
+                    maybe_comment_needs_repo(task_id)
                 actions.append(f"Tagged {label} #{task_id} ({title}) as paused:missing-worker ({reason})")
                 # Keep WIP/Ready clean: paused cards shouldn't sit in active columns.
                 try:
@@ -3704,9 +3746,15 @@ def main() -> int:
             # once the condition clears. Mark these as orchestrator-owned so we can safely clear them.
             if auto_blocked:
                 tags_to_add.append(TAG_AUTO_BLOCKED)
+            if reason_tag == TAG_BLOCKED_DEPS:
+                tags_to_add.append(TAG_HOLD_DEPS)
             if reason_tag == TAG_BLOCKED_REPO:
-                tags_to_add.append(TAG_NO_REPO)
+                tags_to_add.append(TAG_HOLD_NEEDS_REPO)
             add_tags(task_id, tags_to_add)
+            if reason_tag == TAG_BLOCKED_REPO:
+                # Clean up legacy/incorrect auto-tags that made missing mappings ambiguous.
+                remove_tags(task_id, [TAG_NO_REPO, TAG_HOLD])
+                maybe_comment_needs_repo(task_id)
             try:
                 move_task(pid, task_id, int(col_backlog["id"]), 1, int(sl_id))
             except Exception:
@@ -3726,14 +3774,20 @@ def main() -> int:
             title: str,
             tags: List[str],
             description: str,
+            *,
+            require_explicit: bool = False,
         ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
             if has_tag(tags, TAG_NO_REPO):
-                return True, None, None, "tag"
+                # Explicit opt-out: allow automation to proceed without a repo path.
+                # Downstream spawn scripts receive an empty repo path.
+                return True, None, "", "tag"
             hint, source = parse_repo_hint_with_source(
                 tags,
                 description,
                 title,
-                allow_title_prefix=ALLOW_TITLE_REPO_HINT,
+                # Title-prefix mapping is legacy; when enforcing repo hygiene, require explicit
+                # tag/description hints so cards are actionable.
+                allow_title_prefix=(False if require_explicit else ALLOW_TITLE_REPO_HINT),
             )
             repo_key, repo_path = resolve_repo_path(hint, repo_map)
             if repo_path:
@@ -3742,7 +3796,9 @@ def main() -> int:
             return False, repo_key, None, source
 
         def has_repo_mapping(task_id: int, title: str, tags: List[str], description: str) -> bool:
-            ok, _key, _path, _source = resolve_repo_for_task(task_id, title, tags, description)
+            ok, _key, _path, _source = resolve_repo_for_task(
+                task_id, title, tags, description, require_explicit=True
+            )
             return ok
 
         # Determine dry-run
@@ -3948,12 +4004,14 @@ def main() -> int:
                     wtags = []
                     wdesc = ""
 
-                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(wid, wtitle, wtags, wdesc)
+                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                    cid, ctitle, tags, desc, require_explicit=True
+                )
                 is_critical_wip = is_critical(wtags) and not is_held(wtags)
                 spawn_allowed = MISSING_WORKER_POLICY == "spawn" or is_critical_wip
                 label = "critical WIP" if is_critical_wip else "WIP"
                 spawned = False
-                if spawn_allowed and repo_path:
+                if spawn_allowed and repo_path is not None:
                     if dry_run:
                         actions.append(f"Would spawn worker for {label} #{wid} ({wtitle})")
                         if not WORKER_SPAWN_CMD:
@@ -4332,7 +4390,9 @@ def main() -> int:
                         rdesc = (full.get("description") or "")
                     except Exception:
                         rdesc = ""
-                    _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(rid, rtitle, rtags, rdesc)
+                    _repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                        rid, rtitle, rtags, rdesc, require_explicit=True
+                    )
                     spawned_ok, spawned_reason = ensure_reviewer_handle_for_task(
                         rid, repo_key, repo_path, patch_path, current_revision
                     )
@@ -4979,7 +5039,9 @@ def main() -> int:
                             ddesc = (full.get("description") or "")
                         except Exception:
                             ddesc = ""
-                        repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(did, dtitle, dtags, ddesc)
+                        repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                            did, dtitle, dtags, ddesc, require_explicit=True
+                        )
                         patch_path = resolve_patch_path_for_task(did) or ""
                         if not repo_ok:
                             add_tag(did, TAG_DOC_ERROR)
@@ -5185,9 +5247,15 @@ def main() -> int:
                     except Exception:
                         ctags = []
                         cdesc = ""
-                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, ctags, cdesc)
-                    ok, reason = ensure_worker_handle_for_task(cid, repo_key, repo_path) if repo_path else (False, None)
-                    if repo_path and ok:
+                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                        cid, ctitle, ctags, cdesc, require_explicit=True
+                    )
+                    ok, reason = (
+                        ensure_worker_handle_for_task(cid, repo_key, repo_path)
+                        if repo_path is not None
+                        else (False, None)
+                    )
+                    if repo_path is not None and ok:
                         if worker_handle(worker_entry_for(cid, workers_by_task)):
                             actions.append(f"Spawned worker for active critical #{cid} ({ctitle})")
                         else:
@@ -5234,7 +5302,9 @@ def main() -> int:
                     errors.append(f"critical #{cid} ({ctitle}) cannot start: {reason}")
                 else:
                     ctags = get_task_tags(cid)
-                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, ctags, desc)
+                    repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                        cid, ctitle, ctags, desc, require_explicit=True
+                    )
                     if not repo_ok:
                         if dry_run:
                             actions.append(
@@ -5248,6 +5318,7 @@ def main() -> int:
                                 "No repo mapping",
                                 TAG_BLOCKED_REPO,
                                 from_label="critical",
+                                auto_blocked=True,
                             )
                         budget -= 1
                     else:
@@ -5294,6 +5365,18 @@ def main() -> int:
                                     entry = worker_entry_for(cid, workers_by_task)
                                     if worker_handle(entry):
                                         pause_noncritical_wip()
+                                        # Clear transient auto-block fences before starting.
+                                        remove_tags(
+                                            cid,
+                                            [
+                                                TAG_AUTO_BLOCKED,
+                                                TAG_BLOCKED_DEPS,
+                                                TAG_BLOCKED_EXCLUSIVE,
+                                                TAG_BLOCKED_REPO,
+                                                TAG_HOLD_DEPS,
+                                                TAG_HOLD_NEEDS_REPO,
+                                            ],
+                                        )
                                         move_task(pid, cid, int(col_wip["id"]), 1, int(csl_id))
                                         record_action(cid)
                                         moved_to_wip.append(cid)
@@ -5448,7 +5531,7 @@ def main() -> int:
                 # repo mapping (required for auto-start)
                 if not has_repo_mapping(tid, title, tags, desc):
                     if blocked is None:
-                        blocked = (t, sl_id, "No repo mapping (add 'Repo:' or tag repo:<key>)")
+                        blocked = (t, sl_id, "No repo mapping (add 'Repo:' or tag repo:<key> or tag no-repo)")
                     continue
 
                 return (t, sl_id), epic, blocked
@@ -5518,7 +5601,17 @@ def main() -> int:
                         move_task(pid, bid, int(col_ready["id"]), 1, bsl_id)
                         record_action(bid)
                         promoted_to_ready.append(bid)
-                        remove_tags(bid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS, TAG_BLOCKED_EXCLUSIVE, TAG_BLOCKED_REPO, TAG_NO_REPO])
+                        remove_tags(
+                            bid,
+                            [
+                                TAG_AUTO_BLOCKED,
+                                TAG_BLOCKED_DEPS,
+                                TAG_BLOCKED_EXCLUSIVE,
+                                TAG_BLOCKED_REPO,
+                                TAG_HOLD_DEPS,
+                                TAG_HOLD_NEEDS_REPO,
+                            ],
+                        )
                         auto_blocked.pop(str(bid), None)
                         actions.append(f"Auto-healed Backlog #{bid} ({btitle}) -> Ready")
                     budget -= 1
@@ -5570,7 +5663,14 @@ def main() -> int:
                         promoted_to_ready.append(bid)
                         remove_tags(
                             bid,
-                            [TAG_AUTO_BLOCKED, TAG_BLOCKED_DEPS, TAG_BLOCKED_EXCLUSIVE, TAG_BLOCKED_REPO],
+                            [
+                                TAG_AUTO_BLOCKED,
+                                TAG_BLOCKED_DEPS,
+                                TAG_BLOCKED_EXCLUSIVE,
+                                TAG_BLOCKED_REPO,
+                                TAG_HOLD_DEPS,
+                                TAG_HOLD_NEEDS_REPO,
+                            ],
                         )
                         auto_blocked.pop(str(bid), None)
                         actions.append(f"Auto-healed Blocked #{bid} ({btitle}) -> Ready")
@@ -5728,7 +5828,9 @@ def main() -> int:
                     did_something = True
                     continue
 
-                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(cid, ctitle, tags, desc)
+                repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
+                    cid, ctitle, tags, desc, require_explicit=True
+                )
                 if not repo_ok:
                     if not cooled(cid):
                         actions.append(
@@ -5807,6 +5909,7 @@ def main() -> int:
         state["repoByTaskId"] = repo_by_task
         state["workersByTaskId"] = workers_by_task
         state["autoBlockedByOrchestrator"] = auto_blocked
+        state["repoHoldCommentedByTaskId"] = repo_hold_commented_by_task_id
         state["reviewersByTaskId"] = reviewers_by_task
         state["reviewResultsByTaskId"] = review_results_by_task
         state["reviewReworkHistoryByTaskId"] = review_rework_history_by_task

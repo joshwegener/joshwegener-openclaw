@@ -103,7 +103,14 @@ check_claude_code_auth() {
         # Note: This may consume minimal usage; however it is run behind the orchestrator's
         # preflight cache (PREFLIGHT_OK_TTL_SEC) to avoid frequent calls.
         local probe_out
-        probe_out="$("$CLAUDE_BIN" -p --model "${CLAUDE_AUTH_PROBE_MODEL:-haiku}" --dangerously-skip-permissions --output-format text 'Reply with exactly: PONG' 2>/dev/null || true)"
+        local probe_model="${CLAUDE_AUTH_PROBE_MODEL:-}"
+        # Claude Code model aliases are typically "opus"/"sonnet". Older scripts used "haiku"
+        # which is not a valid alias in Claude Code and causes false "auth expired" results.
+        if [ -n "$probe_model" ]; then
+            probe_out="$("$CLAUDE_BIN" -p --model "$probe_model" --dangerously-skip-permissions --output-format text 'Reply with exactly: PONG' 2>/dev/null || true)"
+        else
+            probe_out="$("$CLAUDE_BIN" -p --dangerously-skip-permissions --output-format text 'Reply with exactly: PONG' 2>/dev/null || true)"
+        fi
         probe_out="$(printf '%s' "$probe_out" | tr -d '\r' | tail -n 1 | xargs 2>/dev/null || true)"
         if [ "$probe_out" = "PONG" ]; then
             echo "OK:probe"
