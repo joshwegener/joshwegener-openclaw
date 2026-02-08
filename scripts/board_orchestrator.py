@@ -4072,6 +4072,24 @@ def main() -> int:
                 rtags = get_task_tags(rid)
             except Exception:
                 rtags = []
+
+            # Auto-heal provider blocks: if a card was auto-blocked due to auth/quota
+            # and the provider is healthy again, clear the blocked tags so review can resume.
+            lower_rt = {t.lower() for t in (rtags or [])}
+            if TAG_AUTO_BLOCKED in lower_rt and (TAG_BLOCKED_AUTH in lower_rt or TAG_BLOCKED_QUOTA in lower_rt):
+                provider = infer_preflight_provider("reviewer", REVIEWER_SPAWN_CMD) if REVIEWER_SPAWN_CMD else "claude"
+                if provider:
+                    ok, _cat, _msg = provider_preflight_gate(state, provider=provider, errors=errors)
+                    if ok:
+                        if dry_run:
+                            actions.append(f"Would clear blocked auth/quota tags for Review #{rid} ({rtitle})")
+                        else:
+                            remove_tags(rid, [TAG_AUTO_BLOCKED, TAG_BLOCKED_AUTH, TAG_BLOCKED_QUOTA])
+                            try:
+                                rtags = get_task_tags(rid)
+                            except Exception:
+                                rtags = [t for t in rtags if str(t).lower() not in (TAG_AUTO_BLOCKED, TAG_BLOCKED_AUTH, TAG_BLOCKED_QUOTA)]
+
             if is_held(rtags):
                 continue
             if has_tag(rtags, TAG_REVIEW_SKIP):
