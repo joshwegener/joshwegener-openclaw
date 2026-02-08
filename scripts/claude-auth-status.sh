@@ -22,10 +22,15 @@ fetch_models_status_json() {
     openclaw models status --json 2>/dev/null || true
 }
 
-STATUS_JSON="$(fetch_models_status_json)"
+STATUS_JSON=""
 USE_JSON=0
-if [ -n "$STATUS_JSON" ]; then
-    USE_JSON=1
+# The orchestrator calls this script in `simple` mode for preflight gating; keep that path fast
+# and avoid invoking openclaw unless needed (it can be slow and is unrelated to Claude Code auth).
+if [ "$OUTPUT_MODE" != "simple" ]; then
+    STATUS_JSON="$(fetch_models_status_json)"
+    if [ -n "$STATUS_JSON" ]; then
+        USE_JSON=1
+    fi
 fi
 
 calc_status_from_expires() {
