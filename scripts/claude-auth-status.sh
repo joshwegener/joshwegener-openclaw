@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+# Legacy: older Claude Code versions wrote a token file here. Newer builds may not.
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 OPENCLAW_AUTH="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
 
@@ -86,14 +88,23 @@ json_anthropic_api_key_count() {
 }
 
 check_claude_code_auth() {
-    if [ "$USE_JSON" -eq 1 ]; then
-        local expires_at
-        expires_at=$(json_expires_for_claude_cli)
-        calc_status_from_expires "$expires_at"
-        return $?
-    fi
-
+    # Claude Code auth is NOT the same as OpenClaw auth. Even if openclaw models status
+    # returns JSON, it may reflect token-based profiles unrelated to Claude Code's login.
+    # Prefer the legacy credentials file when present, otherwise a tiny Claude CLI probe.
     if [ ! -f "$CLAUDE_CREDS" ]; then
+        # Newer Claude Code can be authenticated without producing ~/.claude/.credentials.json
+        # (e.g., Claude Team Account / keychain-backed auth). Fall back to a tiny print-mode probe.
+        #
+        # Note: This may consume minimal usage; however it is run behind the orchestrator's
+        # preflight cache (PREFLIGHT_OK_TTL_SEC) to avoid frequent calls.
+        local probe_out
+        probe_out="$("$CLAUDE_BIN" -p --model "${CLAUDE_AUTH_PROBE_MODEL:-haiku}" --dangerously-skip-permissions --output-format text 'Reply with exactly: PONG' 2>/dev/null || true)"
+        probe_out="$(printf '%s' "$probe_out" | tr -d '\r' | tail -n 1 | xargs 2>/dev/null || true)"
+        if [ "$probe_out" = "PONG" ]; then
+            echo "OK:probe"
+            return 0
+        fi
+
         echo "MISSING"
         return 1
     fi
@@ -167,19 +178,14 @@ fi
 # Simple output mode (for scripts/widgets)
 if [ "$OUTPUT_MODE" = "simple" ]; then
     claude_status=$(check_claude_code_auth 2>/dev/null || true)
-    openclaw_status=$(check_openclaw_auth 2>/dev/null || true)
 
+    # For orchestrator preflight gating we only care whether Claude CLI is usable.
+    # OpenClaw auth is checked separately by openclaw itself when needed.
     if [[ "$claude_status" == EXPIRED* ]] || [[ "$claude_status" == MISSING* ]]; then
         echo "CLAUDE_EXPIRED"
         exit 1
-    elif [[ "$openclaw_status" == EXPIRED* ]] || [[ "$openclaw_status" == MISSING* ]]; then
-        echo "OPENCLAW_EXPIRED"
-        exit 1
     elif [[ "$claude_status" == EXPIRING* ]]; then
         echo "CLAUDE_EXPIRING"
-        exit 2
-    elif [[ "$openclaw_status" == EXPIRING* ]]; then
-        echo "OPENCLAW_EXPIRING"
         exit 2
     else
         echo "OK"
