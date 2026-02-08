@@ -6,7 +6,7 @@ Use this when the Kanboard pipeline looks “stuck” (no movement for a while, 
 - In Kanboard, note the task id(s) and current column(s): **Ready**, **WIP**, **Review**, **Blocked**.
 - Check tags for the most common “stop” causes:
   - `paused:*` (manual pause / safety pause)
-  - `hold:*` / `no-auto`
+  - `hold:*` / `no-auto` (common: `hold:queued-critical`, `hold:deps`, `hold:needs-repo`, `hold:manual`)
   - `auto-blocked` + `blocked:*`
   - `review:*`
   - `docs:*`
@@ -17,7 +17,10 @@ Symptoms:
 - Task in **WIP** tagged `paused:missing-worker`
 
 Actions:
-- Ensure the repo mapping is present (`Repo:` line or `repo:<key>` tag).
+- Ensure the repo mapping intent is explicit:
+  - `Repo:` line, or
+  - `repo:<key>` tag, or
+  - `no-repo` tag (explicit opt-out)
 - Ensure the worker spawn command is configured (`BOARD_ORCHESTRATOR_WORKER_SPAWN_CMD`).
 - Clear `paused` / `paused:missing-worker` after fixing config to allow a retry.
 
@@ -64,4 +67,3 @@ Actions:
   - Read the docs worker run dir/log referenced in the card comment.
   - Fix the docs environment (docs repo path, Codex CLI, Kanboard env).
   - Add tag `docs:retry` to allow a retry (or manually tag `docs:skip` / `docs:completed` to finish).
-

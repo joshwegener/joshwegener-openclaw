@@ -64,10 +64,12 @@ When the orchestrator is about to start a task (Ready → WIP), it must be able 
 Supported hints (first match wins):
 - Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
 - Description line: `Repo: <key-or-path>` (e.g. `Repo: server` or `Repo: /Users/joshwegener/Projects/RecallDeck/RecallDeck-Server`)
-- Title prefix: `<key>:` (e.g. `server: Add /v1/recall`, `web: Improve UI`) **legacy fallback**
+- Tag: `no-repo` (explicit opt-out for planning/research tasks)
+- Title prefix: `<key>:` is **legacy** and is **not sufficient** for automation (use an explicit tag or `Repo:` line)
 
 Notes:
 - Prefer tags + explicit `Repo:` hints; title-prefix mapping is legacy and can be disabled via `BOARD_ORCHESTRATOR_ALLOW_TITLE_REPO_HINT=0`.
+- If a task is missing `Repo:`/`repo:<key>`/`no-repo`, the orchestrator tags `hold:needs-repo` and leaves a comment with fix instructions.
 
 Defaults:
 - The orchestrator auto-discovers repos under `RECALLDECK_REPO_ROOT` (default: `/Users/joshwegener/Projects/RecallDeck`) and adds common aliases (e.g. `api` → `server`).

@@ -3814,6 +3814,43 @@ def main() -> int:
 
         budget = ACTION_BUDGET
 
+        # Hygiene: replace ambiguous plain `hold` with explicit hold reasons.
+        # Best-effort; do not scan endlessly in a single tick.
+        def normalize_plain_hold(task_id: int, tags: List[str]) -> bool:
+            lower = {t.lower() for t in (tags or [])}
+            if TAG_HOLD not in lower:
+                return False
+            has_reason = any(t.startswith("hold:") for t in lower)
+            if dry_run:
+                actions.append(f"Would normalize hold tag on #{task_id}")
+                return True
+            # Always remove plain `hold`; keep any existing reason tag.
+            if not has_reason:
+                if TAG_BLOCKED_DEPS in lower:
+                    add_tags(task_id, [TAG_HOLD_DEPS])
+                elif TAG_BLOCKED_REPO in lower:
+                    add_tags(task_id, [TAG_HOLD_NEEDS_REPO])
+                    maybe_comment_needs_repo(task_id)
+                else:
+                    add_tags(task_id, [TAG_HOLD_MANUAL])
+            remove_tag(task_id, TAG_HOLD)
+            return True
+
+        hold_fix_budget = 10
+        if all_open and hold_fix_budget > 0:
+            for t, _sl_id, _col_id in all_open:
+                if hold_fix_budget <= 0:
+                    break
+                tid = int(t.get("id") or 0)
+                if tid <= 0:
+                    continue
+                try:
+                    ttags = get_task_tags(tid)
+                except Exception:
+                    continue
+                if normalize_plain_hold(tid, ttags):
+                    hold_fix_budget -= 1
+
         # If a worker finished and produced artifacts but the card was moved to Blocked
         # (e.g. missing-worker/thrash), promote it to Review so the pipeline can continue.
         completed_blocked_ids: List[int] = []
@@ -4005,7 +4042,7 @@ def main() -> int:
                     wdesc = ""
 
                 repo_ok, repo_key, repo_path, _source = resolve_repo_for_task(
-                    cid, ctitle, tags, desc, require_explicit=True
+                    wid, wtitle, wtags, wdesc, require_explicit=True
                 )
                 is_critical_wip = is_critical(wtags) and not is_held(wtags)
                 spawn_allowed = MISSING_WORKER_POLICY == "spawn" or is_critical_wip

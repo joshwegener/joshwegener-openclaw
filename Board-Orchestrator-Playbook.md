@@ -53,7 +53,8 @@ The orchestrator only auto-starts tasks (Ready → WIP) when it can map the task
 Provide a mapping via one of:
 - Tag: `repo:<key>` (e.g. `repo:server`, `repo:RecallDeck-Server`)
 - Description line: `Repo: <key-or-path>`
-- Title prefix: `<key>:` (e.g. `server: ...`, `web: ...`) **legacy fallback**
+- Tag: `no-repo` (explicit opt-out for planning/research tasks)
+- Title prefix: `<key>:` (e.g. `server: ...`, `web: ...`) is **legacy** and **not sufficient** for automation (use an explicit tag or `Repo:` line)
 
 If a task truly has no repo (planning/research), add tag `no-repo` so it can still be started.
 
