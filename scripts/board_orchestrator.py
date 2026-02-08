@@ -4701,7 +4701,10 @@ def main() -> int:
                     if dry_run:
                         actions.append(f"Would clear docs:error for Documentation #{did} ({dtitle}) (docs:retry)")
                     else:
+                        # On retry we need to re-enter the normal docs spawn state machine.
+                        # Ensure docs:pending is present so docs:auto can trigger a new docs worker.
                         remove_tags(did, [TAG_DOC_ERROR, TAG_DOC_RETRY])
+                        add_tag(did, TAG_DOC_PENDING)
                         try:
                             dtags = get_task_tags(did)
                         except Exception:
