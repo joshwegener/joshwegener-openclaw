@@ -2628,6 +2628,11 @@ def main() -> int:
         docs_spawn_failures_by_task: Dict[str, Any] = (state.get("docsSpawnFailuresByTaskId") or {})
         if not isinstance(docs_spawn_failures_by_task, dict):
             docs_spawn_failures_by_task = {}
+        # Track docs runs that hang (tmux window alive but no done.json) so we can
+        # safely restart without infinite loops.
+        docs_timeout_restarts_by_task: Dict[str, Any] = (state.get("docsTimeoutRestartsByTaskId") or {})
+        if not isinstance(docs_timeout_restarts_by_task, dict):
+            docs_timeout_restarts_by_task = {}
 
         pid = get_project_id()
         board = get_board(pid)
@@ -4782,6 +4787,74 @@ def main() -> int:
 
                 # If a docs worker run completed, consume it and advance deterministically.
                 entry = worker_entry_for(did, docs_workers_by_task)
+
+                # Docs can hang indefinitely (Codex CLI stalled, network issues, etc.). If the
+                # tmux window is still alive but the run has exceeded DOCS_RUN_TIMEOUT_MIN and
+                # done.json never appeared, treat the run as stale and respawn (anti-deadlock).
+                #
+                # We keep this restart bounded: after repeated timeouts we park the card in
+                # docs:error to avoid burning usage.
+                if isinstance(entry, dict):
+                    done_path = entry.get("donePath") or entry.get("done_path") or ""
+                    if done_path and not os.path.isfile(str(done_path)):
+                        try:
+                            started_at_ms = int(entry.get("startedAtMs") or 0) or None
+                        except Exception:
+                            started_at_ms = None
+                        if started_at_ms and DOCS_RUN_TIMEOUT_MIN > 0:
+                            timeout_ms = DOCS_RUN_TIMEOUT_MIN * 60 * 1000
+                            if now_ms() - started_at_ms > timeout_ms:
+                                if dry_run:
+                                    actions.append(
+                                        f"Would restart stale docs worker for Documentation #{did} ({dtitle}) "
+                                        f"(run > {DOCS_RUN_TIMEOUT_MIN}m without done.json)"
+                                    )
+                                else:
+                                    rec = docs_timeout_restarts_by_task.get(str(did)) or {}
+                                    if not isinstance(rec, dict):
+                                        rec = {}
+                                    try:
+                                        count = int(rec.get("count") or 0)
+                                    except Exception:
+                                        count = 0
+                                    count += 1
+                                    rec["count"] = count
+                                    rec["lastAtMs"] = now_ms()
+                                    docs_timeout_restarts_by_task[str(did)] = rec
+
+                                    # Best-effort kill the hung window and drop bookkeeping.
+                                    tmux_kill_window(f"docs-{did}")
+                                    docs_workers_by_task.pop(str(did), None)
+                                    docs_workers_by_task.pop(did, None)
+
+                                    # Re-enter the spawn state machine.
+                                    remove_tag(did, TAG_DOC_INFLIGHT)
+                                    add_tag(did, TAG_DOC_PENDING)
+                                    record_action(did)
+
+                                    actions.append(
+                                        f"Restarted stale docs worker for Documentation #{did} ({dtitle}) "
+                                        f"(timeout {DOCS_RUN_TIMEOUT_MIN}m; attempt {count})"
+                                    )
+
+                                    if count >= 3:
+                                        add_tag(did, TAG_DOC_ERROR)
+                                        remove_tags(did, [TAG_DOC_PENDING, TAG_DOC_INFLIGHT])
+                                        add_comment(
+                                            did,
+                                            "Docs worker appears to be hung (no done.json after timeout).\n"
+                                            f"- attempts: {count}\n"
+                                            "This card is parked with docs:error to avoid thrash.\n"
+                                            "After fixing the docs worker environment, add tag docs:retry.",
+                                        )
+                                        actions.append(
+                                            f"Docs worker timed out {count}x for Documentation #{did} ({dtitle}); tagged docs:error"
+                                        )
+                                budget -= 1
+                                if budget <= 0:
+                                    break
+                                continue
+
                 done_payload = worker_done_from_entry(entry) if isinstance(entry, dict) else None
                 if done_payload:
                     ok = bool(done_payload.get("ok"))
@@ -5292,6 +5365,7 @@ def main() -> int:
             state["reviewerSpawnFailuresByTaskId"] = reviewer_spawn_failures_by_task
             state["docsWorkersByTaskId"] = docs_workers_by_task
             state["docsSpawnFailuresByTaskId"] = docs_spawn_failures_by_task
+            state["docsTimeoutRestartsByTaskId"] = docs_timeout_restarts_by_task
             save_state(state)
             emit_json(
                 mode=mode,
