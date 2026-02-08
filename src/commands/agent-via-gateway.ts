@@ -1,6 +1,7 @@
-import { isCancel, multiselect } from "@clack/prompts";
+import { isCancel, multiselect, select } from "@clack/prompts";
 import type { CliDeps } from "../cli/deps.js";
 import type { PostflightCapturePayload } from "../postflight/types.js";
+import type { PostflightCaptureSettings } from "../postflight/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { listAgentIds } from "../agents/agent-scope.js";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
@@ -65,8 +66,6 @@ export type AgentCliOpts = {
   local?: boolean;
 };
 
-type MemoryCaptureSettings = { mode: "off" | "suggest"; debug: boolean; source: string };
-
 function normalizeCaptureMode(raw: unknown): "off" | "suggest" {
   const val = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   if (val === "off") return "off";
@@ -74,7 +73,16 @@ function normalizeCaptureMode(raw: unknown): "off" | "suggest" {
   return "suggest";
 }
 
-function resolveCaptureSettingsFromEnv(): MemoryCaptureSettings {
+function resolveCaptureSettingsFromEnv(): PostflightCaptureSettings | null {
+  const hasMode =
+    typeof process.env.OPENCLAW_MEMORY_CAPTURE_MODE === "string" &&
+    process.env.OPENCLAW_MEMORY_CAPTURE_MODE.trim().length > 0;
+  const hasDebug =
+    typeof process.env.OPENCLAW_MEMORY_CAPTURE_DEBUG === "string" &&
+    process.env.OPENCLAW_MEMORY_CAPTURE_DEBUG.trim().length > 0;
+  if (!hasMode && !hasDebug) {
+    return null;
+  }
   return {
     mode: normalizeCaptureMode(process.env.OPENCLAW_MEMORY_CAPTURE_MODE),
     debug: isTruthyEnvValue(process.env.OPENCLAW_MEMORY_CAPTURE_DEBUG),
@@ -84,7 +92,7 @@ function resolveCaptureSettingsFromEnv(): MemoryCaptureSettings {
 
 async function fetchCaptureSettingsViaGatewayHttp(
   cfg: ReturnType<typeof loadConfig>,
-): Promise<MemoryCaptureSettings | null> {
+): Promise<PostflightCaptureSettings | null> {
   try {
     const { buildGatewayConnectionDetails } = await import("../gateway/call.js");
     const ws = new URL(buildGatewayConnectionDetails({ config: cfg }).url);
@@ -162,6 +170,17 @@ function formatPayloadForLog(payload: {
     lines.push(`MEDIA:${url}`);
   }
   return lines.join("\n").trimEnd();
+}
+
+function formatPostflightProposalSummary(proposals: Array<{ text: string }>): string {
+  const lines: string[] = [];
+  lines.push("Postflight capture:");
+  for (const [idx, p] of proposals.entries()) {
+    const text = p.text.trim().replace(/\s+/g, " ");
+    const clipped = text.length > 96 ? `${text.slice(0, 93)}…` : text;
+    lines.push(`[x] ${idx + 1}. ${clipped}`);
+  }
+  return lines.join("\n");
 }
 
 export async function agentViaGatewayCommand(opts: AgentCliOpts, runtime: RuntimeEnv) {
@@ -317,9 +336,7 @@ async function runPostflightCapture(params: {
     return;
   }
 
-  const settings = (params.opts.local
-    ? null
-    : await fetchCaptureSettingsViaGatewayHttp(params.cfg)) ??
+  const settings = (await fetchCaptureSettingsViaGatewayHttp(params.cfg)) ??
     resolveCaptureSettingsFromEnv() ?? { mode: "suggest", debug: false, source: "default" };
   if (settings.mode === "off") {
     return;
@@ -346,23 +363,45 @@ async function runPostflightCapture(params: {
   let selected = proposals;
   const canPrompt = Boolean(process.stdout.isTTY && process.stdin.isTTY);
   const autoSave = isTruthyEnvValue(process.env.OPENCLAW_MEMORY_CAPTURE_AUTO_SAVE);
-  if (!canPrompt && !autoSave) {
-    return;
-  }
-  if (canPrompt && !autoSave) {
-    const picked = await multiselect({
-      message: "Postflight capture: Save checked items to memory?",
-      options: proposals.map((p, idx) => ({
-        value: p.id,
-        label: `${idx + 1}. ${p.text.length > 96 ? `${p.text.slice(0, 93)}…` : p.text}`,
-      })),
-      initialValues: allValues,
+  if (autoSave || !canPrompt) {
+    // Low-friction defaults:
+    // - orchestrated runs usually have no TTY; default to "Save all"
+    // - OPENCLAW_MEMORY_CAPTURE_AUTO_SAVE forces "Save all" even when interactive
+    selected = proposals;
+  } else {
+    params.runtime.log(formatPostflightProposalSummary(proposals));
+    const action = await select({
+      message: "Save postflight capture to memory?",
+      options: [
+        { value: "save_all", label: "Save all" },
+        { value: "pick", label: "Choose items" },
+        { value: "skip", label: "Skip" },
+      ],
+      initialValue: "save_all",
     });
-    if (isCancel(picked)) {
+    if (isCancel(action)) {
       return;
     }
-    const pickedSet = new Set(picked);
-    selected = proposals.filter((p) => pickedSet.has(p.id));
+    if (action === "skip") {
+      return;
+    }
+    if (action === "pick") {
+      const picked = await multiselect({
+        message: "Pick items to save",
+        options: proposals.map((p, idx) => ({
+          value: p.id,
+          label: `${idx + 1}. ${p.text.length > 96 ? `${p.text.slice(0, 93)}…` : p.text}`,
+        })),
+        initialValues: allValues,
+      });
+      if (isCancel(picked)) {
+        return;
+      }
+      const pickedSet = new Set(picked);
+      selected = proposals.filter((p) => pickedSet.has(p.id));
+    } else {
+      selected = proposals;
+    }
   }
 
   if (selected.length === 0) {
