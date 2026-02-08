@@ -1,12 +1,21 @@
+import { isCancel, multiselect } from "@clack/prompts";
 import type { CliDeps } from "../cli/deps.js";
+import type { PostflightCapturePayload } from "../postflight/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { listAgentIds } from "../agents/agent-scope.js";
+import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
 import { DEFAULT_CHAT_CHANNEL } from "../channels/registry.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { withProgress } from "../cli/progress.js";
 import { loadConfig } from "../config/config.js";
+import { resolveAgentIdFromSessionKey } from "../config/sessions.js";
+import { resolveGatewayAuth } from "../gateway/auth.js";
 import { callGateway, randomIdempotencyKey } from "../gateway/call.js";
+import { isTruthyEnvValue } from "../infra/env.js";
+import { extractPostflightCaptureFromText } from "../postflight/extract.js";
+import { appendPostflightProposalsToDailyMemory } from "../postflight/save.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { shortenHomePath } from "../utils.js";
 import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
@@ -31,6 +40,10 @@ type GatewayAgentResponse = {
   result?: AgentGatewayResult;
 };
 
+type AgentCliRunResult = GatewayAgentResponse & {
+  postflightCapture?: PostflightCapturePayload | null;
+};
+
 export type AgentCliOpts = {
   message: string;
   agent?: string;
@@ -51,6 +64,74 @@ export type AgentCliOpts = {
   extraSystemPrompt?: string;
   local?: boolean;
 };
+
+type MemoryCaptureSettings = { mode: "off" | "suggest"; debug: boolean; source: string };
+
+function normalizeCaptureMode(raw: unknown): "off" | "suggest" {
+  const val = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (val === "off") return "off";
+  if (val === "suggest") return "suggest";
+  return "suggest";
+}
+
+function resolveCaptureSettingsFromEnv(): MemoryCaptureSettings {
+  return {
+    mode: normalizeCaptureMode(process.env.OPENCLAW_MEMORY_CAPTURE_MODE),
+    debug: isTruthyEnvValue(process.env.OPENCLAW_MEMORY_CAPTURE_DEBUG),
+    source: "env",
+  };
+}
+
+async function fetchCaptureSettingsViaGatewayHttp(
+  cfg: ReturnType<typeof loadConfig>,
+): Promise<MemoryCaptureSettings | null> {
+  try {
+    const { buildGatewayConnectionDetails } = await import("../gateway/call.js");
+    const ws = new URL(buildGatewayConnectionDetails({ config: cfg }).url);
+    const httpProto =
+      ws.protocol === "wss:" ? "https:" : ws.protocol === "ws:" ? "http:" : ws.protocol;
+    const base = new URL(ws.toString());
+    base.protocol = httpProto;
+    base.pathname = "/";
+    base.search = "";
+    base.hash = "";
+    const url = new URL("/v1/settings", base);
+
+    const isRemoteMode = cfg.gateway?.mode === "remote";
+    const remote = isRemoteMode ? cfg.gateway?.remote : undefined;
+    const auth = resolveGatewayAuth({
+      authConfig: cfg.gateway?.auth,
+      env: process.env,
+      tailscaleMode: cfg.gateway?.tailscale?.mode,
+    });
+    const token = isRemoteMode ? remote?.token?.trim() : auth.token?.trim();
+    const password = isRemoteMode ? remote?.password?.trim() : auth.password?.trim();
+    const bearer = auth.mode === "password" ? password : token;
+    const headers: Record<string, string> = {};
+    if (bearer) {
+      headers.authorization = `Bearer ${bearer}`;
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1200);
+    try {
+      const res = await fetch(url, { method: "GET", headers, signal: ctrl.signal });
+      if (!res.ok) {
+        return null;
+      }
+      const body = (await res.json()) as Record<string, unknown>;
+      return {
+        mode: normalizeCaptureMode(body.memory_capture_mode),
+        debug: Boolean(body.memory_capture_debug),
+        source: "gateway",
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
 
 function parseTimeoutSeconds(opts: { cfg: ReturnType<typeof loadConfig>; timeout?: string }) {
   const raw =
@@ -155,7 +236,19 @@ export async function agentViaGatewayCommand(opts: AgentCliOpts, runtime: Runtim
   }
 
   const result = response?.result;
-  const payloads = result?.payloads ?? [];
+  let postflightCapture: PostflightCapturePayload | null = null;
+  const payloads =
+    (result?.payloads ?? []).map((payload) => {
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text.trim()) {
+        return payload;
+      }
+      const extracted = extractPostflightCaptureFromText(text);
+      if (extracted.capture) {
+        postflightCapture = extracted.capture;
+      }
+      return extracted.cleanedText !== text ? { ...payload, text: extracted.cleanedText } : payload;
+    }) ?? [];
 
   if (payloads.length === 0) {
     runtime.log(response?.summary ? String(response.summary) : "No reply from agent.");
@@ -169,23 +262,117 @@ export async function agentViaGatewayCommand(opts: AgentCliOpts, runtime: Runtim
     }
   }
 
-  return response;
+  const nextResponse: AgentCliRunResult = postflightCapture
+    ? { ...response, postflightCapture }
+    : response;
+  return nextResponse;
 }
 
 export async function agentCliCommand(opts: AgentCliOpts, runtime: RuntimeEnv, deps?: CliDeps) {
+  const cfg = loadConfig();
   const localOpts = {
     ...opts,
     agentId: opts.agent,
     replyAccountId: opts.replyAccount,
   };
   if (opts.local === true) {
-    return await agentCommand(localOpts, runtime, deps);
+    const result = await agentCommand(localOpts, runtime, deps);
+    await runPostflightCapture({
+      cfg,
+      runtime,
+      opts,
+      capture: (result.meta as any)?.postflightCapture ?? null,
+    });
+    return result;
   }
 
   try {
-    return await agentViaGatewayCommand(opts, runtime);
+    const result = (await agentViaGatewayCommand(opts, runtime)) as AgentCliRunResult;
+    await runPostflightCapture({ cfg, runtime, opts, capture: result.postflightCapture ?? null });
+    return result;
   } catch (err) {
     runtime.error?.(`Gateway agent failed; falling back to embedded: ${String(err)}`);
-    return await agentCommand(localOpts, runtime, deps);
+    const result = await agentCommand(localOpts, runtime, deps);
+    await runPostflightCapture({
+      cfg,
+      runtime,
+      opts,
+      capture: (result.meta as any)?.postflightCapture ?? null,
+    });
+    return result;
   }
+}
+
+async function runPostflightCapture(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  runtime: RuntimeEnv;
+  opts: AgentCliOpts;
+  capture: PostflightCapturePayload | null;
+}) {
+  if (params.opts.json) {
+    return;
+  }
+  const capture = params.capture;
+  if (!capture || capture.kind !== "memory_writes" || capture.proposals.length === 0) {
+    return;
+  }
+
+  const settings = (params.opts.local
+    ? null
+    : await fetchCaptureSettingsViaGatewayHttp(params.cfg)) ??
+    resolveCaptureSettingsFromEnv() ?? { mode: "suggest", debug: false, source: "default" };
+  if (settings.mode === "off") {
+    return;
+  }
+
+  if (settings.debug) {
+    params.runtime.log(
+      ["", "MEMORY_CAPTURE_JSON (debug):", "```json", capture.rawJson, "```"].join("\n"),
+    );
+  }
+
+  const sessionKey = resolveSessionKeyForRequest({
+    cfg: params.cfg,
+    agentId: params.opts.agent,
+    to: params.opts.to,
+    sessionId: params.opts.sessionId,
+  }).sessionKey;
+  const agentId = resolveAgentIdFromSessionKey(sessionKey);
+  const workspaceDir = resolveAgentWorkspaceDir(params.cfg, agentId);
+
+  const proposals = capture.proposals.slice(0, 20);
+  const allValues = proposals.map((p) => p.id);
+
+  let selected = proposals;
+  const canPrompt = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+  const autoSave = isTruthyEnvValue(process.env.OPENCLAW_MEMORY_CAPTURE_AUTO_SAVE);
+  if (!canPrompt && !autoSave) {
+    return;
+  }
+  if (canPrompt && !autoSave) {
+    const picked = await multiselect({
+      message: "Postflight capture: Save checked items to memory?",
+      options: proposals.map((p, idx) => ({
+        value: p.id,
+        label: `${idx + 1}. ${p.text.length > 96 ? `${p.text.slice(0, 93)}…` : p.text}`,
+      })),
+      initialValues: allValues,
+    });
+    if (isCancel(picked)) {
+      return;
+    }
+    const pickedSet = new Set(picked);
+    selected = proposals.filter((p) => pickedSet.has(p.id));
+  }
+
+  if (selected.length === 0) {
+    return;
+  }
+
+  const saved = await appendPostflightProposalsToDailyMemory({
+    workspaceDir,
+    proposals: selected,
+  });
+  const rel = shortenHomePath(saved.filePath);
+  params.runtime.log(`Saved ${saved.appended}/${selected.length} postflight memories to ${rel}.`);
 }

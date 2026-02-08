@@ -1,5 +1,6 @@
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import type { PostflightCapturePayload } from "../../postflight/types.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import type { AgentCommandOpts } from "./types.js";
 import { AGENT_LANE_NESTED } from "../../agents/lanes.js";
@@ -17,6 +18,7 @@ import {
   normalizeOutboundPayloads,
   normalizeOutboundPayloadsForJson,
 } from "../../infra/outbound/payloads.js";
+import { extractPostflightCaptureFromText } from "../../postflight/extract.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 
 type RunResult = Awaited<
@@ -69,6 +71,23 @@ export async function deliverAgentCommandResult(params: {
   const { cfg, deps, runtime, opts, sessionEntry, payloads, result } = params;
   const deliver = opts.deliver === true;
   const bestEffortDeliver = opts.bestEffortDeliver === true;
+  const shouldFilterPostflight = opts.json !== true;
+  let postflightCapture: PostflightCapturePayload | null = null;
+  const filteredPayloads = shouldFilterPostflight
+    ? (payloads ?? []).map((payload) => {
+        const text = typeof payload.text === "string" ? payload.text : "";
+        if (!text.trim()) {
+          return payload;
+        }
+        const extracted = extractPostflightCaptureFromText(text);
+        if (extracted.capture) {
+          postflightCapture = extracted.capture;
+        }
+        return extracted.cleanedText !== text
+          ? { ...payload, text: extracted.cleanedText }
+          : payload;
+      })
+    : (payloads ?? []);
   const deliveryPlan = resolveAgentDeliveryPlan({
     sessionEntry,
     requestedChannel: opts.replyChannel ?? opts.channel,
@@ -140,23 +159,29 @@ export async function deliverAgentCommandResult(params: {
       JSON.stringify(
         buildOutboundResultEnvelope({
           payloads: normalizedPayloads,
-          meta: result.meta,
+          meta: postflightCapture ? { ...result.meta, postflightCapture } : result.meta,
         }),
         null,
         2,
       ),
     );
     if (!deliver) {
-      return { payloads: normalizedPayloads, meta: result.meta };
+      return {
+        payloads: normalizedPayloads,
+        meta: postflightCapture ? { ...result.meta, postflightCapture } : result.meta,
+      };
     }
   }
 
-  if (!payloads || payloads.length === 0) {
+  if (!filteredPayloads || filteredPayloads.length === 0) {
     runtime.log("No reply from agent.");
-    return { payloads: [], meta: result.meta };
+    return {
+      payloads: [],
+      meta: postflightCapture ? { ...result.meta, postflightCapture } : result.meta,
+    };
   }
 
-  const deliveryPayloads = normalizeOutboundPayloads(payloads);
+  const deliveryPayloads = normalizeOutboundPayloads(filteredPayloads);
   const logPayload = (payload: NormalizedOutboundPayload) => {
     if (opts.json) {
       return;
@@ -194,5 +219,9 @@ export async function deliverAgentCommandResult(params: {
     }
   }
 
-  return { payloads: normalizedPayloads, meta: result.meta };
+  const nextMeta = postflightCapture ? { ...result.meta, postflightCapture } : result.meta;
+  const nextNormalized = shouldFilterPostflight
+    ? normalizeOutboundPayloadsForJson(filteredPayloads ?? [])
+    : normalizedPayloads;
+  return { payloads: nextNormalized, meta: nextMeta };
 }
