@@ -147,21 +147,20 @@ with open(os.environ["META_PATH"], "w") as f:
   json.dump(payload, f, indent=2, sort_keys=True)
 PY
 
-# Ensure Kanboard env is present even when spawned from launchd/tmux without a full shell env.
+# Load the orchestrator env file (best-effort) so PATH/CODEX_BIN/KANBOARD_* are available
+# inside the tmux window. tmux does not reliably inherit the client process environment.
 env_loaded_from=""
-if [[ -z "${KANBOARD_BASE:-}" || -z "${KANBOARD_USER:-}" || -z "${KANBOARD_TOKEN:-}" ]]; then
-  for cand in "${CLAWD_ORCHESTRATOR_ENV_FILE:-}" "${CLAWD_ENV_FILE:-}" "${HOME:-}/.config/clawd/orchestrator.env" "/Users/joshwegener/.config/clawd/orchestrator.env"; do
-    [[ -n "$cand" ]] || continue
-    if [[ -f "$cand" ]]; then
-      # shellcheck disable=SC1090
-      set +u
-      source "$cand" >>"$LOG_PATH" 2>&1 || true
-      set -u
-      env_loaded_from="$cand"
-      break
-    fi
-  done
-fi
+for cand in "${CLAWD_ORCHESTRATOR_ENV_FILE:-}" "${CLAWD_ENV_FILE:-}" "${HOME:-}/.config/clawd/orchestrator.env" "/Users/joshwegener/.config/clawd/orchestrator.env"; do
+  [[ -n "$cand" ]] || continue
+  if [[ -f "$cand" ]]; then
+    # shellcheck disable=SC1090
+    set +u
+    source "$cand" >>"$LOG_PATH" 2>&1 || true
+    set -u
+    env_loaded_from="$cand"
+    break
+  fi
+done
 
 {
   echo "[kanboard-env] HOME=${HOME:-}"
@@ -422,4 +421,3 @@ PY
 handle="tmux:${TMUX_SESSION}:${TMUX_WINDOW}"
 printf '{"execSessionId":"%s","logPath":"%s","runId":"%s","runDir":"%s","donePath":"%s","patchPath":"%s","commentPath":"%s","startedAtMs":%s}\n' \
   "$handle" "$LOG_PATH" "$RUN_ID" "$RUN_DIR" "$DONE_PATH" "$PATCH_PATH" "$COMMENT_PATH" "$started_at_ms"
-

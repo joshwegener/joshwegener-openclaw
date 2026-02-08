@@ -19,6 +19,9 @@ runs/
 __pycache__/
 *.pyc
 
+# Node
+node_modules/
+**/node_modules/
+
 # Logs
 *.log
-

@@ -618,6 +618,40 @@ def provider_preflight_gate(
 
     category = str(check.get("category") or "unknown")
     message = str(check.get("message") or "provider unavailable")
+
+    # Soft-fail "unknown" preflight errors.
+    #
+    # We only want to *block* spawns when we have a clear auth/quota signal. In practice,
+    # Claude/Codex CLIs can sometimes be slow to start or temporarily fail to execute
+    # (PATH drift, cold start, transient CLI issues). Treating those as hard auth failures
+    # causes the pipeline to deadlock in Review/WIP.
+    #
+    # If the provider is truly unusable, the spawned worker/reviewer will fail and we will
+    # later force-block with a concrete (auth/quota) reason based on its logs.
+    if category == "unknown":
+        entry["status"] = "degraded"
+        entry["lastCheckAtMs"] = nowm
+        entry["blockedUntilMs"] = 0
+        entry["lastErrorCategory"] = category
+        entry["lastErrorMessage"] = message
+        # Positive cache this degraded status briefly so we don't keep re-running slow checks.
+        entry["lastOkAtMs"] = nowm
+        entry["consecutiveFailures"] = 0
+        ph[provider] = entry
+        state["providerHealth"] = ph
+        # Best-effort single notification for operators; do not block the pipeline.
+        outage_key = f"degraded:{provider}:{message}"
+        last_key = str(entry.get("lastNotifiedKey") or "")
+        try:
+            last_at = int(entry.get("lastNotifiedAtS") or 0)
+        except Exception:
+            last_at = 0
+        if outage_key and outage_key != last_key and (not last_at or (now_s - last_at) > 5):
+            entry["lastNotifiedKey"] = outage_key
+            entry["lastNotifiedAtS"] = now_s
+            errors.append(f"warn: provider {provider} preflight degraded (unknown): {message}. Proceeding.")
+        return True, None, f"ok(degraded:{message})"
+
     try:
         fail_count = int(entry.get("consecutiveFailures") or 0)
     except Exception:
