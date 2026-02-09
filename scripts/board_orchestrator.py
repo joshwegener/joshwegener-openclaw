@@ -4196,8 +4196,10 @@ def main() -> int:
         review_rework_queue: List[Tuple[Dict[str, Any], int]] = []
         for rt, rsl_id in sorted(review_tasks, key=sort_key):
             rid = int(rt.get("id"))
-            # While any critical exists, only run review automation for the active critical card.
-            if active_critical is not None:
+            # Only freeze non-critical reviews when a critical is actively exclusive (normally: in WIP).
+            # If a critical is blocked in Backlog/Ready/Review, we must continue normal review throughput
+            # or the pipeline can deadlock (e.g., critical depends on another card that needs review).
+            if critical_exclusive and active_critical is not None:
                 active_id = int(active_critical[0].get("id") or 0)
                 if rid != active_id:
                     continue
@@ -4840,8 +4842,9 @@ def main() -> int:
                 did = int(dt.get("id"))
                 dtitle = task_title(dt)
 
-                # While any critical exists, only process docs for the active critical card.
-                if active_critical_id is not None and did != int(active_critical_id):
+                # Same rule as review automation: only freeze docs throughput when a critical is
+                # actively exclusive (normally: in WIP). Do not deadlock on a backlog-blocked critical.
+                if critical_exclusive and active_critical_id is not None and did != int(active_critical_id):
                     continue
 
                 try:
