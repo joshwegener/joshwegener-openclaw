@@ -144,6 +144,13 @@ def main() -> int:
         "-p",
         "--model",
         args.model,
+        # IMPORTANT: Reviews must run without MCP tools. Some MCP servers expose JSON Schemas
+        # that Anthropic rejects (oneOf/allOf/anyOf at top-level), which causes immediate 400s
+        # even if we never call any tools. Reviews should be deterministic anyway: we embed the
+        # patch (when available) into the prompt rather than relying on file tools.
+        "--strict-mcp-config",
+        "--tools",
+        "",
         "--dangerously-skip-permissions",
         "--output-format",
         "text",

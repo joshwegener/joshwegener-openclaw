@@ -244,6 +244,33 @@ try:
 except Exception:
     pass_threshold = 90
 
+patch_text = ""
+if patch_path:
+    try:
+        if os.path.isfile(patch_path):
+            # Keep the review prompt bounded; reviews run without tools, so include the diff inline.
+            max_bytes = 120_000
+            tail_bytes = 20_000
+            st = os.stat(patch_path)
+            with open(patch_path, "rb") as f:
+                if st.st_size <= max_bytes:
+                    patch_text = f.read().decode("utf-8", "replace")
+                else:
+                    head = f.read(max_bytes - tail_bytes)
+                    try:
+                        f.seek(-tail_bytes, 2)
+                        tail = f.read(tail_bytes)
+                    except Exception:
+                        tail = b""
+                    patch_text = (
+                        head.decode("utf-8", "replace")
+                        + "\n\n--- TRUNCATED ---\n\n"
+                        + tail.decode("utf-8", "replace")
+                        + f"\n\n[patch truncated: {st.st_size} bytes total]\n"
+                    )
+    except Exception as e:
+        patch_text = f"[error reading patch file {patch_path!r}: {type(e).__name__}: {e}]\n"
+
 prompt = f"""You are the automated code reviewer for RecallDeck Kanban task #{task_id}.
 
 Context:
@@ -254,9 +281,12 @@ Context:
 - Task description (from Kanboard):
 {desc}
 
+Patch (unified diff; may be truncated):
+{patch_text}
+
 Instructions:
-1) If patch_path is non-empty and exists, review the patch file contents.
-2) Otherwise, review based on the Kanboard task title/description and current repo state.
+1) If a patch is present above, review ONLY that patch (assume it will be applied).
+2) If no patch is present, review based on the Kanboard task title/description and current repo state.
 3) Output STRICT JSON only. No markdown, no prose.
 4) Be specific: include file paths (and ideally line numbers) in critical_items/minor_items when possible.
 
