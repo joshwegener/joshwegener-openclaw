@@ -425,7 +425,21 @@ PREFLIGHT_BACKOFF_JITTER_PCT = float(os.environ.get("BOARD_ORCHESTRATOR_PREFLIGH
 def _classify_provider_failure(output: str) -> str:
     """Return 'quota' or 'auth' or 'unknown' based on common CLI error strings."""
     s = (output or "").lower()
-    if any(x in s for x in ("insufficient_quota", "rate limit", "rate_limit", "quota", "too many requests", "http 429")):
+    # Be conservative: avoid matching the bare word "quota" because some CLIs
+    # include it in non-provider-availability contexts (e.g., UI copy, unrelated logs).
+    if any(
+        x in s
+        for x in (
+            "insufficient_quota",
+            "quota exceeded",
+            "exceeded your current quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "http 429",
+            " 429 ",
+        )
+    ):
         return "quota"
     if any(
         x in s
@@ -4851,10 +4865,28 @@ def main() -> int:
                     dtags = get_task_tags(did)
                 except Exception:
                     dtags = []
-                if is_held(dtags):
-                    continue
 
                 lower = {t.lower() for t in (dtags or [])}
+
+                # Auto-heal provider blocks: if a card was auto-blocked due to auth/quota
+                # and the provider is healthy again, clear the blocked tags so docs can resume.
+                if TAG_AUTO_BLOCKED in lower and (TAG_BLOCKED_AUTH in lower or TAG_BLOCKED_QUOTA in lower):
+                    provider = infer_preflight_provider("docs", DOCS_SPAWN_CMD) if DOCS_SPAWN_CMD else "codex"
+                    if provider:
+                        ok, _cat, _msg = provider_preflight_gate(state, provider=provider, errors=errors)
+                        if ok:
+                            if dry_run:
+                                actions.append(f"Would clear blocked auth/quota tags for Documentation #{did} ({dtitle})")
+                            else:
+                                remove_tags(did, [TAG_AUTO_BLOCKED, TAG_BLOCKED_AUTH, TAG_BLOCKED_QUOTA])
+                                try:
+                                    dtags = get_task_tags(did)
+                                except Exception:
+                                    dtags = [t for t in dtags if str(t).lower() not in (TAG_AUTO_BLOCKED, TAG_BLOCKED_AUTH, TAG_BLOCKED_QUOTA)]
+                                lower = {t.lower() for t in (dtags or [])}
+
+                if is_held(dtags):
+                    continue
                 done_ready = (TAG_DOC_COMPLETED in lower) or (TAG_DOC_SKIP in lower)
                 retry_requested = TAG_DOC_RETRY in lower
 
