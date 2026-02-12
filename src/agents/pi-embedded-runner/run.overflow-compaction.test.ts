@@ -193,6 +193,7 @@ describe("overflow compaction in run loop", () => {
     const overflowError = new Error("request_too_large: Request size exceeds model context window");
 
     mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(makeAttemptResult())
       .mockResolvedValueOnce(makeAttemptResult({ promptError: overflowError }))
       .mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
 
@@ -212,7 +213,7 @@ describe("overflow compaction in run loop", () => {
     expect(mockedCompactDirect).toHaveBeenCalledWith(
       expect.objectContaining({ authProfileId: "test-profile" }),
     );
-    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(3);
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("context overflow detected; attempting auto-compaction"),
     );
@@ -224,7 +225,9 @@ describe("overflow compaction in run loop", () => {
   it("returns error if compaction fails", async () => {
     const overflowError = new Error("request_too_large: Request size exceeds model context window");
 
-    mockedRunEmbeddedAttempt.mockResolvedValue(makeAttemptResult({ promptError: overflowError }));
+    mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(makeAttemptResult())
+      .mockResolvedValueOnce(makeAttemptResult({ promptError: overflowError }));
 
     mockedCompactDirect.mockResolvedValueOnce({
       ok: false,
@@ -235,7 +238,7 @@ describe("overflow compaction in run loop", () => {
     const result = await runEmbeddedPiAgent(baseParams);
 
     expect(mockedCompactDirect).toHaveBeenCalledTimes(1);
-    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
     expect(result.meta.error?.kind).toBe("context_overflow");
     expect(result.payloads?.[0]?.isError).toBe(true);
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("auto-compaction failed"));
@@ -245,6 +248,7 @@ describe("overflow compaction in run loop", () => {
     const overflowError = new Error("request_too_large: Request size exceeds model context window");
 
     mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(makeAttemptResult())
       .mockResolvedValueOnce(makeAttemptResult({ promptError: overflowError }))
       .mockResolvedValueOnce(makeAttemptResult({ promptError: overflowError }));
 
@@ -263,7 +267,7 @@ describe("overflow compaction in run loop", () => {
     // Compaction attempted only once
     expect(mockedCompactDirect).toHaveBeenCalledTimes(1);
     // Two attempts: first overflow -> compact -> retry -> second overflow -> return error
-    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(3);
     expect(result.meta.error?.kind).toBe("context_overflow");
     expect(result.payloads?.[0]?.isError).toBe(true);
   });
@@ -280,7 +284,7 @@ describe("overflow compaction in run loop", () => {
     const result = await runEmbeddedPiAgent(baseParams);
 
     expect(mockedCompactDirect).not.toHaveBeenCalled();
-    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
     expect(result.meta.error?.kind).toBe("compaction_failure");
   });
 });

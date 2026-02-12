@@ -62,6 +62,7 @@ function buildRecallDeckScopeSection(params: { isMinimal: boolean; availableTool
   }
   return [
     "## RecallDeck (Deck Scope)",
+    "- Bootstrap (mandatory when available): call `init_task` (or `init`) once per new session/context reset with the current user message, then execute the returned `next_calls` (use `execute_next_calls` if available) before answering.",
     'Default retrieval scope for clawd/OpenClaw workers: the dedicated "RecallDeck" deck + the read-only "Docs" deck.',
     "- If you use RecallDeck recall/search tools and the user/task did not specify deck scope:",
     '  - Resolve deck ids by name via list_decks, then pass deck_ids=\'[\"<RecallDeck deck id>\",\"<Docs deck id>\"]\' on recall/search calls (a JSON array string).',

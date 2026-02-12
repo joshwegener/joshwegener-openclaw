@@ -745,21 +745,254 @@ export async function runEmbeddedAttempt(
           messages: activeSession.messages,
         });
 
+        const sm = sessionManager;
+        if (!sm) {
+          throw new Error("session manager missing during embedded prompt");
+        }
+
         // Repair orphaned trailing user messages so new prompts don't violate role ordering.
-        const leafEntry = sessionManager.getLeafEntry();
+        const leafEntry = sm.getLeafEntry();
         if (leafEntry?.type === "message" && leafEntry.message.role === "user") {
           if (leafEntry.parentId) {
-            sessionManager.branch(leafEntry.parentId);
+            sm.branch(leafEntry.parentId);
           } else {
-            sessionManager.resetLeaf();
+            sm.resetLeaf();
           }
-          const sessionContext = sessionManager.buildSessionContext();
+          const sessionContext = sm.buildSessionContext();
           activeSession.agent.replaceMessages(sessionContext.messages);
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,
           );
         }
+
+        const appendToolCallTurn = (calls: Array<{ id: string; name: string; args: unknown }>) => {
+          sm.appendMessage({
+            role: "assistant",
+            content: calls.map((call) => ({
+              type: "toolCall",
+              id: call.id,
+              name: call.name,
+              arguments: call.args ?? {},
+            })),
+            stopReason: "toolUse",
+            api: params.model.api,
+            provider: params.provider,
+            model: params.modelId,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+            timestamp: Date.now(),
+          } as Parameters<(typeof sm)["appendMessage"]>[0]);
+        };
+
+        const appendToolResultTurn = (params: {
+          id: string;
+          name: string;
+          result: { content?: unknown; details?: unknown };
+          isError?: boolean;
+        }) => {
+          sm.appendMessage({
+            role: "toolResult",
+            toolCallId: params.id,
+            toolName: params.name,
+            content: (params.result.content ?? []) as never,
+            details: params.result.details,
+            isError: Boolean(params.isError),
+            timestamp: Date.now(),
+          } as Parameters<(typeof sm)["appendMessage"]>[0]);
+        };
+
+        const parseToolPayload = (
+          result: { content?: unknown; details?: unknown } | null | undefined,
+        ) => {
+          if (!result || typeof result !== "object") {
+            return null;
+          }
+          const details = (result as { details?: unknown }).details;
+          if (details && typeof details === "object") {
+            return details as Record<string, unknown>;
+          }
+          const content = (result as { content?: unknown }).content;
+          const text =
+            Array.isArray(content) && content[0] && typeof content[0] === "object"
+              ? (content[0] as { type?: unknown; text?: unknown }).type === "text"
+                ? (content[0] as { text?: unknown }).text
+                : undefined
+              : undefined;
+          if (typeof text !== "string" || !text.trim()) {
+            return null;
+          }
+          try {
+            const parsed = JSON.parse(text) as unknown;
+            return parsed && typeof parsed === "object"
+              ? (parsed as Record<string, unknown>)
+              : null;
+          } catch {
+            return null;
+          }
+        };
+
+        const runRecallDeckPreflightIfNeeded = async () => {
+          if (params.disableTools) {
+            return;
+          }
+
+          const normalizedByTool = new Map<string, (typeof tools)[number]>();
+          for (const tool of tools) {
+            normalizedByTool.set(normalizeToolName(tool.name), tool);
+          }
+
+          const recallDeckTools = [...normalizedByTool.entries()].filter(([name]) =>
+            name.includes("recalldeck"),
+          );
+          if (recallDeckTools.length === 0) {
+            return;
+          }
+
+          const pickTool = (suffixes: string[]) => {
+            for (const suffix of suffixes) {
+              for (const [name, tool] of recallDeckTools) {
+                if (name.endsWith(suffix)) {
+                  return { name, tool };
+                }
+              }
+            }
+            return null;
+          };
+
+          const initTool = pickTool(["init_task", "init"]);
+          if (!initTool) {
+            return;
+          }
+
+          const hasToolResult = (toolNormalized: string) => {
+            for (const msg of activeSession.messages) {
+              if (!msg || typeof msg !== "object") {
+                continue;
+              }
+              if ((msg as { role?: unknown }).role !== "toolResult") {
+                continue;
+              }
+              const name =
+                typeof (msg as { toolName?: unknown }).toolName === "string"
+                  ? String((msg as { toolName?: unknown }).toolName)
+                  : "";
+              if (normalizeToolName(name) === toolNormalized) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          if (hasToolResult(initTool.name)) {
+            return;
+          }
+
+          if (activeSession.messages.length === 0) {
+            sm.appendMessage({
+              role: "user",
+              content: "(session bootstrap)",
+              timestamp: Date.now(),
+            } as Parameters<(typeof sm)["appendMessage"]>[0]);
+          }
+
+          const userMessage =
+            typeof effectivePrompt === "string" && effectivePrompt.trim()
+              ? effectivePrompt.trim()
+              : typeof params.prompt === "string" && params.prompt.trim()
+                ? params.prompt.trim()
+                : "bootstrap";
+
+          const initCallId = `recalldeck_init_${randomUUID()}`;
+          const initArgsPrimary = initTool.name.endsWith("init_task")
+            ? { user_message: userMessage }
+            : {};
+          appendToolCallTurn([{ id: initCallId, name: initTool.tool.name, args: initArgsPrimary }]);
+
+          let initResult: { content?: unknown; details?: unknown } | null = null;
+          let initError = false;
+          try {
+            initResult = await initTool.tool.execute(initCallId, initArgsPrimary);
+          } catch (err) {
+            initError = true;
+            try {
+              initResult = await initTool.tool.execute(
+                initCallId,
+                initTool.name.endsWith("init_task") ? { userMessage } : {},
+              );
+              initError = false;
+            } catch (err2) {
+              initResult = {
+                content: [{ type: "text", text: `error: ${String(err2)}` }],
+                details: { status: "error", tool: initTool.name, error: String(err2) },
+              };
+              initError = true;
+            }
+          }
+
+          appendToolResultTurn({
+            id: initCallId,
+            name: initTool.tool.name,
+            result: initResult ?? {},
+            isError: initError,
+          });
+
+          const initPayload = parseToolPayload(initResult);
+          const nextCallsRaw =
+            (initPayload && typeof initPayload === "object"
+              ? ((initPayload as Record<string, unknown>)["next_calls"] ??
+                (initPayload as Record<string, unknown>)["nextCalls"])
+              : null) ?? null;
+
+          const execTool = pickTool(["execute_next_calls"]);
+          if (
+            execTool &&
+            !hasToolResult(execTool.name) &&
+            Array.isArray(nextCallsRaw) &&
+            nextCallsRaw.length > 0
+          ) {
+            const execCallId = `recalldeck_exec_${randomUUID()}`;
+            appendToolCallTurn([
+              { id: execCallId, name: execTool.tool.name, args: { next_calls: nextCallsRaw } },
+            ]);
+
+            let execResult: { content?: unknown; details?: unknown } | null = null;
+            let execError = false;
+            try {
+              execResult = await execTool.tool.execute(execCallId, { next_calls: nextCallsRaw });
+            } catch (err) {
+              execError = true;
+              execResult = {
+                content: [{ type: "text", text: `error: ${String(err)}` }],
+                details: { status: "error", tool: execTool.name, error: String(err) },
+              };
+            }
+
+            appendToolResultTurn({
+              id: execCallId,
+              name: execTool.tool.name,
+              result: execResult ?? {},
+              isError: execError,
+            });
+          }
+
+          const sessionContext = sm.buildSessionContext();
+          activeSession.agent.replaceMessages(sessionContext.messages);
+        };
+
+        await runRecallDeckPreflightIfNeeded();
 
         try {
           // Detect and load images referenced in the prompt for vision-capable models.
@@ -831,54 +1064,6 @@ export async function runEmbeddedAttempt(
             throw err;
           }
         }
-
-        const appendToolCallTurn = (calls: Array<{ id: string; name: string; args: unknown }>) => {
-          sessionManager.appendMessage({
-            role: "assistant",
-            content: calls.map((call) => ({
-              type: "toolCall",
-              id: call.id,
-              name: call.name,
-              arguments: call.args ?? {},
-            })),
-            stopReason: "toolUse",
-            api: params.model.api,
-            provider: params.provider,
-            model: params.modelId,
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 0,
-              cost: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                total: 0,
-              },
-            },
-            timestamp: Date.now(),
-          } as AgentMessage);
-        };
-
-        const appendToolResultTurn = (params: {
-          id: string;
-          name: string;
-          result: { content?: unknown; details?: unknown };
-          isError?: boolean;
-        }) => {
-          sessionManager.appendMessage({
-            role: "toolResult",
-            toolCallId: params.id,
-            toolName: params.name,
-            content: (params.result.content ?? []) as never,
-            details: params.result.details,
-            isError: Boolean(params.isError),
-            timestamp: Date.now(),
-          } as AgentMessage);
-        };
 
         const parseInitOutput = (msg: AgentMessage | undefined): InitToolOutputV1 | null => {
           if (!msg || typeof msg !== "object") {
@@ -974,10 +1159,11 @@ export async function runEmbeddedAttempt(
               { id: callId, name: INIT_TOOL_NAME, args: { prompt: normalizedPrompt } },
             ]);
             const result = await initTool.execute(callId, { prompt: normalizedPrompt });
-            const isError =
+            const isError = Boolean(
               result?.details &&
               typeof result.details === "object" &&
-              (result.details as { status?: unknown }).status === "error";
+              (result.details as { status?: unknown }).status === "error",
+            );
             appendToolResultTurn({
               id: callId,
               name: INIT_TOOL_NAME,
@@ -1046,10 +1232,11 @@ export async function runEmbeddedAttempt(
                 }
                 try {
                   const result = await c.tool.execute(c.id, c.args);
-                  const isError =
+                  const isError = Boolean(
                     result?.details &&
                     typeof result.details === "object" &&
-                    (result.details as { status?: unknown }).status === "error";
+                    (result.details as { status?: unknown }).status === "error",
+                  );
                   return { id: c.id, name: c.toolName, result, isError };
                 } catch (err) {
                   return {

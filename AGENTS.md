@@ -16,6 +16,7 @@ Before doing anything else:
 2. Read `USER.md` — this is who you're helping
 3. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
 4. **If in MAIN SESSION** (direct chat with your human): Also read `MEMORY.md`
+5. **If RecallDeck tools are available:** call `init_task` (or `init`) once per session/context reset with the current user message, then execute `next_calls` (use `execute_next_calls` if available) before answering.
 
 Don't ask permission. Just do it.
 
@@ -217,4 +218,3 @@ A skill is a set of local instructions to follow that is stored in a `SKILL.md` 
   - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
 - Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.
 </INSTRUCTIONS>
-

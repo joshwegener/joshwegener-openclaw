@@ -61,6 +61,15 @@ const makeAttempt = (overrides: Partial<EmbeddedRunAttemptResult>): EmbeddedRunA
   ...overrides,
 });
 
+const makeInitAttempt = (): EmbeddedRunAttemptResult =>
+  makeAttempt({
+    assistantTexts: [],
+    lastAssistant: buildAssistant({
+      stopReason: "stop",
+      content: [{ type: "text", text: "init" }],
+    }),
+  });
+
 const makeConfig = (opts?: { fallbacks?: string[]; apiKey?: string }): OpenClawConfig =>
   ({
     agents: {
@@ -127,6 +136,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
       await writeAuthStore(agentDir);
 
       runEmbeddedAttemptMock
+        .mockResolvedValueOnce(makeInitAttempt())
         .mockResolvedValueOnce(
           makeAttempt({
             assistantTexts: [],
@@ -162,7 +172,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         runId: "run:auto",
       });
 
-      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
+      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(3);
 
       const stored = JSON.parse(
         await fs.readFile(path.join(agentDir, "auth-profiles.json"), "utf-8"),
@@ -180,7 +190,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
     try {
       await writeAuthStore(agentDir);
 
-      runEmbeddedAttemptMock.mockResolvedValueOnce(
+      runEmbeddedAttemptMock.mockResolvedValueOnce(makeInitAttempt()).mockResolvedValueOnce(
         makeAttempt({
           assistantTexts: [],
           lastAssistant: buildAssistant({
@@ -206,7 +216,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         runId: "run:user",
       });
 
-      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
 
       const stored = JSON.parse(
         await fs.readFile(path.join(agentDir, "auth-profiles.json"), "utf-8"),
@@ -241,7 +251,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         };
         await fs.writeFile(authPath, JSON.stringify(payload));
 
-        runEmbeddedAttemptMock.mockResolvedValueOnce(
+        runEmbeddedAttemptMock.mockResolvedValueOnce(makeInitAttempt()).mockResolvedValueOnce(
           makeAttempt({
             assistantTexts: ["ok"],
             lastAssistant: buildAssistant({
@@ -267,7 +277,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
           runId: "run:user-cooldown",
         });
 
-        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
 
         const stored = JSON.parse(
           await fs.readFile(path.join(agentDir, "auth-profiles.json"), "utf-8"),
@@ -292,7 +302,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
     try {
       await writeAuthStore(agentDir, { includeAnthropic: true });
 
-      runEmbeddedAttemptMock.mockResolvedValueOnce(
+      runEmbeddedAttemptMock.mockResolvedValueOnce(makeInitAttempt()).mockResolvedValueOnce(
         makeAttempt({
           assistantTexts: ["ok"],
           lastAssistant: buildAssistant({
@@ -318,7 +328,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         runId: "run:mismatch",
       });
 
-      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+      expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
     } finally {
       await fs.rm(agentDir, { recursive: true, force: true });
       await fs.rm(workspaceDir, { recursive: true, force: true });
@@ -348,7 +358,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         };
         await fs.writeFile(authPath, JSON.stringify(payload));
 
-        runEmbeddedAttemptMock.mockResolvedValueOnce(
+        runEmbeddedAttemptMock.mockResolvedValueOnce(makeInitAttempt()).mockResolvedValueOnce(
           makeAttempt({
             assistantTexts: ["ok"],
             lastAssistant: buildAssistant({
@@ -374,7 +384,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
           runId: "run:skip-cooldown",
         });
 
-        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
 
         const stored = JSON.parse(
           await fs.readFile(path.join(agentDir, "auth-profiles.json"), "utf-8"),
@@ -502,6 +512,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         await fs.writeFile(authPath, JSON.stringify(payload));
 
         runEmbeddedAttemptMock
+          .mockResolvedValueOnce(makeInitAttempt())
           .mockResolvedValueOnce(
             makeAttempt({
               assistantTexts: [],
@@ -537,7 +548,7 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
           runId: "run:rotate-skip-cooldown",
         });
 
-        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
+        expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(3);
 
         const stored = JSON.parse(
           await fs.readFile(path.join(agentDir, "auth-profiles.json"), "utf-8"),
